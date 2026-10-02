@@ -1,0 +1,12 @@
+{
+  "name": "point-sdd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Spec-driven development hub for the Point Barbershop System.",
+  "scripts": {
+    "test:browser-tester": "node --test .claude/skills/point-browser-tester/tests/"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

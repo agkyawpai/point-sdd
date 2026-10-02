@@ -1,7 +1,7 @@
 ---
-description: Generate a reviewed Excel test specification from OpenSpec specs.
+description: Generate a reviewed Excel test case workbook from OpenSpec specs in this hub.
 ---
 
-Use the `point-generate-tests` skill for this request and follow its steps exactly: manifest review, metadata, case writing, JSON review, then build and `--check`.
+Use the `point-generate-tests` skill for this request and follow its review, generation and inspection steps exactly.
 
 Input: $ARGUMENTS

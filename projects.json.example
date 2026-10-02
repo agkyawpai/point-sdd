@@ -1,0 +1,11 @@
+{
+  "projects": [
+    {
+      "id": "point-barber-app",
+      "canonical": "Point Barbershop App",
+      "role": "Staff app, admin and customer booking site",
+      "tech": "TBD",
+      "path": "D:/point_flow/<app-repo-folder>"
+    }
+  ]
+}

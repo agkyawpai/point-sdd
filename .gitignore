@@ -2,19 +2,37 @@
 .DS_Store
 Thumbs.db
 *.tmp
+*.swp
 .vscode/
 .idea/
 
-# Claude Code local settings
+# Claude Code local settings (developer-specific; never commit)
 .claude/settings.local.json
 
-# Python
+# Logs
+*.log
+
+# Python tooling
 .venv/
 __pycache__/
 *.pyc
 
+# Project mapping (developer-specific paths; never commit)
+projects.json
+
 # Excel lock files
 ~$*
 
-# Node
+# Generated output — only the review JSON is committed
+work/*
+!work/Test Cases/
+work/Test Cases/*
+!work/Test Cases/*/
+work/Test Cases/*/*
+!work/Test Cases/*/temp_manifest.json
+!work/Test Cases/*/*/
+work/Test Cases/*/*/*
+!work/Test Cases/*/*/temp_tests.json
+
+# Node tooling
 node_modules/
