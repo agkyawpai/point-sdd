@@ -43,13 +43,13 @@ Each case carries `caseNo`, `status`, `observed` and `evidence` (paths relative 
 
 ## Credentials and evidence
 
-- Credentials come from `POINT_TEST_<PROFILE>_USER` and `POINT_TEST_<PROFILE>_PASSWORD` (for example `POINT_TEST_ADMIN_USER`), or from the harness's hidden prompt when a terminal is attached. If neither is available, record the affected cases as `BLOCKED`. Never ask the user to paste a password into the chat.
+- **The Point staff app has no passwords** (D-AUTH-01: Google or an 8-digit e-mail code). Runners sign in with the e-mail code: the profile's address comes from `POINT_TEST_<PROFILE>_EMAIL` (for example `POINT_TEST_BARBER_EMAIL=aung@point.test` — the people of `docs/plan/spec-fixtures.md`) through `getLoginEmail`, the runner requests a code on the login screen, and `fetchLoginCode({ email, after, run })` reads it from Mailpit — `after` = the time taken just before the request and `run` are both required, so an older code is never typed and the code is always redacted (`POINT_TEST_MAILPIT_URL`, e.g. `http://localhost:8025` — test environments only, ADR-007). There is no test-only login and Google sign-in is tested by hand. Sign in **once per profile per run** and reuse the session — the app allows 10 code requests and 10 code verifies per hour per IP (API-LIM-02). If the address or Mailpit is unavailable, record the affected cases as `BLOCKED`. `getCredentials` (`_USER` / `_PASSWORD`) remains only for a system that has passwords; never ask the user to paste a password or a code into the chat.
 - Never write credentials into source, logs, screenshots, JSON, Markdown, storage state or commits. The harness redacts known secret values and token-like text from everything it writes.
 - Browser-context evidence is limited to screenshots, sanitized console and page errors, and allowlisted request metadata (method, URL with sensitive query values redacted, status, resource type, timing). Never save request or response bodies, headers, cookies or storage state.
 - `work/` is local output; durable, reusable logic belongs in this skill's `scripts/` with tests in `tests/`.
 
 ## References
 
-Read before executing: `references/case-triage.md`, `references/run-flow.md`, `references/evidence-conventions.md`, `references/case-module-contract.md`. The scripts and their tests (`node --test .claude/skills/point-browser-tester/tests/`, `.venv\Scripts\python -m unittest discover -s .claude/skills/point-browser-tester/tests -p "test_*.py"`) are the source of truth for harness behavior.
+Read before executing: `references/case-triage.md`, `references/run-flow.md`, `references/evidence-conventions.md`, `references/case-module-contract.md`. The scripts and their tests (`node --test .claude/skills/point-browser-tester/tests/harness.test.js`, `.venv\Scripts\python -m unittest discover -s .claude/skills/point-browser-tester/tests -p "test_*.py"`) are the source of truth for harness behavior.
 
 Report every out-of-scope row explicitly; never leave a requested row unaccounted for.

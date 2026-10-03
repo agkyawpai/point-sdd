@@ -1,0 +1,5724 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 4 · Visits, Sales & Payments
+  version: 1.1.0
+  summary: Walk-in / booking START, service and product lines, checkout, payments, discounts, FINISH, receipts, refunds, adjustments, payment methods
+  description: 'Design document for Part 4 (docs/api/04-visits-sales-payments.md). Conventions: docs/api/00-conventions.md (v1.6).
+
+    v1.1 (02/Oct/2026 13:08 — owner sheet 3, review §0.11; no path, schema or permission code changed): context.correction_path is omitted for a payment add on a FINISHED sale and for every write on a CANCELLED sale (P4-RULE-01, S17); the reason fields of this document (reason, added_reason, override_reason, …) are the binding shapes (API-DATA-11 v1.6, S8).
+
+    v1.0 (02/Oct, batch consistency pass — no version bump): Commission.estimate with branch_id, collector list = Attendance.openRecordsAt, StockLedger.post signature, request lookup
+    incl. stock_movement, day_closed / payroll_finalized context = Parts 7 / 5.
+
+    Review fixes 02/Oct (independent review — no version bump): one lock order (day lock → payroll lock → sale → visit → booking → … → stock) and READ COMMITTED for money writes; PayrollLock
+    on late-entry START and on FINISH with SERVICE lines; difference sale defined (link = type-9 adjustment token); approved discount = lines at approval, removable; reference uniqueness
+    on the effective method; refund caps; late-entry timestamps required; once_per_customer = 422; writes on a FINISHED / CANCELLED sale = 409 invalid_transition + correction_path; Commission.estimate(employee_id,
+    business_date, base_amount, branch_id, before?).
+
+    Reconcile 02/Oct (cross-part reconcile — no version bump): refund caps per D-PAY-05 — kind 1 ≤ the sale total (line ≤ its net); a manual kind-2 return needs sale.refund + reason
+    + external_reference and is ≤ max(sale total, Σ non-voided non-cash payments); kind 2 never consumes the kind-1 cap.
+
+    Decisions served: D-VIS-01..13, D-PAY-01..09, D-SVC-04..06/08, D-COM-02..04, D-KPI-01/02, D-DSH-03, D-ROLE-02/03/07/09 (ADR-011, ADR-012), D-NTF-01..03, D-AUD-01/02, D-DAT-05, D-DB-03/08,
+    D-PLT-15, ADR-002/003/013.
+
+    Status: v1.0 — LOCKED (D-API-05) — owner one-sheet "အကုန်လုံး OK" (02/Oct/2026 00:06): items B1–B12, G (DB Part 4 v1.2 guard triggers), H.
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "any staff (read scope)" = operational read, no code; "self" = the caller
+    is the actor of that visit / sale (P4-RULE-03 — own work needs no code); levels per ADR-012: visits, sales, payments, refunds, adjustments, discount requests = branch data; discount
+    codes and payment methods = company master; customers = shared (Part 3).
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating staff operations need X-Requested-With: point-app (API-AUTH-02). Row-creating money operations need Idempotency-Key
+    (= client_request_id — API-IDEM-01/02): replay → 200 + Idempotent-Replayed, in progress → 409 idempotency_in_progress, different identifying fields → 422 idempotency_mismatch. FINISH
+    and other state changes are idempotent by state check.
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; business dates MMT; status/type = smallint codes (D-DB-03); errors = RFC 9457 problem+json with code
+    = language key.'
+servers:
+- url: /api/v1
+  description: Same origin as the app — Caddy routes /api/* to NestJS (ADR-009); none of these routes is forwarded on the public site host
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: visits
+  description: START / COMPLETE / INCOMPLETE, Today, visits list — D-VIS-01..13
+- name: sales
+  description: 'Sale document: lines, price override, discount code, FINISH, product-only and difference sales — D-PAY-03..08, D-SVC-04'
+- name: payments
+  description: Cash / KBZPay / split, void, collected by, KBZPay verification — D-PAY-01/02, D-VIS-06
+- name: discount-codes
+  description: Discount code master (company) — D-PAY-04
+- name: discount-requests
+  description: In-app discount approval — D-PAY-04
+- name: refunds
+  description: Sale refunds and overpayment returns, RF series — D-PAY-05
+- name: adjustments
+  description: Correction ledger after FINISH — F-P4-07
+- name: receipts
+  description: Receipt view / PDF / print image, reprint, lookup — D-PAY-06/07
+- name: payment-methods
+  description: Payment methods master list (company) — D-PAY-01
+security:
+- sessionCookie: []
+paths:
+  /visits:
+    get:
+      tags:
+      - visits
+      operationId: visitList
+      summary: Visits list (P4.VIS.01) — AD-POS-15 open / finished / incomplete with flags
+      x-permission: visit.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date (visit START date); default today
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date; default today
+      - name: performed_by_employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 INCOMPLETE · 1 STARTED · 2 COMPLETED (awaiting payment) · 3 FINISHED (D-VIS-07/09)
+            x-enum-varnames:
+            - INCOMPLETE
+            - STARTED
+            - COMPLETED
+            - FINISHED
+        description: Repeatable
+        style: form
+        explode: true
+      - name: is_late_entry
+        in: query
+        schema:
+          type: boolean
+      - name: proxy
+        in: query
+        schema:
+          type: boolean
+        description: true = proxy_reason is set
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-SVC-06)
+          x-enum-varnames:
+          - BRANCH
+          - HOME
+      - name: booking_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: awaiting_payment
+        in: query
+        schema:
+          type: boolean
+        description: true = COMPLETED visits whose sale is still OPEN (the "Awaiting payment" filter)
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Receipt number or customer name / phone
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - -started_at
+          - started_at
+          default: -started_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VisitListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - visits
+      operationId: visitStart
+      summary: START a visit — walk-in, from a booking, proxy, home, late entry (P4.VIS.03) — P4-RULE-02
+      x-permission: any staff (read scope — branch must be in the caller read scope; own work / proxy need no code — D-VIS-04/12) · late_entry → sale.late_entry (branch data)
+      description: 'Creates the visit (STARTED) and its OPEN sale in one transaction (F-P4-01). Lock order: DayLock, then (late entry) PayrollLock, then the booking row. Late entry into
+        a FINALIZED / PUBLISHED / PAID payroll period → 423 payroll_finalized (correction = manual payroll line — owner B9); late_entry.started_at is required. booking_id → booking row
+        locked FOR UPDATE, must be BOOKED (else 409 invalid_transition with context.visit_id) → booking STARTED (P3-RULE-09). 422 unpaid_visit_open { visit_id } when the performer has
+        a COMPLETED, not-late-entry visit still unpaid (owner B1) · 422 day_closed (DayLock — Part 7) · 422 not_assigned_to_branch · 422 booking_not_today · 400 reason_required (proxy
+        / performer change / late entry OTHER). Identifying fields for idempotency_mismatch: branch_id, booking_id, performed_by_employee_id.'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartVisitRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visit'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visit'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /me/visits:
+    get:
+      tags:
+      - visits
+      operationId: myVisits
+      summary: My visits — Today screen (P4.VIS.02) — AD-TODAY-01/02
+      x-permission: self (performer or recorder)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 INCOMPLETE · 1 STARTED · 2 COMPLETED (awaiting payment) · 3 FINISHED (D-VIS-07/09)
+            x-enum-varnames:
+            - INCOMPLETE
+            - STARTED
+            - COMPLETED
+            - FINISHED
+        description: Repeatable; default 1, 2 (open) plus today's 0 and 3
+        style: form
+        explode: true
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today (MMT)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Visit'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /visits/{id}:
+    get:
+      tags:
+      - visits
+      operationId: visitGet
+      summary: Visit detail with its sale (P4.VIS.04) — AD-POS-04
+      x-permission: self (performer · recorder) | visit.view+ (branch data)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visit'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /visits/{id}/complete:
+    post:
+      tags:
+      - visits
+      operationId: visitComplete
+      summary: '"Service done" — COMPLETE (P4.VIS.05) — D-VIS-02/03'
+      x-permission: self (performer · recorder of the visit) | visit.update (branch data)
+      description: 'STARTED only (else 409 invalid_transition; already COMPLETED → 200 current state). ≥ 1 active SERVICE line (422 service_required). completed_at = now; late-entry
+        visit: completed_at is required in the body (400 validation) = the entered time (≥ started_at, ≤ now — 422 late_entry_time).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visit'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /visits/{id}/incomplete:
+    post:
+      tags:
+      - visits
+      operationId: visitIncomplete
+      summary: Mark incomplete (P4.VIS.06) — D-VIS-09, AD-POS-04
+      x-permission: self (performer · recorder of a PHONE_UNAVAILABLE proxy visit) | visit.delete (branch data — cancel, record kept)
+      description: STARTED / COMPLETED with an OPEN sale. 422 payments_exist when non-voided payments remain (void them first — P4.PAY.03). Sale → CANCELLED, pending discount request
+        → CANCELLED, booking → COMPLETED (F-P4-13). No receipt number, no revenue, no commission.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Visit'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales:
+    get:
+      tags:
+      - sales
+      operationId: saleList
+      summary: Sales list (P4.SAL.01) — Sales menu
+      x-permission: sale.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date (FINISH date for finished sales; START date otherwise); default today
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+            x-enum-varnames:
+            - CANCELLED
+            - OPEN
+            - FINISHED
+        description: Repeatable; default 2
+        style: form
+        explode: true
+      - name: performed_by_employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: collected_by_employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: customer_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: payment_method_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: has_discount
+        in: query
+        schema:
+          type: boolean
+      - name: has_refund
+        in: query
+        schema:
+          type: boolean
+      - name: price_overridden
+        in: query
+        schema:
+          type: boolean
+      - name: kind
+        in: query
+        schema:
+          type: string
+          enum:
+          - service
+          - product_only
+          - difference
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Receipt number (exact or prefix) or customer name / phone
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - -finished_at
+          - finished_at
+          - -total_amount
+          default: -finished_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SaleListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - sales
+      operationId: saleCreateProductOnly
+      summary: Product-only sale (P4.SAL.03) — D-PAY-03
+      x-permission: sale.create (branch data)
+      description: 'OPEN sale without a visit; lines = PRODUCT only (late entry ⏭ — F-P4-09). DayLock on today (422 day_closed). Identifying fields: branch_id.'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductSaleCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}:
+    get:
+      tags:
+      - sales
+      operationId: saleGet
+      summary: Sale detail — lines, discount, payments, totals, refunds, adjustments (P4.SAL.02)
+      x-permission: self (performer of a line · visit recorder · creator · finisher) | sale.view+ (branch data)
+      description: Effective values (after sale_adjustments — P4-RULE-15) are returned next to the stored ones. commission_estimate only for the performer whose effective own-earnings
+        flag is ON (D-COM-04, D-DSH-03).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /sales/{id}/items:
+    post:
+      tags:
+      - sales
+      operationId: saleItemAdd
+      summary: Add a service or product line (P4.SAL.04) — AD-POS-04/05
+      x-permission: self (performer · recorder of the visit · creator of a visit-less sale) | visit.update (branch data — also the lines of someone else's OPEN product-only sale)
+      description: 'OPEN sale (FINISHED → 409 invalid_transition with context.correction_path; CANCELLED → 409 invalid_transition without it — v1.1). A difference sale holds exactly the line P4.SAL.13 wrote: any line write on
+        it → 422 difference_line_type. SERVICE → needs a visit, priced by the Part 2 quote on the visit business date (P4-RULE-05); HOME → the performer must be home-eligible (422 not_eligible).
+        PRODUCT → is_sellable, ACTIVE; list price = products.sell_price_amount. added_reason required for a service not in the booking, or any service added after COMPLETE (D-VIS-05).
+        Item codes: not_sold_here · variant_required · service_inactive · category_inactive · product_not_sellable. Negative stock → warnings[] (never blocks — D-STK).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaleItemCreate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/items/{item_id}:
+    patch:
+      tags:
+      - sales
+      operationId: saleItemUpdate
+      summary: Change option (variant) or product quantity (P4.SAL.05) — D-SVC-05
+      x-permission: self (performer · recorder of the visit · creator of a visit-less sale) | visit.update (branch data — also the lines of someone else's OPEN product-only sale)
+      description: 'Variant change re-prices from the quote (an override on the line is cleared). Booking-origin line → reason required (stored in the audit row). Quantity: PRODUCT only.
+        Difference sale → 422 difference_line_type.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaleItemUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/items/{item_id}/remove:
+    post:
+      tags:
+      - sales
+      operationId: saleItemRemove
+      summary: Remove a line — kept, struck through (P4.SAL.06) — D-VIS-05
+      x-permission: self (performer · recorder of the visit · creator of a visit-less sale) | visit.update (branch data — also the lines of someone else's OPEN product-only sale)
+      description: OPEN sale. The TRANSPORT_FEE line cannot be removed (422 transport_line_locked — reduce it with a price override). Removing the last SERVICE line of a COMPLETED visit
+        → 422 service_required. Difference sale → 422 difference_line_type.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/items/{item_id}/price:
+    post:
+      tags:
+      - sales
+      operationId: saleItemPriceOverride
+      summary: Price override / reset (P4.SAL.07) — D-SVC-04/06, F-P4-03
+      x-permission: sale.override_price (branch data)
+      description: 'OPEN sale only. unit_price_amount = list_price_amount resets the override (reason cleared); otherwise reason required. Barbers never hold this code. No self rule:
+        a holder may override a line they performed (a recorded price decision, not a discount approval — P4-RULE-05).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceOverrideRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/discount-code:
+    post:
+      tags:
+      - sales
+      operationId: saleDiscountCodeApply
+      summary: Apply a discount code (P4.SAL.08) — D-PAY-04, AD-POS-09
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: '422 discount_code_invalid { reason: not_found | inactive | not_started | expired | not_valid_here | exhausted } · 422 once_per_customer (when the customer is already
+        known) · 422 discount_source_exists (a pending request, or an approved one still applied — remove it first, P4.DRQ.04).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                  minLength: 2
+                  maxLength: 40
+                  description: Case-insensitive; stored uppercase
+              required:
+              - code
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    delete:
+      tags:
+      - sales
+      operationId: saleDiscountCodeRemove
+      summary: Remove the applied discount code (P4.SAL.09)
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /sales/{id}/finish:
+    post:
+      tags:
+      - sales
+      operationId: saleFinish
+      summary: FINISH — receipt number, immutable (P4.SAL.10) — D-VIS-07/08, D-PAY-06, P4-RULE-10
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: 'Idempotent by state (no Idempotency-Key): already FINISHED → 200 current state. Lock order (P4-RULE-10): DayLock → PayrollLock (sales with SERVICE lines — 423 payroll_finalized)
+        → sale → visit → booking → discount code → customer → receipt counter → stock; READ COMMITTED, checks after the locks. 409 total_changed { total_amount } when expected_total_amount
+        differs · 422 amount_mismatch { remaining_amount } · 422 visit_not_completed · 422 customer_required · once_per_customer (once-per-customer code) · 422 discount_code_invalid
+        (re-checked under lock) · 422 day_closed · 400 reason_required (override actor). Over-transfer change (owner B5) is returned as an automatic OVERPAYMENT_RETURN refund in cash
+        (its client_request_id = a server-generated UUIDv7; a repeat writes no second row).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinishRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /sales/{id}/cancel:
+    post:
+      tags:
+      - sales
+      operationId: saleCancel
+      summary: Cancel an OPEN visit-less sale (P4.SAL.11)
+      x-permission: self (creator) | sale.delete (branch data — cancel, record kept)
+      description: Product-only / difference sales only — a service sale is cancelled by marking the visit incomplete (P4.VIS.06). 422 payments_exist while non-voided payments remain.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/customer:
+    post:
+      tags:
+      - sales
+      operationId: saleCustomerSet
+      summary: Attach / correct the customer after FINISH (P4.SAL.12) — owner B10
+      x-permission: sale.adjust (branch data) | self (performer / finisher — attach only, when the sale has no customer, same business date)
+      description: 'FINISHED sale; customer_id is the only sale field the DB guard lets change (sales_finished_guard). phone null = detach. Customer matched / created by P3-RULE-01.
+        A sale that used a once-per-customer code: the use row moves to the new customer (422 once_per_customer if that customer already used the code) and a detach is refused (422 customer_required_for_discount).
+        Audit sale.customer_set with reason.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerCorrectionRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/difference-sale:
+    post:
+      tags:
+      - sales
+      operationId: saleDifferenceCreate
+      summary: Undercharge — new "difference sale" for the original barber (P4.SAL.13) — owner B10
+      x-permission: sale.adjust (branch data)
+      description: 'Created when the customer is paying the difference (same day or a later visit): a normal OPEN visit-less sale that must be FINISHED or cancelled before the day closes
+        (owner E2); DayLock on today (422 day_closed). Original sale FINISHED; line = SERVICE or TRANSPORT_FEE of it (422 difference_line_type — a difference sale never moves stock).
+        One line with the original line_type (SERVICE: same service / variant, performer = the original line''s effective performer; TRANSPORT_FEE: no performer), list = unit = amount,
+        description "Difference for <receipt> — <line>". Link = a type 9 adjustment on the ORIGINAL sale whose reason starts with difference_sale:<new sale id>:<original sale_item_id>
+        (no DB column — P4-RULE-12) → Sale.difference_of / SaleAdjustment.difference_sale_id. Checkout actors: the creator, that performer, sale.finish_override holders. Idempotency
+        = the new sale''s client_request_id; identifying fields: original sale, sale_item_id, amount.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DifferenceSaleRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /sales/{id}/collectors:
+    get:
+      tags:
+      - sales
+      operationId: saleCollectors
+      summary: '"Collected by" choices (P4.SAL.14) — owner B3'
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: ACTIVE employees assigned to the sale branch on the sale date; clocked in at the branch now first (Part 5 Attendance.openRecordsAt(branch_id) — P5-RULE-18), then by
+        name; is_default marks the performer (or the proxy-1 recorder).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Collector'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /payments:
+    get:
+      tags:
+      - payments
+      operationId: paymentList
+      summary: Payments list (P4.PAY.01) — KBZPay / unverified / by collector
+      x-permission: payment.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Sale business date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: payment_method_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Effective method (after adjustments)
+      - name: verified
+        in: query
+        schema:
+          type: boolean
+      - name: requires_verification
+        in: query
+        schema:
+          type: boolean
+      - name: collected_by_employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: include_voided
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: sale_status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+            x-enum-varnames:
+            - CANCELLED
+            - OPEN
+            - FINISHED
+        description: Repeatable; default 2
+        style: form
+        explode: true
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Reference or receipt number
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PaymentListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /sales/{id}/payments:
+    post:
+      tags:
+      - payments
+      operationId: paymentAdd
+      summary: Take a payment (P4.PAY.02) — D-PAY-01/02, D-VIS-06, AD-POS-08
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: 'OPEN sale; method ACTIVE. Reference required when the method requires one (422 reference_required) and must match payment_methods.reference_regex after trimming spaces
+        (422 reference_format); unique per effective method among non-voided payments — app check under an advisory lock + the DB index (409 duplicate_reference { receipt_number }).
+        amount ≤ remaining (422 amount_exceeds_remaining) — except a non-cash method may exceed it: the excess = change_due_amount, returned in cash at FINISH (owner B5). received_at
+        is required on a late-entry visit (400 validation). 422 day_closed (DayLock is taken before the sale row lock). Identifying fields: sale_id, payment_method_id, amount.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payments/{id}:
+    patch:
+      tags:
+      - payments
+      operationId: paymentCollectorChange
+      summary: Change "collected by" before FINISH (P4.PAY.04) — D-VIS-06, owner B3
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: OPEN sale only (FINISHED → 409 invalid_transition, correction_path adjustment — type 3, P4.ADJ.01). Must be an ACTIVE employee assigned to the sale branch (422 not_assigned_to_branch).
+        422 day_closed.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                collected_by_employee_id:
+                  type: string
+                  format: uuid
+              required:
+              - collected_by_employee_id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payments/{id}/void:
+    post:
+      tags:
+      - payments
+      operationId: paymentVoid
+      summary: Void a payment of an OPEN sale (P4.PAY.03)
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: Row kept, struck through (D-DAT-05). FINISHED sale → 409 invalid_transition (context.correction_path = refund); CANCELLED sale → 409 invalid_transition without correction_path (v1.1). 422 day_closed.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payments/{id}/verification:
+    post:
+      tags:
+      - payments
+      operationId: paymentVerify
+      summary: Verify against the KBZPay app (P4.PAY.05) — D-PAY-02, owner E3
+      x-permission: payment.verify (branch data)
+      description: FINISHED sale, non-voided, effective method requires_verification (422 verification_not_required). Allowed after the day is closed (owner E3 — the closing snapshot
+        does not change; no DayLock). Already verified → 200.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    delete:
+      tags:
+      - payments
+      operationId: paymentUnverify
+      summary: Undo a verification (P4.PAY.06)
+      x-permission: payment.verify (branch data)
+      description: Only while the branch-day is open (422 day_closed with correction_path reopen).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payments/{id}/reference:
+    post:
+      tags:
+      - payments
+      operationId: paymentReferenceCorrect
+      summary: Correct a mistyped KBZPay reference (P4.PAY.07) — owner B10
+      x-permission: payment.verify (branch data)
+      description: Effective method requires a reference; format + effective-method uniqueness as P4.PAY.02 (409 duplicate_reference). Clears verified_at (verify again — allowed after
+        close; the correction itself needs no open day — owner B10). Amount never changes. Audit payment.reference_correct with old / new + reason.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                external_reference:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+                  description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+              required:
+              - external_reference
+              - reason
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /discount-codes:
+    get:
+      tags:
+      - discount-codes
+      operationId: discountCodeList
+      summary: Discount codes with usage (P4.DSC.01) — D-PAY-04
+      x-permission: discount.view+ (company master — read-only at branch scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+            x-enum-varnames:
+            - INACTIVE
+            - ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: is_public
+        in: query
+        schema:
+          type: boolean
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Codes valid at this branch
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Code or name
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DiscountCode'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - discount-codes
+      operationId: discountCodeCreate
+      summary: Create a discount code (P4.DSC.03) — owner B7 a
+      x-permission: discount.create (company master — company scope)
+      description: 422 branches_required (scope_type 2 without branch_ids). Code uppercase ^[A-Z0-9_-]{2,40}$, unique incl. archived (409 already_exists — never reused).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscountCodeCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountCode'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /discount-codes/available:
+    get:
+      tags:
+      - discount-codes
+      operationId: discountCodeAvailable
+      summary: Internal codes valid today at a branch — checkout list (P4.DSC.02) — AD-POS-09
+      x-permission: any staff (read scope) — operational
+      description: ACTIVE, not archived, is_public = false, valid on the date, branch in scope, not exhausted. Public codes are never listed (the customer mentions them).
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today; late entry = the visit date
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AvailableCode'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /discount-codes/{id}:
+    get:
+      tags:
+      - discount-codes
+      operationId: discountCodeGet
+      summary: Discount code detail + usage (P4.DSC.04)
+      x-permission: discount.view+ (company master)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountCode'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - discount-codes
+      operationId: discountCodeUpdate
+      summary: Edit a discount code (P4.DSC.05)
+      x-permission: discount.update (company master — company scope)
+      description: 422 branches_required · code text is immutable once used (409 code_in_use); value / validity / branches / limits apply to future sales only (finished sales keep their
+        amounts).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscountCodeUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountCode'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /discount-codes/{id}/archive:
+    post:
+      tags:
+      - discount-codes
+      operationId: discountCodeArchive
+      summary: Archive (P4.DSC.06)
+      x-permission: discount.delete (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountCode'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /discount-codes/{id}/restore:
+    post:
+      tags:
+      - discount-codes
+      operationId: discountCodeRestore
+      summary: Restore an archived code (P4.DSC.07)
+      x-permission: discount.delete (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountCode'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /discount-requests:
+    get:
+      tags:
+      - discount-requests
+      operationId: discountRequestList
+      summary: Discount requests — approvals inbox (P4.DRQ.01) — AD-POS-16, AD-NTF-04
+      x-permission: discount.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 CANCELLED · 1 PENDING · 2 APPROVED · 3 REJECTED
+            x-enum-varnames:
+            - CANCELLED
+            - PENDING
+            - APPROVED
+            - REJECTED
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: requested_by_user_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DiscountRequest'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /sales/{id}/discount-requests:
+    post:
+      tags:
+      - discount-requests
+      operationId: discountRequestCreate
+      summary: Ask for a discount (P4.DRQ.02) — D-PAY-04, AD-POS-09
+      x-permission: 'self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective performer) |
+        sale.finish_override (branch data — reason on FINISH)'
+      description: OPEN sale; one PENDING per sale (409 discount_request_pending); no code applied (422 discount_source_exists). Notifies every discount.approve holder covering the branch
+        except the requester (owner B7 c).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscountRequestCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountRequest'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /discount-requests/{id}:
+    get:
+      tags:
+      - discount-requests
+      operationId: discountRequestGet
+      summary: Request detail (P4.DRQ.03)
+      x-permission: self (requester) | discount.view+ (branch data)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /discount-requests/{id}/cancel:
+    post:
+      tags:
+      - discount-requests
+      operationId: discountRequestCancel
+      summary: Cancel a pending request / remove an approved one (P4.DRQ.04)
+      x-permission: 'self (requester) | self (performer · recorder of a PHONE_UNAVAILABLE proxy visit · creator of a visit-less sale · difference sale: also the original line''s effective
+        performer) | sale.finish_override (branch data — reason on FINISH)'
+      description: Sale OPEN (else 409 invalid_transition). PENDING → 0 CANCELLED. APPROVED and applied → removed from the sale (sales.discount_request_id = NULL, discount recomputed
+        to 0); the row stays 2 APPROVED with its decision (DB decision CHECK) and returns applied = false; audit discount_request.remove (P4-RULE-08).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /discount-requests/{id}/approve:
+    post:
+      tags:
+      - discount-requests
+      operationId: discountRequestApprove
+      summary: Approve (P4.DRQ.05) — owner B7 b / d
+      x-permission: discount.approve (branch data)
+      description: PENDING and sale OPEN (else 409 invalid_transition). 422 self_approval when the approver is the requester. The discount applies at once (realtime) to the lines existing
+        at the decision (sale_items.created_at ≤ decided_at) and never grows afterwards (P4-RULE-06).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 1000
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /discount-requests/{id}/reject:
+    post:
+      tags:
+      - discount-requests
+      operationId: discountRequestReject
+      summary: Reject (P4.DRQ.06)
+      x-permission: discount.approve (branch data)
+      description: PENDING only. 422 self_approval as approve.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 1000
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscountRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /refunds:
+    get:
+      tags:
+      - refunds
+      operationId: refundList
+      summary: Refunds list (P4.RFD.01)
+      x-permission: sale.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Refund business date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: kind
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND (items → commission reversal) · 2 OVERPAYMENT_RETURN (no revenue / commission effect — F-P4-06)
+          x-enum-varnames:
+          - SALE_REFUND
+          - OVERPAYMENT_RETURN
+      - name: sale_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: RF number or original receipt number
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RefundListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - refunds
+      operationId: refundCreate
+      summary: Refund items or return an overpayment (P4.RFD.02) — D-PAY-05, owner B8 / B12
+      x-permission: sale.refund (branch data — the sale branch)
+      description: 'FINISHED sale (409 invalid_transition). Refund branch = the sale branch (owner B8 b). Any ACTIVE method (owner B8 c; reference rules as payments). Kind 1 (sale refund):
+        per line amount ≤ the line net remaining and Σ kind-1 refunds ≤ the sale total (422 refund_exceeds_remaining { sale_item_id, remaining_amount }), product lines back_to_stock
+        (owner B8 a → Part 6 StockLedger.post: SALE_RETURN_IN; false = also MANUAL_ADJUST −qty with the stock.refund_damaged_reason_id reason, note = RF number). Kind 2 (overpayment
+        return — the automatic change at FINISH = paid − total needs no code; a manual return = a duplicate transfer never recorded as a payment): amount, reason and external_reference
+        required, no items; each manual return ≤ max(sale total, Σ non-voided non-cash payments of the sale) (422 refund_exceeds_remaining with sale_item_id null); kind-2 returns do
+        not consume the kind-1 cap (D-PAY-05). Missing items (kind 1) / amount (kind 2) → 400 validation. Refund references are not checked for uniqueness. RF number from receipt_counters
+        kind 2; refund business_date = today (DayLock first — 422 day_closed). Identifying fields: sale_id, kind, amount.'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /refunds/{id}:
+    get:
+      tags:
+      - refunds
+      operationId: refundGet
+      summary: Refund detail (P4.RFD.03)
+      x-permission: sale.view+ (branch data)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /sales/{id}/adjustments:
+    post:
+      tags:
+      - adjustments
+      operationId: saleAdjustmentCreate
+      summary: Correction after FINISH — method / performer / collected by / note (P4.ADJ.01) — F-P4-07, owner B9
+      x-permission: sale.adjust (branch data)
+      description: 'FINISHED sale; amounts never change (overcharge → refund · undercharge → P4.SAL.13). Types 1–3: 422 day_closed when the sale business date is closed (owner B9 → admin
+        reopens). Type 2: 423 payroll_finalized for the old or new performer (owner B9 → manual payroll line). Type 1 to a reference method: external_reference required, unique on the
+        effective method (409 duplicate_reference), written on the payment row (owner B10); to a method without references the payment''s external_reference is cleared. Same effective
+        value already → 200, no row (natural-key replay); type 9: the same reason again by the same user → 200, no row. Lock order: DayLock → PayrollLock (type 2) → sale row.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustmentCreate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /sales/{id}/receipt:
+    get:
+      tags:
+      - receipts
+      operationId: saleReceipt
+      summary: Sale receipt — view / PDF / print image, reprint (P4.RCP.01) — D-PAY-06/07, AD-RCPT-01/02, AD-POS-13
+      x-permission: any staff (read scope) — operational (any colleague may print — AD-POS-13)
+      description: FINISHED sales only (409 invalid_transition). Always English (OPEN-32).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - json
+          - pdf
+          - png
+          default: json
+        description: json = receipt data · pdf = stored PDF (Share) · png = 1-bit print image
+      - name: width
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 58
+          - 80
+        description: Printer width; default = branch setting receipt.printer_width_mm (384 / 576 px)
+      responses:
+        '200':
+          description: Receipt — identical on every reprint (stored by receipt.render; rendered on the fly if the job has not run yet)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReceiptView'
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /refunds/{id}/receipt:
+    get:
+      tags:
+      - receipts
+      operationId: refundReceipt
+      summary: Refund receipt (RF series) (P4.RCP.02)
+      x-permission: any staff (read scope) — operational
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - json
+          - pdf
+          - png
+          default: json
+        description: json = receipt data · pdf = stored PDF (Share) · png = 1-bit print image
+      - name: width
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 58
+          - 80
+        description: Printer width; default = branch setting receipt.printer_width_mm (384 / 576 px)
+      responses:
+        '200':
+          description: Receipt — identical on every reprint (stored by receipt.render; rendered on the fly if the job has not run yet)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReceiptView'
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /receipts/lookup:
+    get:
+      tags:
+      - receipts
+      operationId: receiptLookup
+      summary: Find a sale / refund by receipt number (P4.RCP.03)
+      x-permission: any staff (read scope) — operational
+      parameters:
+      - name: number
+        in: query
+        schema:
+          type: string
+          maxLength: 40
+        description: Exact number, case-insensitive (B3-2026-OCT-00125 / B3-RF-2026-OCT-00003)
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReceiptLookup'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /receipts:
+    get:
+      tags:
+      - receipts
+      operationId: receiptList
+      summary: Today's receipts at a branch — print for a colleague (P4.RCP.04) — AD-POS-13
+      x-permission: any staff (read scope) — operational
+      description: 'Number, time, barber, kind — no amounts (AD-PERM-05: no colleague figures in lists; the amounts appear only on the opened receipt).'
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today; at most 7 days back
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ReceiptListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /payment-methods:
+    get:
+      tags:
+      - payment-methods
+      operationId: paymentMethodList
+      summary: Payment methods (P4.PMT.01) — D-PAY-01
+      x-permission: any staff (read scope) — operational (ACTIVE); status=0 / include_archived=true → payment_method.view+ (company master)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+            x-enum-varnames:
+            - INACTIVE
+            - ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PaymentMethod'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - payment-methods
+      operationId: paymentMethodCreate
+      summary: Add a payment method (P4.PMT.02)
+      x-permission: payment_method.create (company master — company scope)
+      description: code ^[A-Z0-9_]{2,30}$ unique (409 already_exists); reference_regex must compile (400 invalid_regex). is_cash follows kind 1.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentMethodCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payment-methods/order:
+    put:
+      tags:
+      - payment-methods
+      operationId: paymentMethodReorder
+      summary: Reorder (P4.PMT.06)
+      x-permission: payment_method.update (company master — company scope)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PaymentMethod'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /payment-methods/{id}:
+    patch:
+      tags:
+      - payment-methods
+      operationId: paymentMethodUpdate
+      summary: Edit a payment method (P4.PMT.03)
+      x-permission: payment_method.update (company master — company scope)
+      description: 'System rows CASH / KBZPAY: code and kind fixed, CASH cannot be deactivated (409 system_row). Flag changes apply to future payments.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentMethodUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payment-methods/{id}/archive:
+    post:
+      tags:
+      - payment-methods
+      operationId: paymentMethodArchive
+      summary: Archive (P4.PMT.04)
+      x-permission: payment_method.delete (company master — company scope)
+      description: System rows → 409 system_row.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payment-methods/{id}/restore:
+    post:
+      tags:
+      - payment-methods
+      operationId: paymentMethodRestore
+      summary: Restore (P4.PMT.05)
+      x-permission: payment_method.delete (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /me/requests/{client_request_id}:
+    get:
+      tags:
+      - visits
+      operationId: myRequestLookup
+      summary: '"Was it saved?" — find what my client_request_id created (P4.REQ.01) — AD-NET-02'
+      x-permission: self (rows created by the caller)
+      description: Searches visits, sales, payments, refunds and stock movements (Part 6 usage / manual adjustment — stock_movements.client_request_id, DB Part 6 v1.2) created by the
+        caller; 404 = not saved → the client may retry with the same key.
+      parameters:
+      - name: client_request_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The Idempotency-Key the client sent
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestLookup'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: client_request_id — one UUID per logical submit, kept across retries (API-IDEM-01, AD-NET-01, 🔒 D-VIS-10); missing → 400 idempotency_key_required
+  responses:
+    ValidationError:
+      description: 400 validation · reason_required · phone_invalid · idempotency_key_required · invalid_regex (errors[] per field)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden (context.required names the missing code) · out_of_scope · company_scope_required (ADR-012) · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (unknown id, out-of-scope single read)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 invalid_transition (context.correction_path on a FINISHED sale where P4-RULE-01 names a correction — omitted for a payment add on a FINISHED sale and for every write on a CANCELLED sale, v1.1) · duplicate_reference (payments — effective method) · discount_request_pending · total_changed
+        · already_exists · code_in_use · system_row · idempotency_in_progress · conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/04-visits-sales-payments.md §11 (day_closed, unpaid_visit_open, amount_mismatch, service_required, discount_code_invalid, once_per_customer,
+        customer_required_for_discount, self_approval, refund_exceeds_remaining, difference_line_type, …)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: 423 payroll_finalized (Part 5 PayrollLock — late-entry START, FINISH with SERVICE lines, PERFORMER adjustment) · locked (only the DB guard finished_immutable — the
+        services answer 409 invalid_transition first, P4-RULE-01)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data (API-ERR-01 v1.4): day_closed → { branch_id, business_date, closed_at, closed_by, correction_path: "reopen" } (Part 7) · unpaid_visit_open → { visit_id
+            } · amount_mismatch → { remaining_amount } · total_changed → { total_amount } · duplicate_reference → { receipt_number } · discount_code_invalid → { reason } · refund_exceeds_remaining
+            → { sale_item_id (null = sale-level cap), remaining_amount } · payroll_finalized → { employee_id, run_id, period: { start, end }, status } (Part 5) · invalid_transition →
+            { status, visit_id?, correction_path? } (correction_path on a FINISHED sale: adjustment | refund | difference_sale — P4-RULE-01; omitted for a payment add on a FINISHED sale and for every write on a CANCELLED sale — v1.1) · forbidden → { required }'
+      required:
+      - type
+      - title
+      - status
+      - code
+    EmployeeRef:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+      required:
+      - id
+      - display_name
+    UserRef:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+      required:
+      - user_id
+      - display_name
+    PaymentMethodRef:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+          x-enum-varnames:
+          - CASH
+          - MOBILE_WALLET
+          - BANK_TRANSFER
+          - CARD
+      required:
+      - id
+      - code
+      - name_mm
+      - kind
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: not_eligible (walk-in service the barber is not eligible for — recorded anyway) · negative_stock · booked_price_kept / performer_price_lower (owner B4) · customer_restored
+            · customer_reactivated · pending_request_cancelled
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    ReasonBody:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - reason
+    ItemRef:
+      type: object
+      properties:
+        service_id:
+          type: string
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Required for OPTIONS services (variant_required)
+      required:
+      - service_id
+    LateEntry:
+      type: object
+      properties:
+        reason:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 9
+          description: 1 INTERNET_OUTAGE · 2 POWER_OUTAGE · 3 PHONE_BROKEN · 4 FORGOT · 9 OTHER (note required) — D-VIS-13
+          x-enum-varnames:
+          - INTERNET_OUTAGE
+          - POWER_OUTAGE
+          - PHONE_BROKEN
+          - FORGOT
+          - OTHER
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when reason = 9 OTHER
+        started_at:
+          type: string
+          format: date-time
+          description: Actual start (performed_at — D-VIS-13); ≤ now; its MMT date must be an open branch-day (owner B11)
+      required:
+      - reason
+      - started_at
+    StartVisitRequest:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        booking_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Start from a BOOKED booking of this branch dated today (or the late-entry date) — booking items become SERVICE lines
+        performed_by_employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Actual service barber; default = the booked barber (booking) or the caller (walk-in) — D-AUTH-07
+        proxy_reason:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: 'Required when the performer is not the caller (D-VIS-04/12); no note field (§10.6 #16)'
+        performer_change_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when the performer ≠ the booked barber (D-VIS-04)
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: Walk-in only (a booking brings its own location)
+          x-enum-varnames:
+          - BRANCH
+          - HOME
+        home_address:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Walk-in HOME only (required)
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemRef'
+          description: 'Walk-in: optional first services (D-VIS-02 — service optional at START); ignored for a booking'
+        late_entry:
+          oneOf:
+          - $ref: '#/components/schemas/LateEntry'
+          - type: 'null'
+          description: Record a past service — needs sale.late_entry (D-VIS-13)
+      required:
+      - branch_id
+    CompleteRequest:
+      type: object
+      properties:
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: 'Late-entry visits: REQUIRED (400 validation when missing; ≥ started_at, ≤ now); otherwise ignored = now'
+    CommissionEstimate:
+      type: object
+      properties:
+        estimate_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        base_amount:
+          type: integer
+          minimum: 0
+          description: Net SERVICE lines of this sale for the performer (D-COM-02)
+        month_to_date_base_amount:
+          type: integer
+          minimum: 0
+          description: 'Period-to-date commissionable base of the performer in the payroll period containing the sale business date (MONTHLY = the month), from sales finished before
+            this sale (an OPEN sale: everything finished so far) — P4-RULE-20'
+        note:
+          type: string
+          enum:
+          - final_at_month_end
+      required:
+      - estimate_amount
+      - base_amount
+      - month_to_date_base_amount
+      - note
+      description: Part 5 Commission.estimate(employee_id, business_date, base_amount, branch_id = the sale branch, before = finished_at) — marginal tiers (owner C12); only for the performer
+        whose effective own-earnings flag is ON
+    SaleItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sort_order:
+          type: integer
+        line_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 SERVICE · 2 PRODUCT · 3 TRANSPORT_FEE
+          x-enum-varnames:
+          - SERVICE
+          - PRODUCT
+          - TRANSPORT_FEE
+        service_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        product_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        booking_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        performed_by:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        effective_performed_by:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+          description: After PERFORMER adjustments (P4-RULE-15)
+        description_mm:
+          type: string
+        description_en:
+          type:
+          - string
+          - 'null'
+        quantity:
+          type: integer
+          minimum: 1
+        list_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        price_overridden:
+          type: boolean
+        price_override_reason:
+          type:
+          - string
+          - 'null'
+        price_override_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        line_discount_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        line_total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        refunded_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        added_reason:
+          type:
+          - string
+          - 'null'
+        removed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        removed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        removed_reason:
+          type:
+          - string
+          - 'null'
+      required:
+      - id
+      - sort_order
+      - line_type
+      - description_mm
+      - quantity
+      - list_price_amount
+      - unit_price_amount
+      - price_overridden
+      - line_discount_amount
+      - line_total_amount
+      - refunded_amount
+    Payment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            kind:
+              type: integer
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+              x-enum-varnames:
+              - CASH
+              - MOBILE_WALLET
+              - BANK_TRANSFER
+              - CARD
+          required:
+          - id
+          - code
+          - name_mm
+          - kind
+        effective_payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            kind:
+              type: integer
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+              x-enum-varnames:
+              - CASH
+              - MOBILE_WALLET
+              - BANK_TRANSFER
+              - CARD
+          required:
+          - id
+          - code
+          - name_mm
+          - kind
+          description: After PAYMENT_METHOD adjustments — closing / reports use this (contract 8)
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        external_reference:
+          type:
+          - string
+          - 'null'
+        collected_by:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        effective_collected_by:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        received_at:
+          type: string
+          format: date-time
+        recorded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        requires_verification:
+          type: boolean
+          description: Of the effective method
+        verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        verified_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        voided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        voided_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        void_reason:
+          type:
+          - string
+          - 'null'
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - sale_id
+      - payment_method
+      - effective_payment_method
+      - amount
+      - collected_by
+      - effective_collected_by
+      - received_at
+      - recorded_by
+      - requires_verification
+      - created_at
+    PaymentListItem:
+      allOf:
+      - $ref: '#/components/schemas/Payment'
+      - type: object
+        properties:
+          branch_id:
+            type: string
+            format: uuid
+          receipt_number:
+            type:
+            - string
+            - 'null'
+          sale_status:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+            x-enum-varnames:
+            - CANCELLED
+            - OPEN
+            - FINISHED
+          sale_business_date:
+            type:
+            - string
+            - 'null'
+            format: date
+        required:
+        - branch_id
+        - sale_status
+    SaleDiscount:
+      type: object
+      properties:
+        source:
+          type: string
+          enum:
+          - code
+          - request
+        discount_code_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        code:
+          type:
+          - string
+          - 'null'
+        code_name_mm:
+          type:
+          - string
+          - 'null'
+        code_name_en:
+          type:
+          - string
+          - 'null'
+        discount_request_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          maximum: 100
+        discount_value_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: AMOUNT type value
+        eligible_amount:
+          type: integer
+          minimum: 0
+          description: 'Code: active non-transport lines · request: the approved lines only (created before the approval and still active — P4-RULE-06)'
+        rounded_to_amount:
+          type: integer
+          description: Setting sales.discount_round_to_amount (100 — owner B6)
+      required:
+      - source
+      - discount_type
+      - eligible_amount
+    RefundSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND (items → commission reversal) · 2 OVERPAYMENT_RETURN (no revenue / commission effect — F-P4-06)
+          x-enum-varnames:
+          - SALE_REFUND
+          - OVERPAYMENT_RETURN
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        refund_receipt_number:
+          type: string
+        refunded_at:
+          type: string
+          format: date-time
+        automatic_change:
+          type: boolean
+      required:
+      - id
+      - kind
+      - amount
+      - refund_receipt_number
+      - refunded_at
+      - automatic_change
+    SaleAdjustment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        adjustment_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 9
+          description: 1 PAYMENT_METHOD · 2 PERFORMER · 3 COLLECTED_BY · 9 OTHER (note only) — F-P4-07
+          x-enum-varnames:
+          - PAYMENT_METHOD
+          - PERFORMER
+          - COLLECTED_BY
+          - OTHER
+        payment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sale_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        new_payment_method:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              kind:
+                type: integer
+                enum:
+                - 1
+                - 2
+                - 3
+                - 4
+                description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+                x-enum-varnames:
+                - CASH
+                - MOBILE_WALLET
+                - BANK_TRANSFER
+                - CARD
+            required:
+            - id
+            - code
+            - name_mm
+            - kind
+          - type: 'null'
+        new_employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        reason:
+          type: string
+        difference_sale_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Type 9 link row of a difference sale — parsed from the reason token difference_sale:<new sale id>:<sale_item_id> (P4-RULE-12)
+        adjusted_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        adjusted_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - sale_id
+      - adjustment_type
+      - reason
+      - adjusted_by
+      - adjusted_at
+    SaleActions:
+      type: object
+      properties:
+        edit_lines:
+          type: boolean
+        take_payment:
+          type: boolean
+        finish:
+          type: boolean
+        finish_needs_reason:
+          type: boolean
+          description: Caller acts through sale.finish_override
+        override_price:
+          type: boolean
+        mark_incomplete:
+          type: boolean
+        request_discount:
+          type: boolean
+        refund:
+          type: boolean
+        adjust:
+          type: boolean
+      description: What the caller may do now (permission + state — AD-PERM-02); the API still decides
+    Sale:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        visit_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        kind:
+          type: string
+          enum:
+          - service
+          - product_only
+          - difference
+          description: difference = visit-less sale with a SERVICE / TRANSPORT_FEE line (owner B10)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+          x-enum-varnames:
+          - CANCELLED
+          - OPEN
+          - FINISHED
+        customer:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name:
+                type: string
+              phone:
+                type: string
+            required:
+            - id
+            - name
+            - phone
+          - type: 'null'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SaleItem'
+        subtotal_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        discount_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        discount:
+          oneOf:
+          - $ref: '#/components/schemas/SaleDiscount'
+          - type: 'null'
+        pending_discount_request:
+          oneOf:
+          - $ref: '#/components/schemas/DiscountRequest'
+          - type: 'null'
+        service_charge_rate:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Percent, ≤ 2 decimals (numeric(5,2) snapshot)
+        service_charge_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        tax_rate:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Percent, ≤ 2 decimals (numeric(5,2) snapshot)
+        tax_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        paid_amount:
+          type: integer
+          minimum: 0
+          description: Σ non-voided payments
+        remaining_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        change_due_amount:
+          type: integer
+          minimum: 0
+          description: Non-cash over-transfer to return in cash at FINISH (owner B5)
+        payments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Payment'
+        receipt_number:
+          type:
+          - string
+          - 'null'
+        business_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finished_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        refunds:
+          type: array
+          items:
+            $ref: '#/components/schemas/RefundSummary'
+        refunded_amount:
+          type: integer
+          minimum: 0
+          description: Σ kind-1 refunds
+        adjustments:
+          type: array
+          items:
+            $ref: '#/components/schemas/SaleAdjustment'
+        commission_estimate:
+          oneOf:
+          - $ref: '#/components/schemas/CommissionEstimate'
+          - type: 'null'
+        difference_of:
+          oneOf:
+          - type: object
+            properties:
+              sale_id:
+                type: string
+                format: uuid
+              sale_item_id:
+                type: string
+                format: uuid
+              receipt_number:
+                type: string
+            required:
+            - sale_id
+            - sale_item_id
+            - receipt_number
+          - type: 'null'
+          description: 'Difference sales only: the original sale and line (from the type-9 link row on the original — P4-RULE-12)'
+        actions:
+          $ref: '#/components/schemas/SaleActions'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - kind
+      - status
+      - items
+      - subtotal_amount
+      - discount_amount
+      - service_charge_rate
+      - service_charge_amount
+      - tax_rate
+      - tax_amount
+      - total_amount
+      - paid_amount
+      - remaining_amount
+      - change_due_amount
+      - payments
+      - refunds
+      - refunded_amount
+      - adjustments
+      - actions
+      - warnings
+      - created_at
+      - updated_at
+    SaleListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        visit_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        kind:
+          type: string
+          enum:
+          - service
+          - product_only
+          - difference
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+          x-enum-varnames:
+          - CANCELLED
+          - OPEN
+          - FINISHED
+        receipt_number:
+          type:
+          - string
+          - 'null'
+        business_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        customer_name:
+          type:
+          - string
+          - 'null'
+        performers:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+        items_label_mm:
+          type: string
+        items_label_en:
+          type:
+          - string
+          - 'null'
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        discount_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        refunded_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        payment_methods:
+          type: array
+          items:
+            type: string
+        flags:
+          type: array
+          items:
+            type: string
+            enum:
+            - late_entry
+            - proxy
+            - home
+            - price_changed
+            - discount
+            - refunded
+            - adjusted
+      required:
+      - id
+      - branch_id
+      - kind
+      - status
+      - total_amount
+      - performers
+      - flags
+    Visit:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        booking_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 INCOMPLETE · 1 STARTED · 2 COMPLETED (awaiting payment) · 3 FINISHED (D-VIS-07/09)
+          x-enum-varnames:
+          - INCOMPLETE
+          - STARTED
+          - COMPLETED
+          - FINISHED
+        performed_by:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        booked_employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        performer_change_reason:
+          type:
+          - string
+          - 'null'
+        proxy_reason:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: 'null = recorded by the performer · 1 PHONE_UNAVAILABLE (recorder may also pay + FINISH — D-VIS-12) · 2 OTHER (help-record: START / lines / COMPLETE only — D-VIS-04)'
+        started_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+          description: Recorded by (D-VIS-03/12)
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-SVC-06)
+          x-enum-varnames:
+          - BRANCH
+          - HOME
+        home_address:
+          type:
+          - string
+          - 'null'
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        completed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        incomplete_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        incomplete_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        incomplete_reason:
+          type:
+          - string
+          - 'null'
+        is_late_entry:
+          type: boolean
+        late_entry_reason:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 9
+          - null
+          description: null = not a late entry · 1 INTERNET_OUTAGE · 2 POWER_OUTAGE · 3 PHONE_BROKEN · 4 FORGOT · 9 OTHER
+        late_entry_note:
+          type:
+          - string
+          - 'null'
+        business_date:
+          type: string
+          format: date
+        recorded_at:
+          type: string
+          format: date-time
+          description: = created_at (D-VIS-13 recorded_at)
+        updated_at:
+          type: string
+          format: date-time
+        sale:
+          $ref: '#/components/schemas/Sale'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+      required:
+      - id
+      - branch_id
+      - status
+      - performed_by
+      - started_by
+      - location_type
+      - started_at
+      - is_late_entry
+      - business_date
+      - recorded_at
+      - updated_at
+      - sale
+      - warnings
+    VisitListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 INCOMPLETE · 1 STARTED · 2 COMPLETED (awaiting payment) · 3 FINISHED (D-VIS-07/09)
+          x-enum-varnames:
+          - INCOMPLETE
+          - STARTED
+          - COMPLETED
+          - FINISHED
+        performed_by:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        started_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        booking_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        customer_name:
+          type:
+          - string
+          - 'null'
+        services_label_mm:
+          type:
+          - string
+          - 'null'
+        services_label_en:
+          type:
+          - string
+          - 'null'
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        sale_id:
+          type: string
+          format: uuid
+        sale_status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+          x-enum-varnames:
+          - CANCELLED
+          - OPEN
+          - FINISHED
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        receipt_number:
+          type:
+          - string
+          - 'null'
+        is_late_entry:
+          type: boolean
+        proxy_reason:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: 'null = recorded by the performer · 1 PHONE_UNAVAILABLE (recorder may also pay + FINISH — D-VIS-12) · 2 OTHER (help-record: START / lines / COMPLETE only — D-VIS-04)'
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-SVC-06)
+          x-enum-varnames:
+          - BRANCH
+          - HOME
+      required:
+      - id
+      - branch_id
+      - business_date
+      - status
+      - performed_by
+      - started_by
+      - started_at
+      - sale_id
+      - sale_status
+      - total_amount
+      - is_late_entry
+      - location_type
+    ProductSaleCreate:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              product_id:
+                type: string
+                format: uuid
+              quantity:
+                type: integer
+                minimum: 1
+                default: 1
+            required:
+            - product_id
+      required:
+      - branch_id
+    SaleItemCreate:
+      type: object
+      properties:
+        line_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SERVICE · 2 PRODUCT (the TRANSPORT_FEE line is automatic)
+        service_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        product_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          default: 1
+          description: PRODUCT only
+        added_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required for a service not in the booking, or any service added after COMPLETE (D-VIS-05)
+      required:
+      - line_type
+    SaleItemUpdate:
+      type: object
+      properties:
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when changing the option of a booking-origin line
+    PriceOverrideRequest:
+      type: object
+      properties:
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required unless unit_price_amount = list_price_amount (reset)
+      required:
+      - unit_price_amount
+    FinishRequest:
+      type: object
+      properties:
+        expected_total_amount:
+          type: integer
+          minimum: 0
+          description: The total shown on the Finish button — 409 total_changed if the sale moved
+        customer:
+          oneOf:
+          - type: object
+            properties:
+              phone:
+                type: string
+                maxLength: 50
+                description: Any format — normalised to E.164 (API-DATA-06)
+              name:
+                type:
+                - string
+                - 'null'
+                maxLength: 255
+                description: 'Required for a new phone (customers.name NOT NULL — §10.6 #11)'
+            required:
+            - phone
+          - type: 'null'
+          description: null / omitted = keep the booking customer or Skip (D-VIS-02); required with a once-per-customer code
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: 'Late-entry visits: REQUIRED (400 validation when missing) — the payment time (≥ completed_at and ≥ the latest payment received_at, ≤ now — P4-RULE-10 #1) → sale
+            business date = that day; otherwise ignored = now'
+        override_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when the caller finishes through sale.finish_override (D-VIS-06)
+      required:
+      - expected_total_amount
+    CustomerCorrectionRequest:
+      type: object
+      properties:
+        phone:
+          type:
+          - string
+          - 'null'
+          maxLength: 50
+          description: null = detach the customer (refused with 422 customer_required_for_discount when the sale used a once-per-customer code)
+        name:
+          type:
+          - string
+          - 'null'
+          maxLength: 255
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - phone
+      - reason
+    DifferenceSaleRequest:
+      type: object
+      properties:
+        sale_item_id:
+          type: string
+          format: uuid
+          description: The undercharged SERVICE / TRANSPORT_FEE line of the FINISHED sale
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - sale_item_id
+      - amount
+      - reason
+    Collector:
+      type: object
+      properties:
+        employee_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        clocked_in:
+          type: boolean
+        is_default:
+          type: boolean
+      required:
+      - employee_id
+      - display_name
+      - clocked_in
+      - is_default
+    PaymentCreate:
+      type: object
+      properties:
+        payment_method_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        external_reference:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+          description: Required when the method requires_reference (KBZPay — D-PAY-02); spaces trimmed
+        collected_by_employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Default = performer, or the recorder of a PHONE_UNAVAILABLE proxy visit (D-VIS-06/12); any ACTIVE staff of the branch (owner B3)
+        received_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: 'Late-entry visits: REQUIRED (400 validation when missing; ≥ completed_at, ≤ now); otherwise ignored = now'
+      required:
+      - payment_method_id
+      - amount
+    PaymentMethod:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+          x-enum-varnames:
+          - CASH
+          - MOBILE_WALLET
+          - BANK_TRANSFER
+          - CARD
+        is_cash:
+          type: boolean
+        requires_reference:
+          type: boolean
+        requires_verification:
+          type: boolean
+        reference_regex:
+          type:
+          - string
+          - 'null'
+          description: Format check after trimming spaces (OPEN-24 — replaces the dropped setting sales.kbzpay_reference_regex); the UI builds the helper text from it (AD-FORM-12)
+        is_system:
+          type: boolean
+          description: CASH / KBZPAY seed rows
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - code
+      - name_mm
+      - kind
+      - is_cash
+      - requires_reference
+      - requires_verification
+      - is_system
+      - sort_order
+      - status
+    PaymentMethodCreate:
+      type: object
+      properties:
+        code:
+          type: string
+          pattern: ^[A-Z0-9_]{2,30}$
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+          x-enum-varnames:
+          - CASH
+          - MOBILE_WALLET
+          - BANK_TRANSFER
+          - CARD
+        requires_reference:
+          type: boolean
+          default: false
+        requires_verification:
+          type: boolean
+          default: false
+        reference_regex:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        sort_order:
+          type: integer
+      required:
+      - code
+      - name_mm
+      - kind
+    PaymentMethodUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        requires_reference:
+          type: boolean
+        requires_verification:
+          type: boolean
+        reference_regex:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    DiscountCode:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          maximum: 100
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        is_public:
+          type: boolean
+        once_per_customer:
+          type: boolean
+        max_uses:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        used_count:
+          type: integer
+        scope_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ALL_BRANCHES · 2 BRANCHES (branch_ids)
+          x-enum-varnames:
+          - ALL_BRANCHES
+          - BRANCHES
+        branch_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type:
+          - string
+          - 'null'
+          format: date
+        valid_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - code
+      - name_mm
+      - discount_type
+      - is_public
+      - once_per_customer
+      - used_count
+      - scope_type
+      - branch_ids
+      - status
+      - created_at
+      - updated_at
+    DiscountCodeCreate:
+      type: object
+      properties:
+        code:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{2,40}$
+          description: Stored uppercase
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          maximum: 100
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        is_public:
+          type: boolean
+          default: false
+        once_per_customer:
+          type: boolean
+          default: false
+        max_uses:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        scope_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ALL_BRANCHES · 2 BRANCHES (branch_ids)
+          x-enum-varnames:
+          - ALL_BRANCHES
+          - BRANCHES
+        branch_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type:
+          - string
+          - 'null'
+          format: date
+        valid_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+      required:
+      - code
+      - name_mm
+      - discount_type
+      - scope_type
+    DiscountCodeUpdate:
+      type: object
+      properties:
+        code:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{2,40}$
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          maximum: 100
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        is_public:
+          type: boolean
+        once_per_customer:
+          type: boolean
+        max_uses:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        scope_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ALL_BRANCHES · 2 BRANCHES (branch_ids)
+          x-enum-varnames:
+          - ALL_BRANCHES
+          - BRANCHES
+        branch_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type:
+          - string
+          - 'null'
+          format: date
+        valid_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    AvailableCode:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        once_per_customer:
+          type: boolean
+        valid_to:
+          type:
+          - string
+          - 'null'
+          format: date
+      required:
+      - id
+      - code
+      - name_mm
+      - discount_type
+      - once_per_customer
+    DiscountRequestCreate:
+      type: object
+      properties:
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          maximum: 100
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - discount_type
+      - reason
+    DiscountRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        requested_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        requested_at:
+          type: string
+          format: date-time
+        discount_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PERCENT · 2 AMOUNT
+          x-enum-varnames:
+          - PERCENT
+          - AMOUNT
+        discount_percent:
+          type:
+          - integer
+          - 'null'
+        discount_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        reason:
+          type: string
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 PENDING · 2 APPROVED · 3 REJECTED
+          x-enum-varnames:
+          - CANCELLED
+          - PENDING
+          - APPROVED
+          - REJECTED
+        decided_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        decided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        decision_note:
+          type:
+          - string
+          - 'null'
+        applied:
+          type: boolean
+          description: APPROVED and still the discount source of the sale (sales.discount_request_id = id); false after it was removed with P4.DRQ.04
+        sale_summary:
+          type: object
+          properties:
+            performed_by:
+              oneOf:
+              - type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  display_name:
+                    type: string
+                required:
+                - id
+                - display_name
+              - type: 'null'
+            items_label_mm:
+              type: string
+            items_label_en:
+              type:
+              - string
+              - 'null'
+            subtotal_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04, API-DATA-02)
+            eligible_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04, API-DATA-02)
+            resulting_discount_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04, API-DATA-02)
+            resulting_total_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04, API-DATA-02)
+            sale_status:
+              type: integer
+              enum:
+              - 0
+              - 1
+              - 2
+              description: 0 CANCELLED · 1 OPEN · 2 FINISHED (immutable — D-VIS-08)
+              x-enum-varnames:
+              - CANCELLED
+              - OPEN
+              - FINISHED
+          required:
+          - subtotal_amount
+          - eligible_amount
+          - resulting_discount_amount
+          - resulting_total_amount
+          - sale_status
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - sale_id
+      - branch_id
+      - requested_by
+      - requested_at
+      - discount_type
+      - reason
+      - status
+      - applied
+      - sale_summary
+      - updated_at
+    RefundItemCreate:
+      type: object
+      properties:
+        sale_item_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          default: 1
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        back_to_stock:
+          type: boolean
+          default: true
+          description: 'PRODUCT lines: false = damaged / not resaleable (owner B8 a → SALE_RETURN_IN + MANUAL_ADJUST)'
+      required:
+      - sale_item_id
+      - amount
+    RefundCreate:
+      type: object
+      properties:
+        sale_id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND (items → commission reversal) · 2 OVERPAYMENT_RETURN (no revenue / commission effect — F-P4-06)
+          x-enum-varnames:
+          - SALE_REFUND
+          - OVERPAYMENT_RETURN
+        payment_method_id:
+          type: string
+          format: uuid
+        external_reference:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+          description: Required for a reference method (KBZPay transfer back) and always for a manual kind-2 return (the reference of the return transfer, else of the duplicate transfer
+            being returned) — 422 reference_required
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RefundItemCreate'
+          minItems: 1
+          description: Kind 1 only (required — 400 validation when missing or empty)
+        amount:
+          type: integer
+          minimum: 1
+          description: Kind 2 only (required — 400 validation when missing; ≤ max(sale total, Σ non-voided non-cash payments of the sale)); kind 1 = Σ items
+      required:
+      - sale_id
+      - kind
+      - payment_method_id
+      - reason
+    RefundItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_item_id:
+          type: string
+          format: uuid
+        line_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 SERVICE · 2 PRODUCT · 3 TRANSPORT_FEE
+          x-enum-varnames:
+          - SERVICE
+          - PRODUCT
+          - TRANSPORT_FEE
+        description_mm:
+          type: string
+        description_en:
+          type:
+          - string
+          - 'null'
+        performed_by:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        quantity:
+          type: integer
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+      required:
+      - id
+      - sale_item_id
+      - line_type
+      - description_mm
+      - quantity
+      - amount
+    Refund:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        original_receipt_number:
+          type: string
+        branch_id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND (items → commission reversal) · 2 OVERPAYMENT_RETURN (no revenue / commission effect — F-P4-06)
+          x-enum-varnames:
+          - SALE_REFUND
+          - OVERPAYMENT_RETURN
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            kind:
+              type: integer
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+              x-enum-varnames:
+              - CASH
+              - MOBILE_WALLET
+              - BANK_TRANSFER
+              - CARD
+          required:
+          - id
+          - code
+          - name_mm
+          - kind
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        external_reference:
+          type:
+          - string
+          - 'null'
+        reason:
+          type: string
+        refund_receipt_number:
+          type: string
+        business_date:
+          type: string
+          format: date
+        refunded_at:
+          type: string
+          format: date-time
+        refunded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        automatic_change:
+          type: boolean
+          description: Created by FINISH for an over-transfer (owner B5)
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RefundItem'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - sale_id
+      - original_receipt_number
+      - branch_id
+      - kind
+      - payment_method
+      - amount
+      - reason
+      - refund_receipt_number
+      - business_date
+      - refunded_at
+      - refunded_by
+      - automatic_change
+      - items
+      - created_at
+    RefundListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        original_receipt_number:
+          type: string
+        branch_id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND (items → commission reversal) · 2 OVERPAYMENT_RETURN (no revenue / commission effect — F-P4-06)
+          x-enum-varnames:
+          - SALE_REFUND
+          - OVERPAYMENT_RETURN
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            kind:
+              type: integer
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              description: 1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD
+              x-enum-varnames:
+              - CASH
+              - MOBILE_WALLET
+              - BANK_TRANSFER
+              - CARD
+          required:
+          - id
+          - code
+          - name_mm
+          - kind
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        refund_receipt_number:
+          type: string
+        business_date:
+          type: string
+          format: date
+        refunded_at:
+          type: string
+          format: date-time
+        refunded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        automatic_change:
+          type: boolean
+      required:
+      - id
+      - sale_id
+      - branch_id
+      - kind
+      - amount
+      - refund_receipt_number
+      - business_date
+      - refunded_at
+    AdjustmentCreate:
+      type: object
+      properties:
+        adjustment_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 9
+          description: 1 PAYMENT_METHOD · 2 PERFORMER · 3 COLLECTED_BY · 9 OTHER (note only) — F-P4-07
+          x-enum-varnames:
+          - PAYMENT_METHOD
+          - PERFORMER
+          - COLLECTED_BY
+          - OTHER
+        payment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Types 1 / 3
+        sale_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Type 2 (SERVICE line)
+        new_payment_method_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Type 1
+        new_employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Types 2 / 3
+        external_reference:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+          description: Type 1 to a reference method — required, unique on the effective method, written on the payment row (owner B10)
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - adjustment_type
+      - reason
+    ReceiptLine:
+      type: object
+      properties:
+        description:
+          type: string
+        option:
+          type:
+          - string
+          - 'null'
+        performer:
+          type:
+          - string
+          - 'null'
+        quantity:
+          type: integer
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+      required:
+      - description
+      - quantity
+      - unit_price_amount
+      - amount
+    ReceiptView:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - sale
+          - refund
+        number:
+          type: string
+        original_number:
+          type:
+          - string
+          - 'null'
+        issued_at:
+          type: string
+          format: date-time
+        branch:
+          type: object
+          properties:
+            name:
+              type: string
+            address:
+              type:
+              - string
+              - 'null'
+            phone:
+              type:
+              - string
+              - 'null'
+            logo_url:
+              type:
+              - string
+              - 'null'
+          required:
+          - name
+        barbers:
+          type: array
+          items:
+            type: string
+        customer_name:
+          type:
+          - string
+          - 'null'
+        customer_phone_masked:
+          type:
+          - string
+          - 'null'
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReceiptLine'
+        subtotal_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        discount_label:
+          type:
+          - string
+          - 'null'
+        discount_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        service_charge_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        tax_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        payments:
+          type: array
+          items:
+            type: object
+            properties:
+              method:
+                type: string
+              amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              reference:
+                type:
+                - string
+                - 'null'
+            required:
+            - method
+            - amount
+        change_returned:
+          oneOf:
+          - type: object
+            properties:
+              amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              refund_receipt_number:
+                type: string
+            required:
+            - amount
+            - refund_receipt_number
+          - type: 'null'
+        footer:
+          type: object
+          properties:
+            opening_hours:
+              type:
+              - string
+              - 'null'
+            thank_you:
+              type:
+              - string
+              - 'null'
+        pdf_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        png_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        rendered_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - kind
+      - number
+      - issued_at
+      - branch
+      - barbers
+      - lines
+      - subtotal_amount
+      - discount_amount
+      - total_amount
+      - payments
+      description: English always (OPEN-32 — *_en with *_mm fallback); the same data the stored PDF / PNG were rendered from
+    ReceiptLookup:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - sale
+          - refund
+        sale_id:
+          type: string
+          format: uuid
+        refund_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        number:
+          type: string
+        branch_id:
+          type: string
+          format: uuid
+      required:
+      - kind
+      - sale_id
+      - number
+      - branch_id
+    ReceiptListItem:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - sale
+          - refund
+        number:
+          type: string
+        sale_id:
+          type: string
+          format: uuid
+        refund_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        issued_at:
+          type: string
+          format: date-time
+        barbers:
+          type: array
+          items:
+            type: string
+      required:
+      - kind
+      - number
+      - sale_id
+      - issued_at
+      - barbers
+      description: No amounts (AD-PERM-05)
+    RequestLookup:
+      type: object
+      properties:
+        client_request_id:
+          type: string
+          format: uuid
+        resource_type:
+          type: string
+          enum:
+          - visit
+          - sale
+          - payment
+          - refund
+          - stock_movement
+          description: stock_movement = Part 6 P6.STK.05 / 07 (sale_id / visit_id null)
+        id:
+          type: string
+          format: uuid
+        sale_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        visit_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+      required:
+      - client_request_id
+      - resource_type
+      - id

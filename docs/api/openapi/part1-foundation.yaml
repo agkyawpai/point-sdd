@@ -1,0 +1,1903 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 1 · Foundation & Access
+  version: 1.6.0
+  summary: Login, sessions, me, company, branches, employees, roles, permissions, settings, system
+  description: |
+    Design document for Part 1 (docs/api/01-foundation.md). Conventions: docs/api/00-conventions.md.
+    Decisions served: D-AUTH-01..08, D-ORG-01..03, D-EMP-01..06, D-ROLE-01..09, D-PLT-03/07/08/16, D-DSH-03, D-UX-05.
+    v1.6 (02/Oct/2026 13:08 — owner sheet 3 "အကုန် OK", review §0.11; no path, schema or permission code changed): X-Requested-With listed on POST /auth/otp/request and /auth/otp/verify (API-AUTH-02 — record R1; 403 csrf); verify has the per-IP cap 10 / hour (429 — API-LIM-02 v1.6, S9); field codes email_invalid / otp_format inside 400 validation (S5); a valid session cookie on a successful sign-in is revoked as LOGOUT (P1-RULE-15, S14); audit action permission.sync (S13); the first company admin is created by an operator command, not by an endpoint (P1-RULE-14, S6).
+    Status: 🔒 LOCKED v1.6 = D-API-02 (02/Oct/2026 — owner one-sheet "အကုန်လုံး OK" 02/Oct/2026 00:06 + Part 4–8 amendments: review fixes 02/Oct (no version bump): site.* keys and system.maintenance are read-only in P1.SET.03 / 04 (400 setting_scope — site.* is written only through Part 8 P8.WEB.02), sales search group typed SaleSearchHit, request_id = UUID, closing.month_end_must_return daily 01:00 MMT; reconcile 02/Oct: audit branch_id of employee-targeted actions = the primary branch of the employee (API-AUD-01), /me.today_branch_id reads Part 5 Attendance.openRecordOf; permission level gains private (contract 1); site.* setting keys = website.update company scope (through P8.WEB.02), payroll.* / attendance.* keys company-only, reference keys must be ACTIVE (400 validation / reason_inactive), client-readable list + receipt.printer_width_mm / receipt.auto_print; logo_attachment_id / photo_attachment_id via Attachments.replace -> stable media path /api/v1/public/media/<id>/original (422 attachment_invalid); employee status warnings salary_open / receivables_outstanding (company-scope payroll.view only); sales search group; job list; x-permission now also on the public operations). v1.4 (owner 01/Oct/2026 21:20; v1.4 = owner scope choice A — ADR-012: data level decides how far a grant reaches — company master writes need company scope (branch scope = read-only, else 403 company_scope_required), branch data needs the branch in scope; settings are mixed (SettingView.editable); Permission.scope -> level; jobs panel = company scope; P1-RULE-13). v1.3 = permission codes CRUD per menu + special actions (ADR-011, supersedes ADR-010) — 21 codes; x-permission on every staff operation ("<module>.view+" = view or any other code of the module — API-PERM-06); company admin = role.view + role.create + role.update + role.delete + role.assign at company scope (P1-RULE-12); invite resend / cancel = employee.access_update; pickable filters repeatable service_id / home / date (P1.EMP.09); client-readable settings list locked (P1.SET.02). v1.2 = Google sign-in hand-off P1.AUTH.06 with verifier/challenge, GET /system/jobs P1.SYS.05, servers /api/v1. Generated-from-code OpenAPI must match this file. Fix-up 02/Oct (batch v5.2.15, no version bump): account.deactivated / login.new_device / security.sessions_revoked = category 6 SECURITY, mandatory (as Part 8 §15); research labels written "Part 8 research E…".
+    v1.1 (01/Oct 11:54): employee.manage split into granular codes — ADR-010 (renamed to the CRUD scheme in v1.3); PATCH /employees/{id} is field-grouped (403 with errors[] for fields outside the caller's codes).
+    Every operation that requires the session cookie may also return 401 (unauthenticated / session_revoked) and 503 (maintenance for non-admins); omitted per operation for brevity.
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; status/type = smallint codes (D-DB-03);
+    bilingual fields *_mm / *_en (D-DB-04); errors = RFC 9457 problem+json with `code` = language key (API-ERR-01).
+servers:
+  - url: /api/v1
+    description: 'Same origin as the web app — Caddy routes /api/* to NestJS (ADR-009); staff host app.<domain>, public host <domain> (★ ACT-05)'
+  - url: http://localhost:3000/api/v1
+    description: Local development through the dev Caddy
+
+tags:
+  - name: auth
+    description: Login (Google / email OTP) and logout — D-AUTH-01..04, D-AUTH-08
+  - name: me
+    description: Bootstrap, language, own sessions — D-AUTH-05/06, D-PLT-03
+  - name: company
+    description: Company info — D-ORG-02, D-WEB-03
+  - name: branches
+    description: Branches — D-ORG-01/02
+  - name: employees
+    description: Employees, users, assignments — D-EMP-*, D-ROLE-05/06, D-AUTH-03/05
+  - name: roles
+    description: Roles and the permission catalogue — D-ROLE-01/02/04/08
+  - name: settings
+    description: Settings store — D-PLT-07/16
+  - name: system
+    description: Health, status, maintenance, global search — D-PLT-08, D-SRC-01
+
+security:
+  - sessionCookie: []
+
+paths:
+  # ───────────────────────── AUTH ─────────────────────────
+  /auth/otp/request:
+    post:
+      tags: [auth]
+      operationId: authOtpRequest
+      summary: Request an 8-digit e-mail code (P1.AUTH.01)
+      x-permission: 'public (no session; CSRF header required; neutral 202; rate limit API-LIM-02)'
+      description: Neutral response — same 202 whether or not the e-mail can sign in (D-AUTH-04). 60 s cooldown per e-mail. A missing X-Requested-With header → 403 csrf (API-AUTH-02). An `email` that is not an address → 400 validation with errors[].code = email_invalid (v1.6).
+      security: []
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, maxLength: 255 }
+      responses:
+        '202':
+          description: Accepted (neutral)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resend_after_seconds]
+                properties:
+                  resend_after_seconds: { type: integer, example: 60 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Maintenance' }
+
+  /auth/otp/verify:
+    post:
+      tags: [auth]
+      operationId: authOtpVerify
+      summary: Verify the code and create a session (P1.AUTH.02)
+      x-permission: 'public (no session; CSRF header required; rate limit API-LIM-02)'
+      description: |
+        Success sets the `point_session` cookie (HttpOnly; Secure; SameSite=Lax) and returns the bootstrap payload.
+        Wrong / expired / unknown → 401 `otp_invalid` (never reveals whether the e-mail exists). 5 consecutive failures → 401 `login_locked`.
+        v1.6: a missing X-Requested-With header → 403 `csrf` (API-AUTH-02). 400 `validation` field codes: `email_invalid`, `otp_format`.
+        At most 10 verify attempts per hour per IP — the 11th answers 429 `rate_limited` before any look-up, counter change or audit write (API-LIM-02).
+        If the request carries a still valid `point_session`, that session is revoked as LOGOUT when the sign-in succeeds (P1-RULE-15).
+      security: []
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string, format: email }
+                code: { type: string, pattern: '^[0-9]{8}$', description: 8 digits (D-AUTH-04) }
+                device_label: { type: string, maxLength: 255, description: Optional client hint; server derives from User-Agent when absent }
+      responses:
+        '200':
+          description: Signed in
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: point_session=<token>; HttpOnly; Secure; SameSite=Lax; Path=/
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: otp_invalid · login_locked
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                locked:
+                  value: { type: 'about:blank', title: Locked, status: 401, code: login_locked, detail: Too many attempts, until: '2026-10-01T15:25:00+06:30', request_id: 0199a3f2-7c1e-7b3a-9d4e-2f6a8c1b5e70 }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/google/start:
+    get:
+      tags: [auth]
+      operationId: authGoogleStart
+      summary: Redirect to Google sign-in (P1.AUTH.03)
+      x-permission: 'public (no session)'
+      security: []
+      parameters:
+        - name: return_to
+          in: query
+          schema: { type: string, pattern: '^/[^/].*$' }
+          description: Same-origin path to return to after login
+        - name: client
+          in: query
+          schema: { type: string, enum: [web, shell, pwa], default: web }
+          description: 'web = browser; shell = Capacitor (opened in the system browser / Custom Tabs); pwa = iOS Home-Screen PWA. For shell|pwa the session is handed back through POST /auth/handoff (ADR-005)'
+        - name: challenge
+          in: query
+          schema: { type: string, minLength: 43, maxLength: 43, pattern: '^[A-Za-z0-9_-]{43}$' }
+          description: 'Required for client=shell|pwa: base64url(sha256(verifier)) of a 32-byte verifier the app keeps in memory; the URL never carries a secret'
+      responses:
+        '302': { description: 'Redirect to Google (OIDC + PKCE; state cookie set)' }
+
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      operationId: authGoogleCallback
+      summary: Google OIDC callback (P1.AUTH.04)
+      x-permission: 'public (no session)'
+      description: On first Google login the Google e-mail must equal users.email; google_subject is stored and checked afterwards (D-AUTH-08).
+      security: []
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: 'client=web: redirect to the app with the session cookie. client=shell|pwa: the session is parked under the challenge (5 min, single use) and the browser is sent to a "return to the app" page — point://auth/handoff?done=1 (shell deep link) or https://app.<domain>/auth/handoff?done=1 (PWA); no cookie is set in that browser. Failure: /login?error=google_not_linked' }
+
+  /auth/handoff:
+    post:
+      tags: [auth]
+      operationId: authHandoff
+      summary: Collect the session started by a system-browser Google sign-in, inside the shell / PWA (P1.AUTH.06)
+      x-permission: 'public (CSRF header required; rate limit API-LIM-02)'
+      description: 'ADR-005. The app polls this every 2 s (max 5 min) after opening the system browser, and immediately on the point://auth/handoff deep link or on regaining visibility. The server hashes the verifier, finds the parked session, consumes it and sets point_session in the calling WebView / standalone PWA. Rate-limited like OTP verify.'
+      security: []
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verifier]
+              properties:
+                verifier: { type: string, minLength: 43, maxLength: 43, pattern: '^[A-Za-z0-9_-]{43}$' }
+                device_label: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Signed in; Set-Cookie point_session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '202':
+          description: 'Google flow not finished yet — keep polling'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [pending] }
+        '401': { description: 'handoff_invalid (challenge unknown, expired or already used)' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: authLogout
+      summary: Revoke the current session (P1.AUTH.05)
+      x-permission: 'session'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      responses:
+        '204': { description: Logged out; cookie cleared }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  # ───────────────────────── ME ─────────────────────────
+  /me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: App bootstrap — user, employee, grants, effective flags, scope (P1.ME.01)
+      x-permission: 'self'
+      responses:
+        '200':
+          description: OK (no-store)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/Maintenance' }
+    patch:
+      tags: [me]
+      operationId: patchMe
+      summary: Change own UI language (P1.ME.02)
+      x-permission: 'self'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ui_language:
+                  type: [integer, 'null']
+                  enum: [1, 2, null]
+                  description: 1 MY · 2 EN · null = system default (users.ui_language, D-PLT-03)
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /me/sessions:
+    get:
+      tags: [me]
+      operationId: listMySessions
+      summary: My devices (P1.ME.03)
+      x-permission: 'self'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /me/sessions/{session_id}:
+    delete:
+      tags: [me]
+      operationId: revokeMySession
+      summary: Remove one of my devices (P1.ME.04)
+      x-permission: 'self'
+      parameters:
+        - { $ref: '#/components/parameters/XRequestedWith' }
+        - { name: session_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Revoked (revoke_reason 2 DEVICE_REMOVED) }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /me/permissions:
+    get:
+      tags: [me]
+      operationId: getMyPermissions
+      summary: Grants with branch scope (P1.ME.05)
+      x-permission: 'self'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: '#/components/schemas/Grant' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  # ───────────────────────── COMPANY ─────────────────────────
+  /company:
+    get:
+      tags: [company]
+      operationId: getCompany
+      summary: Company info (P1.CO.01)
+      x-permission: 'any staff'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Company' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    patch:
+      tags: [company]
+      operationId: patchCompany
+      summary: Update company info — company.update (P1.CO.02)
+      x-permission: 'company.update (company master: company scope)'
+      description: 'logo_attachment_id (v1.5) = a staging image from POST /v1/attachments (Part 8 P8.ATT.01), linked with Attachments.replace (the previous logo is soft-deleted by the system; null removes it); logo_url then stores the stable path /api/v1/public/media/<attachment_id>/original — never a signed URL (Part 8 research E9, P8-RULE-04).'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompanyUpdate' }
+      responses:
+        '200':
+          description: Updated (enqueues site.content_changed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Company' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/AttachmentInvalid' }
+
+  # ───────────────────────── BRANCHES ─────────────────────────
+  /branches:
+    get:
+      tags: [branches]
+      operationId: listBranches
+      summary: All branches (summary) (P1.BR.01)
+      x-permission: 'any staff'
+      parameters:
+        - { name: status, in: query, schema: { type: integer, enum: [0, 1] } }
+      responses:
+        '200':
+          description: OK — all branches (API-PERM-03 exception); no sensitive fields
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/BranchSummary' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [branches]
+      operationId: createBranch
+      summary: Create a branch — branch.create (P1.BR.02)
+      x-permission: 'branch.create (company master: company scope)'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BranchCreate' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /branches/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [branches]
+      operationId: getBranch
+      summary: Branch detail (P1.BR.03)
+      x-permission: 'any staff'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [branches]
+      operationId: patchBranch
+      summary: Update a branch — branch.update (P1.BR.04)
+      x-permission: 'branch.update (branch data: branch in scope)'
+      description: 'Website-relevant fields enqueue site.content_changed [home, branch:<code>]. Opening hours and closures are Part 8 (website.update — P8.WEB.04..08, branch data; v1.5).'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BranchUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /branches/{id}/status:
+    post:
+      tags: [branches]
+      operationId: setBranchStatus
+      summary: Activate / deactivate — branch.delete (P1.BR.05)
+      x-permission: 'branch.delete (company master: company scope)'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: integer, enum: [0, 1], description: 0 INACTIVE · 1 ACTIVE }
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: branch_in_use — open bookings / active assignments remain
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ───────────────────────── EMPLOYEES ─────────────────────────
+  /employees:
+    get:
+      tags: [employees]
+      operationId: listEmployees
+      summary: Search employees — employee.view+, scope-filtered (P1.EMP.01)
+      x-permission: 'employee.view+'
+      parameters:
+        - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: 'Name (MM/EN), phone (any format), employee code' }
+        - { name: branch_id, in: query, schema: { type: string, format: uuid } }
+        - { name: role_id, in: query, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { type: array, items: { type: integer, enum: [0, 1, 2, 3] } }, style: form, explode: true, description: employees.status }
+        - { name: login_status, in: query, schema: { type: integer, enum: [0, 1, 2] }, description: users.status 0 DISABLED · 1 ACTIVE · 2 INVITED }
+        - { name: sort, in: query, schema: { type: string, default: name_mm, enum: [name_mm, -name_mm, employee_code, -employee_code, join_date, -join_date, created_at, -created_at] } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EmployeeListItem' }
+                  next_cursor: { type: [string, 'null'] }
+                  total: { type: [integer, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [employees]
+      operationId: createEmployee
+      summary: Create employee + login user (+ invite) — employee.create (P1.EMP.02)
+      x-permission: 'employee.create'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmployeeCreate' }
+      responses:
+        '201':
+          description: Created (users.status 2 INVITED; invite e-mail sent when send_invite)
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: already_exists — e-mail or employee_code taken
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /employees/pickable:
+    get:
+      tags: [employees]
+      operationId: listPickableEmployees
+      summary: Lightweight picker (START, booking, filters) — any staff, read scope; eligibility filters from Part 2 (P1.EMP.09)
+      x-permission: 'any staff (read scope)'
+      parameters:
+        - { name: branch_id, in: query, schema: { type: string, format: uuid }, description: 'Omit for all branches in the caller''s scope' }
+        - { name: service_id, in: query, style: form, explode: true, schema: { type: array, items: { type: string, format: uuid } }, description: 'Repeatable — only employees eligible for ALL listed services on date (Part 2 P2-RULE-06)' }
+        - { name: date, in: query, schema: { type: string, format: date }, description: 'MMT business date, default today — assignment and eligibility are evaluated on this date' }
+        - { name: home, in: query, schema: { type: boolean }, description: 'true = home_allowed required for every listed service (Part 2)' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EmployeePick' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /employees/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [employees]
+      operationId: getEmployee
+      summary: Employee detail — employee.view+ (scope) or self (P1.EMP.03)
+      x-permission: 'employee.view+ | self'
+      responses:
+        '200':
+          description: OK (self view omits internal_notes and the raw earnings flag)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [employees]
+      operationId: patchEmployee
+      summary: 'Update profile / website fields / earnings flag — field-grouped: employee.update · employee.rating_update · employee.earnings_update (P1.EMP.04)'
+      x-permission: 'employee.update | employee.rating_update | employee.earnings_update (per field group)'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmployeeUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/AttachmentInvalid' }
+
+  /employees/{id}/status:
+    post:
+      tags: [employees]
+      operationId: setEmployeeStatus
+      summary: Deactivate / resign / terminate / reactivate — employee.delete (record kept) (P1.EMP.05)
+      x-permission: 'employee.delete'
+      description: 'Ends open branch assignments, revokes all sessions (reason 4), disables login, notifies account.deactivated (category 6 SECURITY, mandatory — Part 8 §15) to the user and the company admins (v1.5 — Part 8 research E11). Returns future bookings as warnings (AD-EMP-03); bookings are NOT cancelled (D-BKG-19). v1.5 (Part 5): on RESIGNED / TERMINATED also warnings salary_open (an open-ended salary row) and receivables_outstanding { count, balance_amount } — pay data, included only for a caller holding payroll.view through a company-scope assignment (private — P5-RULE-01).'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: integer, enum: [0, 1, 2, 3], description: 0 INACTIVE · 1 ACTIVE (reactivate) · 2 RESIGNED · 3 TERMINATED }
+                effective_date: { type: string, format: date, description: 'effective_to of the open branch assignments (default today); the status changes immediately' }
+                reason: { type: string, maxLength: 500, description: Audit only }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Employee'
+                  - type: object
+                    properties:
+                      warnings:
+                        type: array
+                        items: { $ref: '#/components/schemas/Warning' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}/branches:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [employees]
+      operationId: listEmployeeBranches
+      summary: Branch assignment history (P1.EMP.06)
+      x-permission: 'employee.view+ | self'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/BranchAssignment' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [employees]
+      operationId: assignEmployeeBranch
+      summary: Assign to a branch — employee.branch_assign (P1.EMP.07)
+      x-permission: 'employee.branch_assign'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branch_id]
+              properties:
+                branch_id: { type: string, format: uuid }
+                effective_from: { type: string, format: date, description: Default today (MMT) }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BranchAssignment' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}/branches/{assignment_id}/end:
+    post:
+      tags: [employees]
+      operationId: endEmployeeBranch
+      summary: End a branch assignment — employee.branch_assign (P1.EMP.08)
+      x-permission: 'employee.branch_assign'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [effective_to]
+              properties:
+                effective_to: { type: string, format: date }
+      responses:
+        '200':
+          description: Ended (warnings list future bookings / shifts at that branch)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BranchAssignment'
+                  - type: object
+                    properties:
+                      warnings:
+                        type: array
+                        items: { $ref: '#/components/schemas/Warning' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /employees/{id}/roles:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [employees]
+      operationId: listEmployeeRoles
+      summary: Role assignments (active + revoked) (P1.EMP.10)
+      x-permission: 'employee.view+ | self'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/RoleAssignment' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [employees]
+      operationId: assignEmployeeRole
+      summary: Assign a role with branch scope — role.assign (P1.EMP.11)
+      x-permission: 'role.assign'
+      description: scope_type 2 requires branch_ids. A branch-scoped caller may only assign branches in their own scope and may not grant permissions they do not hold (no escalation). Emits session.updated.
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_id, scope_type]
+              properties:
+                role_id: { type: string, format: uuid }
+                scope_type: { type: integer, enum: [1, 2], description: 1 COMPANY · 2 BRANCHES (D-ROLE-05) }
+                branch_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  minItems: 1
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleAssignment' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}/roles/{assignment_id}/revoke:
+    post:
+      tags: [employees]
+      operationId: revokeEmployeeRole
+      summary: Revoke one role assignment — role.assign (P1.EMP.11b)
+      x-permission: 'role.assign'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Revoked (only this assignment — D-ROLE-06)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleAssignment' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: last_admin — cannot revoke the qualifying assignment of the last company admin (P1-RULE-12)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /employees/{id}/public-rating:
+    put:
+      tags: [employees]
+      operationId: setEmployeePublicRating
+      summary: Set the website rating — employee.rating_update (branch scope) (P1.EMP.12)
+      x-permission: 'employee.rating_update'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_rating]
+              properties:
+                public_rating:
+                  type: [number, 'null']
+                  minimum: 1.0
+                  maximum: 5.0
+                  multipleOf: 0.5
+                  description: Shown on the website as "Point rating"; null = not shown (D-UX-05, OPEN-37)
+      responses:
+        '200':
+          description: Saved (site.content_changed ['barbers'])
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [public_rating]
+                properties:
+                  public_rating: { type: [number, 'null'] }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /employees/{id}/invite/resend:
+    post:
+      tags: [employees]
+      operationId: resendInvite
+      summary: Resend the invite e-mail — employee.access_update (P1.EMP.13)
+      x-permission: 'employee.access_update'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      responses:
+        '202':
+          description: Sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invite_last_sent_at: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /employees/{id}/invite/cancel:
+    post:
+      tags: [employees]
+      operationId: cancelInvite
+      summary: Cancel a pending invite (users.status → 0) — employee.access_update (P1.EMP.14)
+      x-permission: 'employee.access_update'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}/sessions:
+    get:
+      tags: [employees]
+      operationId: listEmployeeSessions
+      summary: Devices of an employee — employee.access_update (P1.EMP.15)
+      x-permission: 'employee.access_update'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Session' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /employees/{id}/sessions/revoke-all:
+    post:
+      tags: [employees]
+      operationId: revokeAllEmployeeSessions
+      summary: Log out all devices — employee.access_update (P1.EMP.16)
+      x-permission: 'employee.access_update'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '204': { description: All sessions revoked (revoke_reason 3 ADMIN_REVOKE_ALL) }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────── ROLES / PERMISSIONS ─────────────────────────
+  /roles:
+    get:
+      tags: [roles]
+      operationId: listRoles
+      summary: Roles — role.view+ or employee.view (P1.RL.01)
+      x-permission: 'role.view+ | employee.view'
+      parameters:
+        - { name: include_archived, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [roles]
+      operationId: createRole
+      summary: Create a role — role.create (P1.RL.02)
+      x-permission: 'role.create (company master: company scope)'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoleCreate' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /roles/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [roles]
+      operationId: getRole
+      summary: Role detail — role.view+ (P1.RL.03)
+      x-permission: 'role.view+'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [roles]
+      operationId: patchRole
+      summary: Rename / describe — role.update (P1.RL.04)
+      x-permission: 'role.update (company master: company scope)'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name_mm: { type: string, maxLength: 100 }
+                name_en: { type: [string, 'null'], maxLength: 100 }
+                description_mm: { type: [string, 'null'] }
+                description_en: { type: [string, 'null'] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /roles/{id}/permissions:
+    put:
+      tags: [roles]
+      operationId: setRolePermissions
+      summary: Replace the permission set — role.update (P1.RL.05)
+      x-permission: 'role.update (company master: company scope)'
+      description: Takes effect immediately for all holders (D-ROLE-06) — emits session.updated to affected users. A caller who is not a company admin may not grant codes they do not hold (company admins are exempt — P1-RULE-12).
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permission_codes]
+              properties:
+                permission_codes:
+                  type: array
+                  items: { type: string, pattern: '^[a-z_]+\.[a-z_]+(\.[a-z_]+)?$' }
+                  uniqueItems: true
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: last_admin — removing any of the five role codes from the last company admin's role (P1-RULE-12)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /roles/{id}/archive:
+    post:
+      tags: [roles]
+      operationId: archiveRole
+      summary: Archive a role (no active assignments) — role.delete (P1.RL.06)
+      x-permission: 'role.delete (company master: company scope)'
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      responses:
+        '200':
+          description: Archived
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: role_in_use (active assignments) · last_admin (the last company admin's role — P1-RULE-12)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /permissions:
+    get:
+      tags: [roles]
+      operationId: listPermissions
+      summary: Permission catalogue (from permissions.json sync) — role.view+ or employee.view (P1.PERM.01)
+      x-permission: 'role.view+ | employee.view'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Permission' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────── SETTINGS ─────────────────────────
+  /settings:
+    get:
+      tags: [settings]
+      operationId: listSettings
+      summary: All setting definitions with company / branch / effective values — settings.view+ (P1.SET.01)
+      x-permission: 'settings.view+ (mixed: company values at any scope; branch_id must be covered by the caller''s settings grant, else empty items)'
+      description: 'v1.5 — keys of module website (site.*) are listed read-only here (editable false; edited only in Website › Site content with company-scope website.update — P8.WEB.02; P1.SET.03 / 04 refuse them — review fix 02/Oct), and so is system.maintenance (written by P1.SYS.03); every payroll.* / attendance.* key has scope company (no branch override).'
+      parameters:
+        - { name: module, in: query, schema: { type: string } }
+        - { name: branch_id, in: query, schema: { type: string, format: uuid }, description: Include this branch's overrides }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SettingView' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /settings/effective:
+    get:
+      tags: [settings]
+      operationId: getEffectiveSettings
+      summary: Effective values of client-readable keys (P1.SET.02)
+      x-permission: 'any staff'
+      description: 'Locked client-readable list (owner 01/Oct 21:20, §13 #3): booking.slot_interval_minutes, booking.advance_window_days, sales.tax_enabled, sales.service_charge_enabled, closing.cash_difference_tolerance_amount, home_service.transport_fee_amount, system.default_language, system.upload_max_mb + v1.5 (Part 4, owner H / REC-37): receipt.printer_width_mm (branch, 58 / 80), receipt.auto_print (company, false).'
+      parameters:
+        - { name: branch_id, in: query, schema: { type: string, format: uuid } }
+        - { name: keys, in: query, schema: { type: array, items: { type: string } }, style: form, explode: false, description: Comma-separated; omit for the whole client-readable set }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [values, as_of]
+                properties:
+                  values:
+                    type: object
+                    additionalProperties: true
+                    example: { 'booking.slot_interval_minutes': 15, 'closing.cash_difference_tolerance_amount': 0 }
+                  as_of: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /settings/{key}:
+    parameters:
+      - { $ref: '#/components/parameters/SettingKey' }
+    put:
+      tags: [settings]
+      operationId: putSetting
+      summary: Set a company value or a branch override — settings.update (P1.SET.03)
+      x-permission: 'settings.update (mixed: no branch_id = company value -> company scope; branch_id = branch override -> that branch in scope)'
+      description: 'P1-RULE-08. v1.5: company-only keys (every payroll.* / attendance.* key) refuse branch_id (400 setting_scope); keys with their own endpoint are refused with 400 setting_scope, with or without branch_id — every site.* key (written only through Part 8 P8.WEB.02) and system.maintenance (P1.SYS.03) — review fix 02/Oct; reference keys (type ref:<table>, e.g. stock.refund_damaged_reason_id) must point to an ACTIVE row (400 validation, errors[].code = reason_inactive); site.* writes also raise site.content_changed.'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value:
+                  description: Typed per settings.json (number / boolean / time "HH:mm" / choice / {mm,en} / json)
+                branch_id: { type: [string, 'null'], format: uuid, description: Set for a branch override (key must allow branch scope) }
+      responses:
+        '200':
+          description: Saved (history row written by trigger; settings.changed emitted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingView' }
+        '400':
+          description: validation (incl. errors[].code reason_inactive — v1.5) · setting_scope
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /settings/{key}/reset:
+    post:
+      tags: [settings]
+      operationId: resetSetting
+      summary: Reset to the company value (branch) or to the default (company) — settings.update (P1.SET.04)
+      x-permission: 'settings.update (mixed — as putSetting; site.* keys and system.maintenance -> 400 setting_scope — review fix 02/Oct)'
+      description: Implemented as an UPDATE to the parent value (no delete — settings_history FK / trigger; D-DAT-05). `source` is derived from value equality.
+      parameters:
+        - { $ref: '#/components/parameters/SettingKey' }
+        - { $ref: '#/components/parameters/XRequestedWith' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                branch_id: { type: [string, 'null'], format: uuid, description: 'Reset this branch''s override; omit for the company value' }
+      responses:
+        '200':
+          description: Reset
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingView' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /settings/{key}/history:
+    get:
+      tags: [settings]
+      operationId: getSettingHistory
+      summary: Who changed it, when, old → new — settings.view+ (P1.SET.05)
+      x-permission: 'settings.view+ (mixed: company rows at any scope; branch rows for covered branches)'
+      parameters:
+        - { $ref: '#/components/parameters/SettingKey' }
+        - { name: branch_id, in: query, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SettingHistoryItem' }
+                  next_cursor: { type: [string, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────── SYSTEM ─────────────────────────
+  /health:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness — DB ping only, no details (P1.SYS.01)
+      x-permission: 'public (liveness — no details)'
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  time: { type: string, format: date-time }
+
+  /system/jobs:
+    get:
+      tags: [system]
+      operationId: systemJobs
+      summary: Background job and backup status for the admin Jobs panel (P1.SYS.05) — settings.view+
+      x-permission: 'settings.view+ with company scope'
+      description: 'ADR-002 / ADR-007: last run per pg-boss cron job plus backup_runs summary; feeds the "nightly jobs not run by 06:00" alert. Jobs (v1.5 — ADR-002 list as amended by Parts 4–8, P8-RULE-18): shifts.generate, booking.noshow_alarm, booking.noshow_autocancel, receipt.render, attendance.detect_exceptions, stock.reconcile_levels, closing.month_end_must_return (daily 01:00 MMT — acts once the month of the branch is fully closed; review fix 02/Oct), notifications.purge (renamed from notifications.cleanup), uploads.purge, exports.purge, export.run, import.run, site.revalidate, backup.watchdog, integrity.check_weekly, sync.code_tables, email.send, auth.cleanup.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, backups]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, failures_24h, queued]
+                      properties:
+                        name: { type: string }
+                        schedule: { type: string, description: 'cron expression (Asia/Yangon) or null for on-demand jobs' }
+                        last_success_at: { type: string, format: date-time }
+                        last_failure_at: { type: string, format: date-time }
+                        failures_24h: { type: integer }
+                        queued: { type: integer }
+                  backups:
+                    type: array
+                    items:
+                      type: object
+                      required: [kind]
+                      properties:
+                        kind: { type: string, enum: [daily, weekly, restore_test] }
+                        last_success_at: { type: string, format: date-time }
+                        last_failure_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /system/status:
+    get:
+      tags: [system]
+      operationId: systemStatus
+      summary: Maintenance flag and server time — public (P1.SYS.02)
+      x-permission: 'public (no session)'
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemStatus' }
+
+  /system/maintenance:
+    put:
+      tags: [system]
+      operationId: setMaintenance
+      summary: Turn maintenance mode on / off — settings.update (P1.SYS.03)
+      x-permission: 'settings.update (company master: company scope)'
+      parameters: [ { $ref: '#/components/parameters/XRequestedWith' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                until: { type: [string, 'null'], format: date-time }
+                message_mm: { type: [string, 'null'] }
+                message_en: { type: [string, 'null'] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemStatus' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /search:
+    get:
+      tags: [system]
+      operationId: globalSearch
+      summary: Global search grouped by type, within scope (P1.SYS.04)
+      x-permission: 'any staff (read scope)'
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2, maxLength: 100 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10, default: 5 }, description: Per group }
+      responses:
+        '200':
+          description: OK — groups the caller may not see are empty arrays
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [customers, bookings, sales, employees]
+                properties:
+                  customers: { type: array, items: { $ref: '#/components/schemas/SearchHit' } }
+                  bookings: { type: array, items: { $ref: '#/components/schemas/SearchHit' } }
+                  sales: { type: array, items: { $ref: '#/components/schemas/SaleSearchHit' }, description: 'v1.5 — Part 4 P4-RULE-18: sale.view+ holders only; exact or prefix receipt number' }
+                  employees: { type: array, items: { $ref: '#/components/schemas/SearchHit' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session (user_sessions.token_hash) — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SettingKey:
+      name: key
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$', example: booking.slot_interval_minutes }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema: { type: string, enum: [point-app] }
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+
+  responses:
+    ValidationError:
+      description: 400 validation (errors[] per field)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: 403 forbidden · company_scope_required (ADR-012) · csrf (out_of_scope only where an endpoint of a part names it — API-PERM-03 v1.6; no Part 1 endpoint does)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: 404 not_found (also used for out-of-scope single reads)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: 409 conflict · already_exists · invalid_transition
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: 429 rate_limited (retry_after seconds)
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    AttachmentInvalid:
+      description: '422 attachment_invalid { attachment_id, reason: not_found | not_yours | expired | already_linked | type_not_allowed | too_many } — Part 8 Attachments.link / replace (v1.5)'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Maintenance:
+      description: 503 maintenance (non-admins)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details; `code` is the language-file key under error.*
+      required: [title, status, code, request_id]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: slot_taken }
+        detail: { type: string, description: Developer text — never shown to users }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, code]
+            properties:
+              field: { type: string, example: 'items[1].quantity' }
+              code: { type: string }
+              params: { type: object, additionalProperties: true }
+        request_id: { type: string, format: uuid, description: 'Server-generated UUIDv7; a client X-Request-Id is used only when it parses as a UUID (API-ERR-01 — review fix 02/Oct)' }
+        context: { type: object, additionalProperties: true, description: 'Machine data a code needs (API-ERR-01 v1.4), e.g. already_exists -> the existing id' }
+      additionalProperties: true
+
+    Warning:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, example: future_bookings }
+        params: { type: object, additionalProperties: true }
+        items:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    Bilingual:
+      type: object
+      required: [mm]
+      properties:
+        mm: { type: string }
+        en: { type: [string, 'null'] }
+
+    SocialLinks:
+      type: object
+      description: Public social links (FE-IA-06 / FE-SEO-03) — TikTok included (D-UX-05)
+      properties:
+        facebook: { type: [string, 'null'], format: uri }
+        tiktok: { type: [string, 'null'], format: uri }
+        viber: { type: [string, 'null'], description: 'viber:// link or phone' }
+        instagram: { type: [string, 'null'], format: uri }
+        youtube: { type: [string, 'null'], format: uri }
+        other:
+          type: array
+          items:
+            type: object
+            required: [label, url]
+            properties:
+              label: { type: string, maxLength: 50 }
+              url: { type: string, format: uri }
+
+    Company:
+      type: object
+      required: [id, name_mm, status]
+      properties:
+        id: { type: string, format: uuid }
+        name_mm: { type: string }
+        name_en: { type: [string, 'null'] }
+        logo_url: { type: [string, 'null'], description: 'Stable media path /api/v1/public/media/<attachment_id>/original (v1.5 — Part 8 research E9); swap the last segment for w400 / w800 / w1600' }
+        phone: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        address_mm: { type: [string, 'null'] }
+        address_en: { type: [string, 'null'] }
+        website_url: { type: [string, 'null'] }
+        social_links: { $ref: '#/components/schemas/SocialLinks' }
+        status: { type: integer, enum: [0, 1] }
+        updated_at: { type: string, format: date-time }
+
+    CompanyUpdate:
+      type: object
+      properties:
+        name_mm: { type: string, maxLength: 255 }
+        name_en: { type: [string, 'null'], maxLength: 255 }
+        phone: { type: [string, 'null'], maxLength: 50 }
+        email: { type: [string, 'null'], format: email }
+        address_mm: { type: [string, 'null'] }
+        address_en: { type: [string, 'null'] }
+        website_url: { type: [string, 'null'], format: uri }
+        social_links: { $ref: '#/components/schemas/SocialLinks' }
+        logo_attachment_id: { type: [string, 'null'], format: uuid, description: 'v1.5 — staging image from POST /v1/attachments (Part 8 P8.ATT.01), linked with Attachments.replace; null removes the logo (422 attachment_invalid)' }
+        expected_updated_at: { type: string, format: date-time }
+
+    BranchSummary:
+      type: object
+      required: [id, code, name_mm, status, is_public]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: B3 }
+        name_mm: { type: string }
+        name_en: { type: [string, 'null'] }
+        phone: { type: [string, 'null'] }
+        status: { type: integer, enum: [0, 1] }
+        is_public: { type: boolean }
+
+    Branch:
+      allOf:
+        - $ref: '#/components/schemas/BranchSummary'
+        - type: object
+          properties:
+            email: { type: [string, 'null'] }
+            address_mm: { type: [string, 'null'] }
+            address_en: { type: [string, 'null'] }
+            website_url: { type: [string, 'null'] }
+            social_links: { $ref: '#/components/schemas/SocialLinks' }
+            latitude: { type: [number, 'null'] }
+            longitude: { type: [number, 'null'] }
+            location_radius_meters: { type: [integer, 'null'], description: QR + GPS attendance radius (D-ATT-01) }
+            map_url: { type: [string, 'null'], format: uri }
+            active_employees: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    BranchCreate:
+      type: object
+      required: [code, name_mm]
+      properties:
+        code: { type: string, pattern: '^[A-Z0-9]{1,10}$' }
+        name_mm: { type: string, maxLength: 255 }
+        name_en: { type: [string, 'null'], maxLength: 255 }
+        phone: { type: [string, 'null'] }
+        email: { type: [string, 'null'], format: email }
+        address_mm: { type: [string, 'null'] }
+        address_en: { type: [string, 'null'] }
+        website_url: { type: [string, 'null'], format: uri }
+        social_links: { $ref: '#/components/schemas/SocialLinks' }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        location_radius_meters: { type: [integer, 'null'], minimum: 10, maximum: 2000 }
+        is_public: { type: boolean, default: true }
+        map_url: { type: [string, 'null'], format: uri }
+
+    BranchUpdate:
+      allOf:
+        - $ref: '#/components/schemas/BranchCreate'
+        - type: object
+          required: []
+          properties:
+            expected_updated_at: { type: string, format: date-time }
+
+    EmployeeRef:
+      type: object
+      required: [id, name_mm]
+      properties:
+        id: { type: string, format: uuid }
+        employee_code: { type: string }
+        name_mm: { type: string }
+        name_en: { type: [string, 'null'] }
+        photo_url: { type: [string, 'null'], description: 'Stable media path /api/v1/public/media/<attachment_id>/original (v1.5 — Part 8 research E9)' }
+
+    EmployeePick:
+      allOf:
+        - $ref: '#/components/schemas/EmployeeRef'
+        - type: object
+          required: [branch_ids]
+          properties:
+            branch_ids:
+              type: array
+              items: { type: string, format: uuid }
+
+    EmployeeListItem:
+      allOf:
+        - $ref: '#/components/schemas/EmployeeRef'
+        - type: object
+          required: [status, login_status, branches, roles]
+          properties:
+            phone: { type: [string, 'null'] }
+            status: { type: integer, enum: [0, 1, 2, 3], description: 0 INACTIVE · 1 ACTIVE · 2 RESIGNED · 3 TERMINATED }
+            login_status: { type: integer, enum: [0, 1, 2], description: users.status }
+            branches:
+              type: array
+              items: { $ref: '#/components/schemas/BranchSummary' }
+            roles:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  name_mm: { type: string }
+                  name_en: { type: [string, 'null'] }
+            join_date: { type: [string, 'null'], format: date }
+
+    Employee:
+      allOf:
+        - $ref: '#/components/schemas/EmployeeRef'
+        - type: object
+          required: [status, public_profile, effective_show_own_earnings, user, branches, roles, created_at, updated_at]
+          properties:
+            phone: { type: [string, 'null'] }
+            join_date: { type: [string, 'null'], format: date }
+            status: { type: integer, enum: [0, 1, 2, 3] }
+            internal_notes: { type: [string, 'null'], description: Omitted on self view }
+            public_profile: { type: boolean }
+            public_specialty_mm: { type: [string, 'null'], maxLength: 200 }
+            public_specialty_en: { type: [string, 'null'], maxLength: 200 }
+            public_rating: { type: [number, 'null'], minimum: 1, maximum: 5, multipleOf: 0.5 }
+            show_own_earnings: { type: [boolean, 'null'], description: null = follow dashboard.show_own_earnings_all; omitted on self view }
+            effective_show_own_earnings: { type: boolean }
+            user: { $ref: '#/components/schemas/UserAccess' }
+            branches:
+              type: array
+              items: { $ref: '#/components/schemas/BranchAssignment' }
+            roles:
+              type: array
+              items: { $ref: '#/components/schemas/RoleAssignment' }
+            sessions_count: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    UserAccess:
+      type: object
+      required: [id, email, status]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        status: { type: integer, enum: [0, 1, 2], description: 0 DISABLED · 1 ACTIVE · 2 INVITED }
+        ui_language: { type: [integer, 'null'], enum: [1, 2, null] }
+        invited_at: { type: [string, 'null'], format: date-time }
+        invite_last_sent_at: { type: [string, 'null'], format: date-time }
+        activated_at: { type: [string, 'null'], format: date-time }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        login_locked_until: { type: [string, 'null'], format: date-time }
+
+    EmployeeCreate:
+      type: object
+      required: [email, name_mm]
+      properties:
+        email: { type: string, format: email, description: Login e-mail (D-AUTH-02); stored lower-case; unique }
+        employee_code: { type: [string, 'null'], maxLength: 100, description: Generated from employee.code_format when absent }
+        name_mm: { type: string, maxLength: 255 }
+        name_en: { type: [string, 'null'], maxLength: 255 }
+        phone: { type: [string, 'null'], maxLength: 50 }
+        join_date: { type: [string, 'null'], format: date }
+        internal_notes: { type: [string, 'null'] }
+        branch_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Initial assignments effective today
+        role_assignments:
+          type: array
+          items:
+            type: object
+            required: [role_id, scope_type]
+            properties:
+              role_id: { type: string, format: uuid }
+              scope_type: { type: integer, enum: [1, 2] }
+              branch_ids: { type: array, items: { type: string, format: uuid } }
+        send_invite: { type: boolean, default: true }
+
+    EmployeeUpdate:
+      type: object
+      properties:
+        employee_code: { type: string, maxLength: 100 }
+        name_mm: { type: string, maxLength: 255 }
+        name_en: { type: [string, 'null'], maxLength: 255 }
+        phone: { type: [string, 'null'], maxLength: 50 }
+        photo_attachment_id: { type: [string, 'null'], format: uuid, description: 'employee.update — v1.5: staging image from POST /v1/attachments, linked with Attachments.replace; photo_url then stores the stable media path; null removes the photo (422 attachment_invalid)' }
+        join_date: { type: [string, 'null'], format: date }
+        internal_notes: { type: [string, 'null'] }
+        public_profile: { type: boolean }
+        public_specialty_mm: { type: [string, 'null'], maxLength: 200 }
+        public_specialty_en: { type: [string, 'null'], maxLength: 200 }
+        public_rating: { type: [number, 'null'], minimum: 1, maximum: 5, multipleOf: 0.5 }
+        show_own_earnings: { type: [boolean, 'null'] }
+        expected_updated_at: { type: string, format: date-time }
+
+    BranchAssignment:
+      type: object
+      required: [id, branch, effective_from]
+      properties:
+        id: { type: string, format: uuid }
+        branch: { $ref: '#/components/schemas/BranchSummary' }
+        effective_from: { type: string, format: date }
+        effective_to: { type: [string, 'null'], format: date }
+
+    RoleAssignment:
+      type: object
+      required: [id, role, scope_type, branch_ids, assigned_at]
+      properties:
+        id: { type: string, format: uuid }
+        role:
+          type: object
+          required: [id, name_mm]
+          properties:
+            id: { type: string, format: uuid }
+            name_mm: { type: string }
+            name_en: { type: [string, 'null'] }
+        scope_type: { type: integer, enum: [1, 2], description: 1 COMPANY · 2 BRANCHES }
+        branch_ids:
+          type: array
+          items: { type: string, format: uuid }
+        assigned_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time, description: Who / why = audit event (no DB column) }
+
+    Grant:
+      type: object
+      required: [code, scope_type, branch_ids]
+      properties:
+        code: { type: string, example: booking.delete }
+        scope_type: { type: integer, enum: [1, 2] }
+        branch_ids:
+          type: array
+          items: { type: string, format: uuid }
+
+    Session:
+      type: object
+      required: [id, login_method, created_at, last_seen_at, is_current]
+      properties:
+        id: { type: string, format: uuid }
+        device_label: { type: [string, 'null'], example: Android · Chrome }
+        login_method: { type: integer, enum: [1, 2], description: 1 GOOGLE · 2 EMAIL_OTP }
+        ip_address: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        is_current: { type: boolean }
+
+    Role:
+      type: object
+      required: [id, name_mm, status, permission_codes, active_assignments]
+      properties:
+        id: { type: string, format: uuid }
+        name_mm: { type: string }
+        name_en: { type: [string, 'null'] }
+        description_mm: { type: [string, 'null'] }
+        description_en: { type: [string, 'null'] }
+        status: { type: integer, enum: [0, 1] }
+        permission_codes:
+          type: array
+          items: { type: string }
+        active_assignments: { type: integer }
+        archived_at: { type: [string, 'null'], format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RoleCreate:
+      type: object
+      required: [name_mm, permission_codes]
+      properties:
+        name_mm: { type: string, maxLength: 100 }
+        name_en: { type: [string, 'null'], maxLength: 100 }
+        description_mm: { type: [string, 'null'] }
+        description_en: { type: [string, 'null'] }
+        permission_codes:
+          type: array
+          items: { type: string }
+          uniqueItems: true
+
+    Permission:
+      type: object
+      required: [code, module, action, kind, level]
+      properties:
+        code: { type: string, example: service.update }
+        module: { type: string, example: service }
+        action: { type: string, example: update }
+        kind: { type: string, enum: [crud, special], description: 'crud = view / create / update / delete column of the role matrix; special = approve / assign / field-group codes (ADR-011)' }
+        level: { type: string, enum: [company, branch, mixed, shared, private], description: 'ADR-012 (v1.4, replaces scope): company = acts on company master only (branch-scope grant = read-only); branch = branch data in the grant scope; mixed = company values need company scope, branch values need the branch; shared = shared records (customers) with any assignment, history filtered to read scope; private (v1.5 — contract 1) = company-only data, read and write need company scope, a branch-scope grant reaches nothing' }
+        description: { type: [string, 'null'], description: 'Developer text; UI label = language key permission.<code>' }
+
+    SettingDefinition:
+      type: object
+      required: [type, scope, module, label_key]
+      properties:
+        type: { type: string, pattern: '^(number|boolean|time|choice|text_mm_en|json|uuid|ref:[a-z][a-z0-9_]*)$', description: 'number / boolean / time / choice / text_mm_en / json / uuid (v1.5 — site image ids) / ref:<table> (v1.5 — a row id that must be ACTIVE, e.g. ref:stock_adjustment_reasons). Money settings use number with validation.unit = MMK' }
+        scope: { type: string, enum: [company, branch], description: 'branch = branch override allowed; company = company-only (v1.5: every payroll.*, attendance.* and site.* key)' }
+        module: { type: string, example: booking }
+        default: {}
+        label_key: { type: string, example: settings.booking.slot_interval_minutes.label }
+        help_key: { type: [string, 'null'] }
+        impact_key: { type: [string, 'null'], description: Shown before saving (AD-SET-03) }
+        validation: { type: object, additionalProperties: true, description: 'e.g. { min: 5, max: 60, step: 5 } or { choices: [...] }' }
+        client_readable: { type: boolean }
+
+    SettingView:
+      type: object
+      required: [key, definition, effective, source]
+      properties:
+        key: { type: string }
+        definition: { $ref: '#/components/schemas/SettingDefinition' }
+        company_value: {}
+        branch_value: {}
+        effective: {}
+        source: { type: string, enum: [default, company, branch] }
+        editable: { type: boolean, description: 'v1.4 — true when the caller may change this value (company value: company-scope settings.update; branch value: settings.update covering branch_id and a branch-scoped key)' }
+        updated_at: { type: [string, 'null'], format: date-time }
+        updated_by:
+          type: [object, 'null']
+          properties:
+            id: { type: string, format: uuid }
+            name_mm: { type: string }
+            name_en: { type: [string, 'null'] }
+
+    SettingHistoryItem:
+      type: object
+      required: [id, new_value, changed_at, changed_by]
+      properties:
+        id: { type: string, format: uuid }
+        branch_id: { type: [string, 'null'], format: uuid }
+        old_value: {}
+        new_value: {}
+        changed_at: { type: string, format: date-time }
+        changed_by:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name_mm: { type: string }
+            name_en: { type: [string, 'null'] }
+
+    SystemStatus:
+      type: object
+      required: [maintenance, version, server_time]
+      properties:
+        maintenance: { type: boolean }
+        until: { type: [string, 'null'], format: date-time }
+        message_mm: { type: [string, 'null'] }
+        message_en: { type: [string, 'null'] }
+        version: { type: string }
+        server_time: { type: string, format: date-time, example: '2026-10-01T11:20:00+06:30' }
+
+    SaleSearchHit:
+      type: object
+      description: 'Search group sales (API-DATA-09, Part 4 P4-RULE-18) — review fix 02/Oct: its own shape, not SearchHit'
+      required: [id, receipt_number, finished_at, branch_id, total_amount]
+      properties:
+        id: { type: string, format: uuid }
+        receipt_number: { type: string }
+        finished_at: { type: string, format: date-time }
+        branch_id: { type: string, format: uuid }
+        total_amount: { type: integer, description: Whole MMK (D-PLT-04) }
+    SearchHit:
+      type: object
+      required: [id, type, title]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [customer, booking, sale, employee] }
+        title: { type: string, description: 'e.g. customer name, receipt number' }
+        subtitle: { type: [string, 'null'], description: 'e.g. phone (staff view), date, branch' }
+        branch_id: { type: [string, 'null'], format: uuid }
+        link_path: { type: string, example: '/sales/01J…' }
+
+    MeResponse:
+      type: object
+      required: [user, employee, grants, branches_in_scope, assigned_branch_ids, effective, settings, system, session]
+      properties:
+        user:
+          type: object
+          required: [id, email, status]
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string, format: email }
+            status: { type: integer, enum: [1, 2] }
+            ui_language: { type: [integer, 'null'], enum: [1, 2, null] }
+            last_login_at: { type: [string, 'null'], format: date-time }
+        employee:
+          allOf:
+            - $ref: '#/components/schemas/EmployeeRef'
+            - type: object
+              properties:
+                status: { type: integer, enum: [1] }
+        grants:
+          type: array
+          items: { $ref: '#/components/schemas/Grant' }
+        branches_in_scope:
+          type: array
+          items: { $ref: '#/components/schemas/BranchSummary' }
+        today_branch_id: { type: [string, 'null'], format: uuid, description: 'Branch of today''s shift or open attendance record — Part 5 Attendance.openRecordOf(employee_id) (null when neither)' }
+        assigned_branch_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Active assignments ordered by effective_from — client fallback after last-used (AD-NAV-04)
+        effective:
+          type: object
+          required: [show_own_earnings]
+          properties:
+            show_own_earnings: { type: boolean, description: 'COALESCE(employees.show_own_earnings, dashboard.show_own_earnings_all)' }
+        settings:
+          type: object
+          additionalProperties: true
+          description: client_readable keys (effective for today's branch)
+        system:
+          type: object
+          required: [maintenance, server_time, default_language]
+          properties:
+            maintenance: { type: boolean }
+            server_time: { type: string, format: date-time }
+            default_language: { type: integer, enum: [1, 2] }
+        session:
+          type: object
+          required: [id, created_at]
+          properties:
+            id: { type: string, format: uuid }
+            device_label: { type: [string, 'null'] }
+            created_at: { type: string, format: date-time }

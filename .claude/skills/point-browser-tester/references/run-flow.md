@@ -12,7 +12,8 @@ Keep the JSON. It tells you the sheet names, the test-case sheet, header row, co
 
 - base URL of the Point web app (pass as `POINT_TEST_BASE_URL`)
 - environment name (`POINT_TEST_ENVIRONMENT`, e.g. `local`, `staging`)
-- credential profile(s) per role the cases need (owner, manager, barber, front desk, ...). The user sets `POINT_TEST_<PROFILE>_USER` / `POINT_TEST_<PROFILE>_PASSWORD` in their own shell or types them into the hidden prompt. Never take passwords through the chat.
+- sign-in profile(s) per role the cases need (admin, manager, barber, ...). The Point staff app is passwordless: the user sets `POINT_TEST_<PROFILE>_EMAIL` (a fixture person of `docs/plan/spec-fixtures.md`, e.g. `POINT_TEST_BARBER_EMAIL=aung@point.test`) and `POINT_TEST_MAILPIT_URL` (where the test environment's Mailpit answers, e.g. `http://localhost:8025`); the runner requests an e-mail code and reads it from Mailpit. Never take a password or a code through the chat. Google sign-in is not automated — test it by hand.
+- the Mailpit address (`POINT_TEST_MAILPIT_URL`, e.g. `http://localhost:8025`) — the runner and Mailpit must share a clock (same machine / Docker host): `fetchLoginCode` accepts only mail created after the moment the code was requested; if Mailpit's clock is behind, sign-in ends as BLOCKED (never with an older code). **Sign in once per profile and reuse the session** (Playwright `storageState`): the app accepts at most 10 code requests and 10 code verifies per hour from one IP (API-LIM-02 v1.6) — a run that signs in for every case is refused with 429 and its cases become BLOCKED
 - shop/tenant if sign-in depends on it
 - which cases to run, if not all (`--cases 1,3,5-8`)
 - tester name for the workbook (`POINT_TEST_TESTER`, ideally from the List sheet)

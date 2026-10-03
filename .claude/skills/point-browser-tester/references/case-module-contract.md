@@ -8,7 +8,7 @@ Rules:
 - One `addCaseResult` per case, called as soon as the case ends.
 - Call `assertMutationApproved` before the first state change of a mutating case; turn a refusal into `BLOCKED`.
 - Cleanup goes in `finally`. If restoration cannot be verified, record `BLOCKED` and call `abortMutations`; skip later mutating cases once `run.aborted` is set.
-- Credentials are used only to fill the sign-in form. Never put them in results, notes, screenshots, file names or console output.
+- The sign-in e-mail and the e-mail code are used only to fill the sign-in form. Never put them in results, notes, screenshots, file names or console output.
 - Fail closed: an unexpected exception inside a case is `BLOCKED` with the error message (the harness redacts secrets), not `PASS`.
 
 ## Skeleton
@@ -24,8 +24,9 @@ const {
   assertMutationApproved,
   attachPageListeners,
   createRun,
+  fetchLoginCode,
   finalizeRun,
-  getCredentials,
+  getLoginEmail,
   parseRunArgs,
   screenshot,
   shouldRunCase,
@@ -49,9 +50,9 @@ async function main() {
     runId: args.runId,
   });
 
-  let credentials = null;
+  let email = null;
   try {
-    credentials = await getCredentials('admin', { run });
+    email = await getLoginEmail('admin', { run }); // POINT_TEST_ADMIN_EMAIL - no password
   } catch (error) {
     for (const item of CASES) {
       if (shouldRunCase(run, item.caseNo, args)) {
@@ -69,7 +70,18 @@ async function main() {
   attachPageListeners(run, page, { getCaseNo: () => currentCase });
 
   try {
-    await signIn(page, baseUrl, credentials);
+    try {
+      await signIn(run, page, baseUrl, email);
+    } catch (error) {
+      // Mailpit not reachable or no code in time (CREDENTIALS_UNAVAILABLE), or the login screen failed:
+      // every selected case is BLOCKED and the run is still finalized below - never a crash.
+      for (const item of CASES) {
+        if (shouldRunCase(run, item.caseNo, args)) {
+          addCaseResult(run, { caseNo: item.caseNo, row: item.row, status: 'BLOCKED', scope: item.scope, mutation: item.mutation, blocker: `Sign-in failed: ${error.message}` });
+        }
+      }
+      return;
+    }
     for (const item of CASES) {
       if (!shouldRunCase(run, item.caseNo, args)) continue;
       currentCase = item.caseNo;
@@ -94,16 +106,21 @@ async function main() {
   } finally {
     await context.close();
     await browser.close();
+    console.log(await finalizeRun(run)); // also reached after the early return above
   }
-  console.log(await finalizeRun(run));
 }
 
-async function signIn(page, baseUrl, { username, password }) {
-  await page.goto(baseUrl);
-  // Selectors are application-specific.
-  await page.getByLabel('Email').fill(username);
-  await page.getByLabel('Password').fill(password);
-  await page.getByRole('button', { name: /sign in/i }).click();
+// Point has no passwords: sign in with the e-mail code read from Mailpit.
+async function signIn(run, page, baseUrl, email) {
+  await page.goto(new URL('/login', baseUrl).toString());
+  // Find elements by test id, never by visible text: the screen may be in Myanmar
+  // (coding guideline CG-TEST-06). These ids are fixed by add-foundation-auth-access.
+  const requestedAt = new Date(); // taken BEFORE the code is requested
+  await page.getByTestId('login-email').fill(email);
+  await page.getByTestId('login-send-code').click();
+  const code = await fetchLoginCode({ email, after: requestedAt, run }); // `after` and `run` are required
+  await page.getByTestId('login-code').fill(code);
+  await page.getByTestId('login-submit').click();
 }
 
 async function listShowsCustomers({ run, page, baseUrl }) {
@@ -143,7 +160,9 @@ main().catch((error) => {
 | `createRun({ evidenceRoot, topic, workbook, environment, runId?, tester?, date? })` | new run, or resume when `runId` is given |
 | `shouldRunCase(run, caseNo, { cases })` | selected and not yet recorded in this run |
 | `assertMutationApproved(mutation, options?)` | throws `MUTATION_NOT_APPROVED` without explicit approval (options, argv flags, or `POINT_APPROVE_MUTATIONS=1` / `POINT_APPROVE_RBAC_MUTATIONS=1`) |
-| `getCredentials(profile, { run })` | env `POINT_TEST_<PROFILE>_USER`/`_PASSWORD` or hidden prompt; throws `CREDENTIALS_UNAVAILABLE` |
+| `getLoginEmail(profile, { run })` | env `POINT_TEST_<PROFILE>_EMAIL` (or `_USER`) or hidden prompt — the passwordless sign-in address; throws `CREDENTIALS_UNAVAILABLE` |
+| `fetchLoginCode({ email, after, run })` | reads the newest 8-digit sign-in code sent **after `after`** to exactly `email` from Mailpit (`POINT_TEST_MAILPIT_URL`); registers it as a secret. `after` and `run` are **required** (`BAD_ARGUMENT` otherwise — an older code must never be typed: wrong codes count toward the 5-failure lock, D-AUTH-04). Throws `CREDENTIALS_UNAVAILABLE` when Mailpit is not set, cannot be reached, or no code arrives within 30 s → case `BLOCKED` |
+| `getCredentials(profile, { run })` | password systems only (not the Point staff app): env `POINT_TEST_<PROFILE>_USER`/`_PASSWORD` or hidden prompt; throws `CREDENTIALS_UNAVAILABLE` |
 | `attachPageListeners(run, page, { getCaseNo })` | console, page errors and xhr/fetch/document responses to `diagnostics/` |
 | `recordConsole`, `recordPageError`, `recordNetwork` | manual diagnostic records, sanitized |
 | `screenshot(run, page, 'TCnn-purpose.png', { stampUrl, fullPage })` | saves to `screenshots/`, returns the relative path |

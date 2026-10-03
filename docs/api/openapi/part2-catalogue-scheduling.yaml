@@ -1,0 +1,3316 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 2 · Catalogue & Scheduling
+  version: 1.4.0
+  summary: Service categories, services, options / variants, effective-dated prices + quote, eligibility, schedule patterns / shifts, leave, availability
+  description: 'Design document for Part 2 (docs/api/02-catalogue-scheduling.md). Conventions: docs/api/00-conventions.md (v1.5).
+
+    Decisions served: D-SVC-01..08, D-EMP-05, D-SCH-01..03, D-LV-01..05, D-BKG-04..08/19/22/23, D-WEB-01/04, D-DB-03/04/06, D-PLT-15/16, D-DAT-05.
+
+    Status: LOCKED v1.4 = D-API-03 (02/Oct/2026 — owner one-sheet "အကုန်လုံး OK" 02/Oct/2026 00:06 + Part 4 / 5 / 8 amendments: priceQuote date window = any branch date that is not CLOSED (late entry — owner B11; closed past date -> 422 day_closed); shift writes inside a finalized payroll period -> 423 payroll_finalized (Part 5 PayrollLock) and attendance re-detection on shift / leave writes touching today or a past date; review fixes 02/Oct (no version bump): 423 payroll_finalized also on leaveCreate / leaveApprove / leaveReject, 422 self_action on an own shift write (or own pattern save) changing a date <= today (reconcile 02/Oct: 422, not 403), category_in_use { count }, schedule.changed payload { branch_id?, employee_id?, dates }; leaveCreate look-back for Part 5 create_leave; availability ignores late-entry visits as busy time, several in-progress visits each count (owner B1); image_attachment_id = staging upload via Attachments.replace, image_url = stable media path (Part 8 research E9)). Fix-up 02/Oct (batch v5.2.15, no version bump): 423 payroll_finalized context = Part 5 { employee_id, run_id, period: { start, end }, status }; leave.requested / leave.decided / leave.cancelled named as notification types (Part 8 §15; leave.cancelled as locked in v1.3). v1.3 (owner scope choice A — ADR-012: categories / service master / options / order / archive / leave types = company master -> company scope to write (branch scope = read-only, 403 company_scope_required); per-branch sale + duration (serviceBranchesSet) = branch data checked per item; service.view / service.update are mixed). Locked v1.2 = D-API-03 (owner 01/Oct/2026 21:20 — decision sheet #16-#24 all at the defaults; DB Part 2 v1.3 locked = D-DB-06 v1.3). v1.2 = permission codes CRUD per menu + special actions (ADR-011) — 22 codes; x-permission on every operation ("<module>.view+" = view or any other code of the module; "any staff (read scope)" = operational read, no code — P2-RULE-11). v1.1 = independent review fixes + verification pass (§17 of the design). Generated-from-code OpenAPI must match this file.
+
+    Every operation that requires the session cookie may also return 401 (unauthenticated / session_revoked) and 503 (maintenance for non-admins); omitted per operation for brevity.
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; dates = MMT business dates; status/type = smallint codes (D-DB-03); bilingual *_mm / *_en (D-DB-04); errors = RFC 9457 problem+json
+    with code = language key (API-ERR-01); lists cursor-paginated (API-DATA-08); availability and quote responses are never cached.
+
+    '
+servers:
+- url: /api/v1
+  description: Same origin as the web app — Caddy routes /api/* to NestJS (ADR-009); staff host app.<domain> (★ ACT-05)
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: categories
+  description: Service categories — D-SVC-01
+- name: services
+  description: Company master services, branch sale / duration, website fields — D-SVC-01/02/07, D-WEB-01
+- name: options
+  description: Pricing option groups, values, generated variants — D-SVC-05, D-DB-06
+- name: prices
+  description: Effective-dated price store and the price quote — D-SVC-03/04/05/06/08
+- name: eligibility
+  description: Employee × branch × service eligibility, home_allowed — D-EMP-05, D-BKG-22
+- name: schedule
+  description: Weekly patterns, generated / manual shifts, roster, conflicts — D-SCH-01..03, D-BKG-19
+- name: leave
+  description: Leave types and leave requests — D-LV-01..05
+- name: availability
+  description: The one availability function — D-BKG-04..08/23, D-SCH-03, D-LV-04
+security:
+- sessionCookie: []
+paths:
+  /service-categories:
+    get:
+      tags:
+      - categories
+      operationId: categoryList
+      summary: List service categories (P2.CAT.01)
+      x-permission: 'any staff (read scope); include_archived=true -> service.view+'
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+        description: repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: include_counts
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Category'
+        '401': &id001
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags:
+      - categories
+      operationId: categoryCreate
+      summary: Create a category (P2.CAT.02) — service.create
+      x-permission: 'service.create (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+          headers:
+            Location:
+              schema:
+                type: string
+        '400': &id002
+          $ref: '#/components/responses/ValidationError'
+        '401': *id001
+        '403': &id003
+          $ref: '#/components/responses/Forbidden'
+        '409': &id004
+          $ref: '#/components/responses/Conflict'
+  /service-categories/order:
+    put:
+      tags:
+      - categories
+      operationId: categoryReorder
+      summary: Reorder categories (P2.CAT.05) — service.update
+      x-permission: 'service.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - ids
+              properties:
+                ids:
+                  type: array
+                  items: &id006
+                    type: string
+                    format: uuid
+                  minItems: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Category'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+  /service-categories/{id}:
+    patch:
+      tags:
+      - categories
+      operationId: categoryUpdate
+      summary: Update a category (P2.CAT.03) — service.update
+      x-permission: 'service.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': &id005
+          $ref: '#/components/responses/NotFound'
+        '409': *id004
+  /service-categories/{id}/archive:
+    post:
+      tags:
+      - categories
+      operationId: categoryArchive
+      summary: Archive a category (P2.CAT.04) — service.delete; 409 category_in_use { count }
+      x-permission: 'service.delete (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+  /services:
+    get:
+      tags:
+      - services
+      operationId: serviceList
+      summary: List services (P2.SVC.01) — any staff; sold=all / include_archived=true need service.view+
+      x-permission: 'any staff (read scope); include_archived=true -> service.view+; sold=all -> service.view+ for a branch_id the grant covers (ADR-012)'
+      parameters:
+      - name: q
+        in: query
+        schema:
+          type: string
+          maxLength: 100
+      - name: category_id
+        in: query
+        schema: *id006
+      - name: branch_id
+        in: query
+        schema: *id006
+        description: Only services sold at this branch (ACTIVE branch_services)
+      - name: pricing_mode
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+        description: repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: sold
+        in: query
+        schema:
+          type: string
+          enum:
+          - here
+          - all
+          default: here
+        description: all (service.view+) = every service with a sold_here flag for the Branches tab
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceListPage'
+        '400': *id002
+        '401': *id001
+    post:
+      tags:
+      - services
+      operationId: serviceCreate
+      summary: Create a service with branches and options (P2.SVC.02) — service.create
+      x-permission: 'service.create (company master: company scope)'
+      description: 'v1.4: image_attachment_id = a staging image from POST /v1/attachments (Part 8), linked with Attachments.replace (422 attachment_invalid); image_url = the stable media path /api/v1/public/media/<attachment_id>/original (Part 8 research E9).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Service'
+          headers:
+            Location:
+              schema:
+                type: string
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '409': *id004
+        '422': &id007
+          $ref: '#/components/responses/Unprocessable'
+  /services/order:
+    put:
+      tags:
+      - services
+      operationId: serviceReorder
+      summary: Reorder services within a category (P2.SVC.07) — service.update
+      x-permission: 'service.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - category_id
+              - ids
+              properties:
+                category_id: *id006
+                ids:
+                  type: array
+                  items: *id006
+                  minItems: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServiceListItem'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+  /services/{id}:
+    get:
+      tags:
+      - services
+      operationId: serviceGet
+      summary: Service detail with branches, options, variants, website fields (P2.SVC.03)
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Service'
+        '401': *id001
+        '404': *id005
+    patch:
+      tags:
+      - services
+      operationId: serviceUpdate
+      summary: Update details / website fields / status (P2.SVC.04) — service.update
+      x-permission: 'service.update (company master: company scope)'
+      description: 'v1.4: image_attachment_id as serviceCreate — the previous image is soft-deleted by the system, null removes it (422 attachment_invalid).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Service'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+  /services/{id}/archive:
+    post:
+      tags:
+      - services
+      operationId: serviceArchive
+      summary: Archive a service (P2.SVC.05) — service.delete; references in bookings / sales stay (D-DAT-05)
+      x-permission: 'service.delete (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Service'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+  /services/{id}/branches:
+    put:
+      tags:
+      - services
+      operationId: serviceBranchesSet
+      summary: Set where the service is sold and its duration per branch (P2.SVC.06) — service.update
+      x-permission: 'service.update (branch data: every item''s branch_id must be covered by the caller''s service.update scope, else 403 out_of_scope — ADR-012)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - items
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                    - branch_id
+                    - sold
+                    - duration_minutes
+                    properties:
+                      branch_id: *id006
+                      sold:
+                        type: boolean
+                      duration_minutes:
+                        type: integer
+                        minimum: 1
+                        maximum: 1440
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Service'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+  /services/{id}/options:
+    get:
+      tags:
+      - options
+      operationId: serviceOptionsGet
+      summary: Option groups, values and generated variants (P2.OPT.01)
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptionsView'
+        '401': *id001
+        '404': *id005
+    put:
+      tags:
+      - options
+      operationId: serviceOptionsSet
+      summary: Replace option groups / values; variants regenerated; on a SIMPLE service switches it to OPTIONS (P2.OPT.02) — service.update
+      x-permission: 'service.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OptionsSet'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/OptionsView'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+  /services/{id}/variants:
+    get:
+      tags:
+      - options
+      operationId: serviceVariantsResolved
+      summary: Variant cells with the effective price at a branch / location (P2.OPT.03)
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: branch_id
+        in: query
+        schema: *id006
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - name: as_of
+        in: query
+        schema: &id008
+          type: string
+          format: date
+          description: MMT business date YYYY-MM-DD (D-PLT-15)
+        description: default today
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VariantCell'
+        '400': *id002
+        '401': *id001
+        '404': *id005
+  /services/{id}/prices:
+    get:
+      tags:
+      - prices
+      operationId: priceGridGet
+      summary: Price grid effective on a date plus scheduled grids (P2.PRC.01) — price.view+
+      x-permission: 'price.view+'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: branch_id
+        in: query
+        schema: *id006
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - name: as_of
+        in: query
+        schema: *id008
+        description: default today
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceGrid'
+        '400': *id002
+        '401': *id001
+        '404': *id005
+    put:
+      tags:
+      - prices
+      operationId: priceGridSet
+      summary: Write a price grid effective from a date (P2.PRC.02) — price.update (branch scope)
+      x-permission: 'price.update'
+      description: 'D-SVC-03/05/06/08, P2-RULE-03/04. Replaces the whole grid for the branch / location from effective_from: a cell absent or with price_amount null = not sold (BRANCH) / use shop price
+        (HOME). 409 price_overlap from the DB EXCLUDE; 422 not_sold_here · variant_not_of_service · override_not_allowed · effective_date_past.'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceGridWrite'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PriceGrid'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+  /services/{id}/prices/history:
+    get:
+      tags:
+      - prices
+      operationId: priceHistory
+      summary: Price history rows (P2.PRC.03) — price.view+; D-SVC-08
+      x-permission: 'price.view+'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: branch_id
+        in: query
+        schema: *id006
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+      - name: service_variant_id
+        in: query
+        schema: *id006
+      - name: employee_id
+        in: query
+        schema: *id006
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceRowPage'
+        '400': *id002
+        '401': *id001
+        '404': *id005
+  /services/{id}/prices/copy:
+    post:
+      tags:
+      - prices
+      operationId: priceGridCopy
+      summary: Copy today's grid from one branch to another as a dated write (P2.PRC.04) — price.update
+      x-permission: 'price.update'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - from_branch_id
+              - to_branch_id
+              - location_type
+              - effective_from
+              properties:
+                from_branch_id: *id006
+                to_branch_id: *id006
+                location_type:
+                  type: integer
+                  enum:
+                  - 1
+                  - 2
+                effective_from: *id008
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PriceGrid'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+  /services/{id}/prices/withdraw:
+    post:
+      tags:
+      - prices
+      operationId: priceGridWithdraw
+      summary: Withdraw a scheduled (not yet effective) grid (P2.PRC.05) — price.delete; 422 grid_effective
+      x-permission: 'price.delete'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - branch_id
+              - location_type
+              - effective_from
+              properties:
+                branch_id: *id006
+                location_type:
+                  type: integer
+                  enum:
+                  - 1
+                  - 2
+                effective_from: *id008
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceGrid'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+  /prices/quote:
+    post:
+      tags:
+      - prices
+      operationId: priceQuote
+      summary: Price quote for items at a branch / location / date / barber (P2.PRC.06) — the only price calculator (D-SVC-04)
+      x-permission: 'any staff (read scope)'
+      description: 'Pure read (POST for the body). complete=false with per-item sold=false and reason instead of 422. Cache-Control: no-store. v1.4 (owner B11): date = any earlier business date of the branch that is not CLOSED (late entry — no fixed look-back) up to today + advance window; a later date -> 422 outside_window; a past date whose branch-day is CLOSED (Part 7 daily_closings) -> 422 day_closed (context.correction_path = reopen).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+  /branches/{id}/eligibilities:
+    get:
+      tags:
+      - eligibility
+      operationId: eligibilityMatrixGet
+      summary: Eligibility matrix for a branch (P2.ELG.01) — eligibility.view+; D-EMP-05
+      x-permission: 'eligibility.view+'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: as_of
+        in: query
+        schema: *id008
+        description: default today
+      - name: service_id
+        in: query
+        schema: *id006
+      - name: employee_id
+        in: query
+        schema: *id006
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EligibilityMatrix'
+        '400': *id002
+        '401': *id001
+        '404': *id005
+  /branches/{id}/eligibilities/set:
+    post:
+      tags:
+      - eligibility
+      operationId: eligibilityMatrixSet
+      summary: Bulk set eligibility / home_allowed from a date — cells not listed are untouched (P2.ELG.02) — eligibility.update (branch scope)
+      x-permission: 'eligibility.update'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - effective_from
+              - items
+              properties:
+                effective_from: *id008
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                    - employee_id
+                    - service_id
+                    - eligible
+                    properties:
+                      employee_id: *id006
+                      service_id: *id006
+                      eligible:
+                        type: boolean
+                      home_allowed:
+                        type: boolean
+                        description: omitted = keep current (false for a new row)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/EligibilityMatrix'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+  /employees/{id}/eligibilities:
+    get:
+      tags:
+      - eligibility
+      operationId: employeeEligibilities
+      summary: One employee's eligibility rows (P2.ELG.03) — eligibility.view+ or self
+      x-permission: 'eligibility.view+ | self'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: as_of
+        in: query
+        schema: *id008
+      - name: include_history
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EligibilityRow'
+        '401': *id001
+        '404': *id005
+  /employees/{id}/schedule-pattern:
+    get:
+      tags:
+      - schedule
+      operationId: patternGet
+      summary: Weekly schedule pattern set (P2.PAT.01) — schedule.view+ or self; D-SCH-01
+      x-permission: 'schedule.view+ | self'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: as_of
+        in: query
+        schema: *id008
+      - name: include_history
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternSet'
+        '401': *id001
+        '404': *id005
+    put:
+      tags:
+      - schedule
+      operationId: patternSet
+      summary: Replace the pattern set from a date (>= today) and regenerate PATTERN shifts for non-manual days (P2.PAT.02) — schedule.update over old + new branches
+      x-permission: 'schedule.update'
+      description: 'P2-RULE-04/07/08. 400 validation errors[] per segment: segment_overlap · end_before_start; 422: cross_branch_gap { needed, actual, after_segment } · not_assigned_to_branch · effective_date_past · self_action (reconcile 02/Oct: a save on the own employee of the caller that would change an own shift of today — owner C11). warnings[]:
+        bookings_outside_shift, shift_kept_attendance (never cancelled — D-BKG-19).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatternSetWrite'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PatternSet'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+  /schedule/shifts:
+    get:
+      tags:
+      - schedule
+      operationId: shiftList
+      summary: 'Roster: shifts, leave blocks and closures for a range (P2.SHF.01)'
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - name: branch_id
+        in: query
+        schema: *id006
+      - name: employee_id
+        in: query
+        schema: *id006
+        description: without branch_id = barber view across branches
+      - name: from
+        in: query
+        schema: *id008
+        required: true
+      - name: to
+        in: query
+        schema: *id008
+        description: at most 42 days after from
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Roster'
+        '400': *id002
+        '401': *id001
+    post:
+      tags:
+      - schedule
+      operationId: shiftCreate
+      summary: Create a MANUAL shift (P2.SHF.03) — schedule.create; 409 shift_overlap
+      x-permission: 'schedule.create'
+      description: 'v1.4 (contract 3 / 17): inside a FINALIZED / PUBLISHED / PAID payroll period -> 423 payroll_finalized (Part 5 PayrollLock); a date <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-07). Review fix 02/Oct: a shift write for a date <= today on the own employee of the caller -> 422 self_action (owner C11; reconcile 02/Oct: 422 as in Part 5).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShiftCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Shift'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+          headers:
+            Location:
+              schema:
+                type: string
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '409': *id004
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /me/shifts:
+    get:
+      tags:
+      - schedule
+      operationId: myShifts
+      summary: Own shifts (P2.SHF.02)
+      x-permission: 'self'
+      parameters:
+      - name: from
+        in: query
+        schema: *id008
+        required: true
+      - name: to
+        in: query
+        schema: *id008
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Roster'
+        '400': *id002
+        '401': *id001
+  /schedule/shifts/{id}:
+    patch:
+      tags:
+      - schedule
+      operationId: shiftUpdate
+      summary: Edit a shift (becomes MANUAL) (P2.SHF.04) — schedule.update
+      x-permission: 'schedule.update'
+      description: 'v1.4 (contract 3 / 17): inside a FINALIZED / PUBLISHED / PAID payroll period -> 423 payroll_finalized (Part 5 PayrollLock); a date <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-07). Review fix 02/Oct: a shift write for a date <= today on the own employee of the caller -> 422 self_action (owner C11; reconcile 02/Oct: 422 as in Part 5).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - expected_updated_at
+              properties:
+                branch_id: *id006
+                start_time: &id009
+                  type: string
+                  pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+                  description: HH:MM MMT
+                end_time: *id009
+                expected_updated_at: &id014
+                  type: string
+                  format: date-time
+                  description: ISO 8601 with +06:30
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Shift'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /schedule/shifts/{id}/archive:
+    post:
+      tags:
+      - schedule
+      operationId: shiftArchive
+      summary: Archive a shift; the day becomes a manual day (P2.SHF.05) — schedule.delete; bookings outside shifts returned as warnings
+      x-permission: 'schedule.delete'
+      description: 'v1.4 (contract 3 / 17): inside a FINALIZED / PUBLISHED / PAID payroll period -> 423 payroll_finalized (Part 5 PayrollLock); a date <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-07). Review fix 02/Oct: a shift write for a date <= today on the own employee of the caller -> 422 self_action (owner C11; reconcile 02/Oct: 422 as in Part 5).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type: string
+                  maxLength: 500
+                  description: audit only
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Shift'
+                - type: object
+                  properties:
+                    warnings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Warning'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /schedule/days/reset:
+    post:
+      tags:
+      - schedule
+      operationId: scheduleDayReset
+      summary: Return a manual day to the pattern — archives its active shifts, turns archived MANUAL markers into history (source = 1) and regenerates (P2.SHF.08) — schedule.update over old + pattern branches
+      x-permission: 'schedule.update'
+      description: 'v1.4 (contract 3 / 17): inside a FINALIZED / PUBLISHED / PAID payroll period -> 423 payroll_finalized (Part 5 PayrollLock); a date <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-07). Review fix 02/Oct: a shift write for a date <= today on the own employee of the caller -> 422 self_action (owner C11; reconcile 02/Oct: 422 as in Part 5).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - employee_id
+              - date
+              properties:
+                employee_id: *id006
+                date: *id008
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Shift'
+                  warnings:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Warning'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /schedule/generate:
+    post:
+      tags:
+      - schedule
+      operationId: scheduleGenerate
+      summary: Run shifts.generate now for a branch (P2.SHF.06) — schedule.update (branch scope)
+      x-permission: 'schedule.update'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - branch_id
+              properties:
+                branch_id: *id006
+                from:
+                  type: string
+                  format: date
+                  description: clipped to today
+                to: *id008
+                employee_id: *id006
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - job_id
+                properties:
+                  job_id:
+                    type: string
+        '400': *id002
+        '401': *id001
+        '403': *id003
+  /schedule/conflicts:
+    get:
+      tags:
+      - schedule
+      operationId: scheduleConflicts
+      summary: Bookings that no longer fit a shift / leave / closure (P2.SHF.07) — schedule.view+; D-BKG-19
+      x-permission: 'schedule.view+'
+      parameters:
+      - name: branch_id
+        in: query
+        schema: *id006
+        required: true
+      - name: from
+        in: query
+        schema: *id008
+        required: true
+      - name: to
+        in: query
+        schema: *id008
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScheduleConflict'
+        '400': *id002
+        '401': *id001
+  /leave-types:
+    get:
+      tags:
+      - leave
+      operationId: leaveTypeList
+      summary: Leave types (P2.LVT.01) — any staff; include_archived=true needs leave_type.view+; D-LV-01
+      x-permission: 'any staff (read scope); include_archived=true -> leave_type.view+'
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+        description: repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LeaveType'
+        '401': *id001
+    post:
+      tags:
+      - leave
+      operationId: leaveTypeCreate
+      summary: Create a leave type (P2.LVT.02) — leave_type.create
+      x-permission: 'leave_type.create (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaveTypeCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaveType'
+          headers:
+            Location:
+              schema:
+                type: string
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '409': *id004
+  /leave-types/{id}:
+    patch:
+      tags:
+      - leave
+      operationId: leaveTypeUpdate
+      summary: Update a leave type (P2.LVT.03) — leave_type.update
+      x-permission: 'leave_type.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaveTypeUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaveType'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+  /leave-types/{id}/archive:
+    post:
+      tags:
+      - leave
+      operationId: leaveTypeArchive
+      summary: Archive a leave type (P2.LVT.04) — leave_type.delete; 409 leave_type_in_use
+      x-permission: 'leave_type.delete (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaveType'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+  /leaves:
+    get:
+      tags:
+      - leave
+      operationId: leaveList
+      summary: Leaves in scope — approval inbox with status=1 (P2.LV.01) — leave.view+ (includes leave.approve)
+      x-permission: 'leave.view+'
+      parameters:
+      - name: branch_id
+        in: query
+        schema: *id006
+      - name: employee_id
+        in: query
+        schema: *id006
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+        description: repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema: *id008
+      - name: to
+        in: query
+        schema: *id008
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeavePage'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+    post:
+      tags:
+      - leave
+      operationId: leaveCreate
+      summary: Request leave for self or on behalf (P2.LV.03) — D-LV-02..05
+      x-permission: 'self | leave.create (on behalf)'
+      description: employee_id omitted = self; on behalf needs leave.create with the employee in scope. 409 leave_overlap (PENDING / APPROVED); 422 half_day_single_date. Response includes affected_bookings[]
+        (D-LV-04, never deleted — D-BKG-19). start_date >= today - 7; v1.4 — when called from Part 5 P5.EXC.02 create_leave, back to the start of the oldest non-finalized payroll period (PayrollLock.lastFinalizedEnd() + 1). Dates <= today -> attendance re-detection (P2-RULE-09). Review fix 02/Oct — a date inside a FINALIZED / PUBLISHED / PAID payroll period -> 423 payroll_finalized.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaveCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+          headers:
+            Location:
+              schema:
+                type: string
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '409': *id004
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /me/leaves:
+    get:
+      tags:
+      - leave
+      operationId: myLeaves
+      summary: Own leave requests (P2.LV.02)
+      x-permission: 'self'
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+        description: repeatable
+        style: form
+        explode: true
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeavePage'
+        '401': *id001
+  /leaves/{id}:
+    get:
+      tags:
+      - leave
+      operationId: leaveGet
+      summary: Leave detail (P2.LV.04)
+      x-permission: 'requester | employee | leave.view+'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+        '401': *id001
+        '404': *id005
+    patch:
+      tags:
+      - leave
+      operationId: leaveUpdate
+      summary: Edit while PENDING (P2.LV.05) — requester / employee or leave.update; 423 payroll_finalized
+      x-permission: 'requester | employee (PENDING) | leave.update'
+      description: 'v1.4: dates <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-09 — an APPROVED leave resolves a covered OPEN ABSENT exception to LEAVE; rejected / cancelled -> back to OPEN). 423 payroll_finalized = Part 5 PayrollLock.'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaveUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '409': *id004
+        '422': *id007
+        '423': &id010
+          $ref: '#/components/responses/Locked'
+  /leaves/{id}/cancel:
+    post:
+      tags:
+      - leave
+      operationId: leaveCancel
+      summary: Cancel (P2.LV.06) — requester / employee / leave.delete while PENDING; leave.approve for APPROVED; 423 payroll_finalized
+      x-permission: 'requester | employee (PENDING) | leave.delete (PENDING) | leave.approve (APPROVED)'
+      description: 'v1.4: dates <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-09 — an APPROVED leave resolves a covered OPEN ABSENT exception to LEAVE; rejected / cancelled -> back to OPEN). 423 payroll_finalized = Part 5 PayrollLock.'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+        '423': *id010
+  /leaves/{id}/approve:
+    post:
+      tags:
+      - leave
+      operationId: leaveApprove
+      summary: Approve (P2.LV.07) — leave.approve, not own request
+      x-permission: 'leave.approve (not own)'
+      description: 'v1.4: dates <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-09 — an APPROVED leave resolves a covered OPEN ABSENT exception to LEAVE; rejected / cancelled -> back to OPEN). Review fix 02/Oct — 423 payroll_finalized when a date of the leave lies inside a finalized payroll period (P2-RULE-09).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                decision_note:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /leaves/{id}/reject:
+    post:
+      tags:
+      - leave
+      operationId: leaveReject
+      summary: Reject with a note (P2.LV.08) — leave.approve, not own request
+      x-permission: 'leave.approve (not own)'
+      description: 'v1.4: dates <= today -> AttendanceDetector.redetect(employee_id, dates[], actor) in the same transaction (P2-RULE-09 — an APPROVED leave resolves a covered OPEN ABSENT exception to LEAVE; rejected / cancelled -> back to OPEN). Review fix 02/Oct — 423 payroll_finalized when a date of the leave lies inside a finalized payroll period (P2-RULE-09).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - decision_note
+              properties:
+                decision_note:
+                  type: string
+                  minLength: 1
+                  maxLength: 500
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Leave'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '404': *id005
+        '422': *id007
+        '423':
+          $ref: '#/components/responses/Locked'
+  /leaves/{id}/affected-bookings:
+    get:
+      tags:
+      - leave
+      operationId: leaveAffectedBookings
+      summary: Bookings inside the leave period (P2.LV.09) — D-LV-04 / D-BKG-19
+      x-permission: 'requester | employee | leave.view+'
+      parameters:
+      - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AffectedBooking'
+        '401': *id001
+        '404': *id005
+  /availability/dates:
+    get:
+      tags:
+      - availability
+      operationId: availabilityDates
+      summary: Date strip states over the advance window (P2.AVL.01) — D-BKG-04/06, no-store; 422 outside_window / item errors
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - &id011
+        name: branch_id
+        in: query
+        schema: *id006
+        required: true
+      - &id012
+        name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - &id013
+        name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+          minItems: 1
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        required: true
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema: *id006
+        description: omit = any eligible barber
+      - name: from
+        in: query
+        schema: *id008
+      - name: to
+        in: query
+        schema: *id008
+      - name: exclude_booking_id
+        in: query
+        schema: *id006
+        description: reschedule (D-BKG-12/13)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityDates'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '422': *id007
+  /availability/slots:
+    get:
+      tags:
+      - availability
+      operationId: availabilitySlots
+      summary: Free start times for one date (P2.AVL.02) — D-BKG-05/07/23, no-store; 422 outside_window / date_closed
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - *id011
+      - *id012
+      - *id013
+      - name: employee_id
+        in: query
+        schema: *id006
+      - name: date
+        in: query
+        schema: *id008
+        required: true
+      - name: exclude_booking_id
+        in: query
+        schema: *id006
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilitySlots'
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '422': *id007
+  /availability/next:
+    get:
+      tags:
+      - availability
+      operationId: availabilityNext
+      summary: Next free start per barber (P2.AVL.03)
+      x-permission: 'any staff (read scope)'
+      parameters:
+      - *id011
+      - *id012
+      - *id013
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items: *id006
+        description: repeatable; default = all eligible
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - employee_id
+                      properties:
+                        employee_id: *id006
+                        next_available_at:
+                          type:
+                          - string
+                          - 'null'
+                          format: date-time
+        '400': *id002
+        '401': *id001
+        '403': *id003
+        '422': *id007
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session (user_sessions.token_hash) — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: *id006
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+  responses:
+    ValidationError:
+      description: 400 validation (errors[] per field)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden · out_of_scope · company_scope_required (ADR-012) · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (also out-of-scope single reads)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 already_exists · category_in_use { count } · leave_type_in_use · price_overlap · shift_overlap · leave_overlap · conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/02-catalogue-scheduling.md §13b (incl. self_action — a shift write or pattern save changing the own shifts of the caller on a date <= today; owner C11, reconcile 02/Oct)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: '423 payroll_finalized { employee_id, run_id, period: { start, end }, status } (context = Part 5 P5-RULE-10 PayrollLock, Part 0 API-IDEM-06 — leave create / edit / approve / reject / cancel and shift writes touching a finalized payroll period; review fix 02/Oct)'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: 429 rate_limited
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Maintenance:
+      description: 503 maintenance (non-admins)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required:
+      - title
+      - status
+      - code
+      - request_id
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          example: cross_branch_gap
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            required:
+            - field
+            - code
+            properties:
+              field:
+                type: string
+                example: days[2].segments[1]
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: Machine data a code needs (API-ERR-01 v1.4), e.g. day_closed -> branch_id, business_date, correction_path
+      additionalProperties: true
+      description: RFC 9457 problem details; code = language key error.*
+    Warning:
+      type: object
+      required:
+      - code
+      properties:
+        code:
+          type: string
+          example: bookings_outside_shift
+        params:
+          type: object
+          additionalProperties: true
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    Category:
+      type: object
+      required:
+      - id
+      - name_mm
+      - name_en
+      - sort_order
+      - status
+      - updated_at
+      properties:
+        id: *id006
+        name_mm:
+          type: string
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+        service_count:
+          type: integer
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at: *id014
+    CategoryCreate:
+      type: object
+      required:
+      - name_mm
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        sort_order:
+          type: integer
+    CategoryUpdate:
+      type: object
+      required:
+      - expected_updated_at
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+        expected_updated_at: *id014
+    DurationRange:
+      type: object
+      required:
+      - min
+      - max
+      properties:
+        min:
+          type: integer
+        max:
+          type: integer
+    ServiceListItem:
+      type: object
+      required:
+      - id
+      - category_id
+      - name_mm
+      - name_en
+      - pricing_mode
+      - buffer_minutes
+      - status
+      - show_on_website
+      - branch_ids
+      - updated_at
+      properties:
+        id: *id006
+        category_id: *id006
+        name_mm: &id015
+          type: string
+          maxLength: 200
+        name_en: &id016
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        pricing_mode: &id017
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SIMPLE · 2 OPTIONS (D-SVC-05)
+        buffer_minutes: &id018
+          type: integer
+          minimum: 0
+          maximum: 120
+          description: D-SVC-07
+        status: &id019
+          type: integer
+          enum:
+          - 0
+          - 1
+        show_on_website: &id020
+          type: boolean
+        sort_order: &id021
+          type: integer
+        branch_ids: &id022
+          type: array
+          items: *id006
+          description: branches where sold (ACTIVE branch_services)
+        unpriced_branch_ids: &id023
+          type: array
+          items: *id006
+          description: sold there but no price effective today (quote would say not_sold_here)
+        duration_range: &id024
+          $ref: '#/components/schemas/DurationRange'
+        archived_at: &id025
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at: *id014
+        sold_here:
+          type: boolean
+          description: present when sold=all
+    ServiceListPage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceListItem'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        total:
+          type:
+          - integer
+          - 'null'
+    ServiceBranch:
+      type: object
+      required:
+      - branch_id
+      - sold
+      - duration_minutes
+      properties:
+        branch_id: *id006
+        sold:
+          type: boolean
+        duration_minutes:
+          type: integer
+          minimum: 1
+    Service:
+      type: object
+      required:
+      - id
+      - category_id
+      - name_mm
+      - name_en
+      - pricing_mode
+      - buffer_minutes
+      - status
+      - show_on_website
+      - branches
+      - options
+      - updated_at
+      properties:
+        id: *id006
+        category_id: *id006
+        name_mm: *id015
+        name_en: *id016
+        pricing_mode: *id017
+        buffer_minutes: *id018
+        status: *id019
+        show_on_website: *id020
+        sort_order: *id021
+        branch_ids: *id022
+        unpriced_branch_ids: *id023
+        duration_range: *id024
+        archived_at: *id025
+        updated_at: *id014
+        description_mm: &id026
+          type:
+          - string
+          - 'null'
+        description_en: *id026
+        public_description_mm: *id026
+        public_description_en: *id026
+        image_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        image_url:
+          type:
+          - string
+          - 'null'
+          format: uri-reference
+          description: Stable media path /api/v1/public/media/<attachment_id>/original (v1.4 — Part 8 research E9); swap the last segment for w400 / w800 / w1600
+        branches:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceBranch'
+        options:
+          $ref: '#/components/schemas/OptionsView'
+    ServiceCreate:
+      type: object
+      required:
+      - category_id
+      - name_mm
+      - pricing_mode
+      properties:
+        category_id: *id006
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 200
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        description_mm: *id026
+        description_en: *id026
+        pricing_mode:
+          type: integer
+          enum:
+          - 1
+          - 2
+        buffer_minutes:
+          type: integer
+          minimum: 0
+          maximum: 120
+          default: 0
+        show_on_website:
+          type: boolean
+          default: true
+        public_description_mm: *id026
+        public_description_en: *id026
+        image_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branches:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceBranch'
+        options:
+          $ref: '#/components/schemas/OptionsSet'
+    ServiceUpdate:
+      type: object
+      required:
+      - expected_updated_at
+      properties:
+        category_id: *id006
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 200
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        description_mm: *id026
+        description_en: *id026
+        pricing_mode:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: only OPTIONS → SIMPLE (1) is accepted here; 2 → 422 use_options_endpoint (SIMPLE → OPTIONS = PUT /services/{id}/options)
+        buffer_minutes:
+          type: integer
+          minimum: 0
+          maximum: 120
+        show_on_website:
+          type: boolean
+        public_description_mm: *id026
+        public_description_en: *id026
+        image_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+        expected_updated_at: *id014
+    OptionValue:
+      type: object
+      required:
+      - id
+      - name_mm
+      - name_en
+      - sort_order
+      properties:
+        id: *id006
+        name_mm:
+          type: string
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        sort_order:
+          type: integer
+    OptionGroup:
+      type: object
+      required:
+      - id
+      - name_mm
+      - name_en
+      - sort_order
+      - values
+      properties:
+        id: *id006
+        name_mm:
+          type: string
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        sort_order:
+          type: integer
+        values:
+          type: array
+          items:
+            $ref: '#/components/schemas/OptionValue'
+    Variant:
+      type: object
+      required:
+      - id
+      - value_ids
+      - variant_key
+      - sold_at_branch_ids
+      properties:
+        id: *id006
+        value_ids:
+          type: array
+          items: *id006
+        variant_key:
+          type: string
+        sold_at_branch_ids:
+          type: array
+          items: *id006
+    OptionsView:
+      type: object
+      required:
+      - groups
+      - variants
+      properties:
+        groups:
+          type: array
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/OptionGroup'
+        variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/Variant'
+    OptionsSet:
+      type: object
+      required:
+      - groups
+      properties:
+        groups:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items:
+            type: object
+            required:
+            - name_mm
+            - values
+            properties:
+              id: *id006
+              name_mm:
+                type: string
+                minLength: 1
+                maxLength: 100
+              name_en:
+                type:
+                - string
+                - 'null'
+                maxLength: 100
+              values:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required:
+                  - name_mm
+                  properties:
+                    id: *id006
+                    name_mm:
+                      type: string
+                      minLength: 1
+                      maxLength: 100
+                    name_en:
+                      type:
+                      - string
+                      - 'null'
+                      maxLength: 100
+      description: 'Replace semantics: with id = update, without = create, missing = archive (variants regenerated) — P2-RULE-02'
+    VariantCell:
+      type: object
+      required:
+      - id
+      - value_ids
+      - label_mm
+      - label_en
+      - sold
+      properties:
+        id: *id006
+        value_ids:
+          type: array
+          items: *id006
+        label_mm:
+          type: string
+        label_en: *id026
+        price_amount:
+          type:
+          - integer
+          - 'null'
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+        sold:
+          type: boolean
+    PriceCell:
+      type: object
+      required:
+      - price_amount
+      properties:
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: barber override (SIMPLE + BRANCH only — D-SVC-03/05)
+        price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: null = not sold (BRANCH) / use shop price (HOME)
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        inherited_from_branch:
+          type: boolean
+          description: 'HOME read: shown price comes from the BRANCH row (D-SVC-06)'
+    PriceGrid:
+      type: object
+      required:
+      - branch_id
+      - location_type
+      - as_of
+      - cells
+      - scheduled
+      properties:
+        branch_id: *id006
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+        as_of: *id008
+        effective_from:
+          type:
+          - string
+          - 'null'
+          format: date
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        cells:
+          type: array
+          items:
+            $ref: '#/components/schemas/PriceCell'
+        scheduled:
+          type: array
+          items:
+            type: object
+            required:
+            - effective_from
+            - cells
+            properties:
+              effective_from: *id008
+              cells:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PriceCell'
+    PriceGridWrite:
+      type: object
+      required:
+      - branch_id
+      - location_type
+      - effective_from
+      - cells
+      properties:
+        branch_id: *id006
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+        effective_from:
+          type: string
+          format: date
+          description: today or later (422 effective_date_past)
+        cells:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PriceCell'
+    PriceRow:
+      type: object
+      required:
+      - id
+      - service_variant_id
+      - location_type
+      - employee_id
+      - price_amount
+      - effective_from
+      - effective_to
+      - created_at
+      properties:
+        id: *id006
+        branch_id: *id006
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        price_amount: &id027
+          type: integer
+          minimum: 0
+          description: MMK integer (D-PLT-04)
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+        effective_from: *id008
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        created_at: *id014
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    PriceRowPage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PriceRow'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        total:
+          type:
+          - integer
+          - 'null'
+    QuoteItemRequest:
+      type: object
+      required:
+      - service_id
+      properties:
+        service_id: *id006
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    QuoteRequest:
+      type: object
+      required:
+      - branch_id
+      - location_type
+      - date
+      - items
+      properties:
+        branch_id: *id006
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+        date: *id008
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/QuoteItemRequest'
+    QuoteItem:
+      type: object
+      required:
+      - service_id
+      - sold
+      properties:
+        service_id: *id006
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sold:
+          type: boolean
+        reason:
+          type:
+          - string
+          - 'null'
+          enum:
+          - not_sold_here
+          - variant_required
+          - service_inactive
+          - category_inactive
+          - null
+        unit_price_amount:
+          type:
+          - integer
+          - 'null'
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+        buffer_minutes:
+          type:
+          - integer
+          - 'null'
+        price_source:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - null
+          description: 1 BRANCH · 2 BARBER_OVERRIDE · 3 HOME · 4 HOME_FALLBACK_BRANCH (branch-level BRANCH row; overrides never apply to HOME)
+    Quote:
+      type: object
+      required:
+      - branch_id
+      - location_type
+      - date
+      - complete
+      - items
+      - transport_fee_amount
+      - subtotal_amount
+      - duration_minutes
+      - block_minutes
+      properties:
+        branch_id: *id006
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+        date: *id008
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        complete:
+          type: boolean
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteItem'
+        transport_fee_amount:
+          type: integer
+          minimum: 0
+          description: HOME only, else 0 (D-SVC-06)
+        subtotal_amount: *id027
+        duration_minutes:
+          type: integer
+        block_minutes:
+          type: integer
+          description: travel + Σ duration + Σ buffer + travel (P2-RULE-10)
+    EligibilityRow:
+      type: object
+      required:
+      - branch_id
+      - service_id
+      - home_allowed
+      - effective_from
+      - effective_to
+      properties:
+        employee_id: *id006
+        branch_id: *id006
+        service_id: *id006
+        home_allowed:
+          type: boolean
+        effective_from: *id008
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+    EligibilityMatrix:
+      type: object
+      required:
+      - branch_id
+      - as_of
+      - employees
+      - services
+      - cells
+      properties:
+        branch_id: *id006
+        as_of: *id008
+        employees:
+          type: array
+          items:
+            type: object
+            required:
+            - employee_id
+            - display_name
+            properties:
+              employee_id: *id006
+              display_name:
+                type: string
+        services:
+          type: array
+          items:
+            type: object
+            required:
+            - service_id
+            - name_mm
+            properties:
+              service_id: *id006
+              name_mm:
+                type: string
+              name_en: *id026
+        cells:
+          type: array
+          items:
+            $ref: '#/components/schemas/EligibilityRow'
+    PatternSegment:
+      type: object
+      required:
+      - branch_id
+      - start_time
+      - end_time
+      properties:
+        branch_id: *id006
+        start_time: *id009
+        end_time: *id009
+    PatternDay:
+      type: object
+      required:
+      - day_of_week
+      - segments
+      properties:
+        day_of_week:
+          type: integer
+          minimum: 1
+          maximum: 7
+          description: 1 Mon … 7 Sun (ISO)
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternSegment'
+    PatternSet:
+      type: object
+      required:
+      - employee_id
+      - effective_from
+      - effective_to
+      - days
+      properties:
+        employee_id: *id006
+        effective_from: *id008
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        days:
+          type: array
+          maxItems: 7
+          items:
+            $ref: '#/components/schemas/PatternDay'
+        history:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    PatternSetWrite:
+      type: object
+      required:
+      - effective_from
+      - days
+      properties:
+        effective_from: *id008
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        days:
+          type: array
+          maxItems: 7
+          items:
+            $ref: '#/components/schemas/PatternDay'
+    Shift:
+      type: object
+      required:
+      - id
+      - employee_id
+      - branch_id
+      - shift_date
+      - starts_at
+      - ends_at
+      - source
+      - updated_at
+      properties:
+        id: *id006
+        employee_id: *id006
+        branch_id: *id006
+        shift_date: *id008
+        starts_at: *id014
+        ends_at: *id014
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 PATTERN · 2 MANUAL
+        schedule_pattern_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        redacted:
+          type: boolean
+          description: true = out-of-scope branch, times only (AD-CAL-03)
+        updated_at: *id014
+    ShiftCreate:
+      type: object
+      required:
+      - employee_id
+      - branch_id
+      - shift_date
+      - start_time
+      - end_time
+      properties:
+        employee_id: *id006
+        branch_id: *id006
+        shift_date: *id008
+        start_time: *id009
+        end_time: *id009
+    LeaveBlock:
+      type: object
+      required:
+      - leave_id
+      - employee_id
+      - start_at
+      - end_at
+      - status
+      - leave_type_id
+      properties:
+        leave_id: *id006
+        employee_id: *id006
+        start_at: *id014
+        end_at: *id014
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+        leave_type_id: *id006
+    Roster:
+      type: object
+      required:
+      - items
+      - leaves
+      - closures
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Shift'
+        leaves:
+          type: array
+          items:
+            $ref: '#/components/schemas/LeaveBlock'
+        closures:
+          type: array
+          items:
+            type: object
+            required:
+            - branch_id
+            - date
+            properties:
+              branch_id: *id006
+              date: *id008
+              notice_mm: *id026
+              notice_en: *id026
+    ScheduleConflict:
+      type: object
+      required:
+      - booking_id
+      - employee_id
+      - branch_id
+      - starts_at
+      - ends_at
+      - reason
+      properties:
+        booking_id: *id006
+        employee_id: *id006
+        branch_id: *id006
+        starts_at: *id014
+        ends_at: *id014
+        reason:
+          type: string
+          enum:
+          - no_shift
+          - on_leave
+          - branch_closed
+          - not_eligible
+          - not_assigned
+          - employee_inactive
+          - service_inactive
+    LeaveType:
+      type: object
+      required:
+      - id
+      - name_mm
+      - name_en
+      - is_paid
+      - sort_order
+      - status
+      - updated_at
+      properties:
+        id: *id006
+        name_mm:
+          type: string
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        is_paid:
+          type: boolean
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at: *id014
+    LeaveTypeCreate:
+      type: object
+      required:
+      - name_mm
+      - is_paid
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        is_paid:
+          type: boolean
+        sort_order:
+          type: integer
+    LeaveTypeUpdate:
+      type: object
+      required:
+      - expected_updated_at
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 100
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        is_paid:
+          type: boolean
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+        sort_order:
+          type: integer
+        expected_updated_at: *id014
+    AffectedBooking:
+      type: object
+      required:
+      - booking_id
+      - branch_id
+      - starts_at
+      - ends_at
+      - customer_name
+      - status
+      properties:
+        booking_id: *id006
+        branch_id: *id006
+        starts_at: *id014
+        ends_at: *id014
+        customer_name:
+          type: string
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+    Leave:
+      type: object
+      required:
+      - id
+      - employee_id
+      - leave_type_id
+      - start_date
+      - end_date
+      - day_portion
+      - status
+      - requested_by_user_id
+      - created_at
+      - updated_at
+      properties:
+        id: *id006
+        employee_id: *id006
+        leave_type_id: *id006
+        start_date: *id008
+        end_date: *id008
+        day_portion:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 FULL · 2 MORNING · 3 AFTERNOON (D-LV-05)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 PENDING · 2 APPROVED · 3 REJECTED
+        reason: *id026
+        requested_by_user_id: *id006
+        decided_by_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        decided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        decision_note: *id026
+        cancelled_by_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        affected_bookings:
+          type: array
+          items:
+            $ref: '#/components/schemas/AffectedBooking'
+        created_at: *id014
+        updated_at: *id014
+    LeavePage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Leave'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        total:
+          type:
+          - integer
+          - 'null'
+    LeaveCreate:
+      type: object
+      required:
+      - leave_type_id
+      - start_date
+      - end_date
+      - day_portion
+      properties:
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: omit = self; on behalf = leave.create
+        leave_type_id: *id006
+        start_date: *id008
+        end_date: *id008
+        day_portion:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          default: 1
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+    LeaveUpdate:
+      type: object
+      required:
+      - expected_updated_at
+      properties:
+        leave_type_id: *id006
+        start_date: *id008
+        end_date: *id008
+        day_portion:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        expected_updated_at: *id014
+    AvailabilityDate:
+      type: object
+      required:
+      - date
+      - state
+      properties:
+        date: *id008
+        state:
+          type: string
+          enum:
+          - available
+          - full
+          - closed
+        first_slot_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        closure_notice_mm: *id026
+        closure_notice_en: *id026
+    AvailabilityDates:
+      type: object
+      required:
+      - branch_id
+      - window
+      - no_eligible_employee
+      - dates
+      properties:
+        branch_id: *id006
+        window:
+          type: object
+          required:
+          - from
+          - to
+          properties:
+            from: *id008
+            to: *id008
+        no_eligible_employee:
+          type: boolean
+        dates:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilityDate'
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    AvailabilitySlot:
+      type: object
+      required:
+      - starts_at
+      - ends_at
+      - block_starts_at
+      - block_ends_at
+      - employee_ids
+      properties:
+        starts_at: *id014
+        ends_at: *id014
+        block_starts_at: *id014
+        block_ends_at: *id014
+        employee_ids:
+          type: array
+          items: *id006
+          minItems: 1
+    AvailabilitySlots:
+      type: object
+      required:
+      - date
+      - slot_interval_minutes
+      - block_minutes
+      - duration_minutes
+      - no_eligible_employee
+      - slots
+      properties:
+        date: *id008
+        no_eligible_employee:
+          type: boolean
+        slot_interval_minutes:
+          type: integer
+        block_minutes:
+          type: integer
+        duration_minutes:
+          type: integer
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilitySlot'
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time

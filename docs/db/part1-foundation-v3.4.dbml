@@ -1,0 +1,209 @@
+// Point Barbershop — Part 1: Foundation / Organization / Access · v3.4 (01/Oct/2026)
+// 🔒 D-DB-02 = v3 (29/Sep ည) · v3.1 = users မှာ Part 1b login column ၇ ခု ထပ်ဖြည့် (D-AUTH-03/04/08) · v3.2 = Part 8 website column — branches ၂ ခု + employees ၃ ခု (OPEN-21 → toggle / data, D-WEB-01 / 04)
+// v3.3 (01/Oct — owner UI/UX အဖြေ): users.ui_language (OPEN-33 ✅ — ဘာသာ = user account) · employees.show_own_earnings (OPEN-10 ✅ — default OFF, admin က တစ်ယောက်ချင်း ဖွင့်) — column ၂ ခုပဲ၊ table / FK မပြောင်း
+// v3.4 (01/Oct — owner အဖြေ ဒုတိယအကြိမ်): employees.show_own_earnings → NULL ခွင့်ပြု (NULL = company setting dashboard.show_own_earnings_all လိုက် — "အကုန်လုံး / တစ်ယောက်ချင်း" နှစ်မျိုးလုံး) · employees.public_rating (OPEN-37 ✅ — admin / manager ပေးတဲ့ rating, website barber card; V2 = customer rating)
+// v2 → v3: F-P1-02..10 approve ပြီး · D-ORG-03 (company_id) · D-DB-03 (status = number code)
+//          D-DB-04 (MM / EN) · D-ROLE-08 (permissions.json sync) · D-ROLE-06 (assignment တစ်ခုချင်း)
+// Status / type = smallint + CHECK (D-DB-03) — number အဓိပ္ပာယ်ကို note မှာ ပြ၊ code ထဲမှာ constant နာမည်နဲ့ပဲ သုံး
+// id = UUIDv7 (app ကထုတ် — D-DB-01) · *_at = timestamptz · CHECK / partial unique = part1-foundation-v3-constraints.sql
+
+Table companies {
+  id uuid [pk, note: 'UUIDv7 (D-DB-01)']
+  name_mm varchar(255) [not null, note: 'D-DB-04']
+  name_en varchar(255) [note: 'D-DB-04 — NULL ဆို EN screen မှာ MM ပြ']
+  logo_url text
+  phone varchar(50)
+  email varchar(255)
+  address_mm text [note: 'D-DB-04']
+  address_en text [note: 'D-DB-04']
+  website_url text
+  social_links jsonb
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE (D-DB-03)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'D-ORG-01, D-ORG-02 · D-ORG-03: V1 = row ၁ ခု (Point)၊ နောက်မှ multi-company ဖွင့်လို့ရအောင် master table တွေမှာ company_id'
+}
+
+Table branches {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id]
+  code varchar(50) [not null, note: '/book?branch=<code> (D-BKG-01)']
+  name_mm varchar(255) [not null, note: 'D-DB-04']
+  name_en varchar(255) [note: 'D-DB-04']
+  phone varchar(50)
+  email varchar(255)
+  address_mm text [note: 'D-DB-04']
+  address_en text [note: 'D-DB-04']
+  website_url text
+  social_links jsonb
+  latitude numeric(10,7)
+  longitude numeric(10,7)
+  location_radius_meters integer [note: 'QR + GPS attendance (D-ATT-01)']
+  is_public boolean [not null, default: true, note: 'Part 8 (v3.2) — website မှာ ပြ / မပြ (D-WEB-01, OPEN-21 toggle)']
+  map_url text [note: 'Part 8 (v3.2) — Google Maps link (website "လမ်းညွှန်") · NULL = lat / long ကနေ ထုတ်']
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE (D-DB-03)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Indexes {
+    (company_id, code) [unique]
+  }
+
+  Note: 'D-ORG-02, D-WEB-03 · ဖွင့်ချိန် = branch_opening_hours · ယာယီပိတ်ရက် = branch_closures (Part 8 — D-WEB-04, F-P1-11 ပြေ)'
+}
+
+Table users {
+  id uuid [pk]
+  email varchar(255) [not null, unique, note: 'Login email = admin ထည့်ထားတဲ့ email (D-AUTH-02)']
+  status smallint [not null, default: 2, note: '0 DISABLED · 1 ACTIVE · 2 INVITED (D-DB-03)']
+  last_login_at timestamptz
+  google_subject varchar(255) [unique, note: 'Part 1b — Google account ID (sub)၊ ပထမ Google login မှာ email ကိုက်မှ မှတ် (D-AUTH-08)']
+  invited_at timestamptz [note: 'Part 1b — D-AUTH-03']
+  invited_by_user_id uuid [ref: > users.id, note: 'Part 1b — D-AUTH-03']
+  invite_last_sent_at timestamptz [note: 'Part 1b — resend (D-AUTH-03)']
+  activated_at timestamptz [note: 'Part 1b — ပထမ login အောင် → 2 INVITED → 1 ACTIVE']
+  failed_login_count smallint [not null, default: 0, note: 'Part 1b — ဆက်တိုက်မှား အကြိမ်၊ မှန်ရင် 0 (D-AUTH-04)']
+  login_locked_until timestamptz [note: 'Part 1b — ၅ ကြိမ်မှား → now + 20 min (D-AUTH-04)']
+  ui_language smallint [note: 'v3.3 — UI ဘာသာ: 1 MY · 2 EN · NULL = system default (D-PLT-03, OPEN-33 ✅ 01/Oct) · CHECK = constraints.sql · notification / OTP email ကိုလည်း ဒီဘာသာ']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '''
+  Login identity ပဲ (D-DB-01) · company_id မထား — company က employees ကနေ (D-ORG-03)
+  ui_language (v3.3) = user တစ်ယောက်ချင်း ရွေးထားတဲ့ UI ဘာသာ — session payload နဲ့ ပြန်ပေး (D-PLT-03)
+  Invite → ပထမ login အောင်ရင် 2 INVITED → 1 ACTIVE (D-AUTH-03)
+  OTP / session table = Part 1b (part1b-login-v1.dbml) · invite = column (table မလို — D-AUTH-03)
+  '''
+}
+
+Table employees {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  user_id uuid [not null, unique, ref: - users.id, note: '🔒 D-EMP-02 — users 1 : 1 employees']
+  employee_code varchar(100) [not null, note: 'Format = setting (D-EMP-03)']
+  name_mm varchar(255) [not null, note: 'D-DB-04']
+  name_en varchar(255) [note: 'D-DB-04']
+  phone varchar(50)
+  photo_url text
+  public_profile boolean [not null, default: false, note: 'Part 8 (v3.2) — website မှာ barber ပုံ / နာမည် ပြ (default OFF — OPEN-21 toggle; ဖုန်း / email လုံးဝ မပြ)']
+  public_specialty_mm varchar(200) [note: 'Part 8 (v3.2) — website ပြ specialty (D-DB-04)']
+  public_specialty_en varchar(200) [note: 'Part 8 (v3.2)']
+  show_own_earnings boolean [note: 'v3.3 / v3.4 — barber ကိုယ့် sale / commission estimate ကို dashboard + checkout မှာ မြင်ရ (OPEN-10 ✅ 01/Oct; D-DSH-03, D-COM-04) · NULL = company setting dashboard.show_own_earnings_all (settings.json, default false) အတိုင်း · true / false = ဒီ barber အတွက် override (admin Pay tab) · effective = COALESCE(column, setting)']
+  public_rating numeric(2,1) [note: 'v3.4 — website barber card rating (OPEN-37 ✅ 01/Oct — admin / manager ပေး; 1.0–5.0, 0.5 ခြား — CHECK) · NULL = မပြ · website မှာ "Point rating" လို့ label (customer review မဟုတ်) · V2 = customer rating (table အသစ်) · D-UX-05']
+  join_date date
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE · 2 RESIGNED · 3 TERMINATED (D-DB-03, D-EMP-04)']
+  internal_notes text [note: 'Free text — ရိုက်တဲ့ ဘာသာအတိုင်း (D-DB-04)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Indexes {
+    (company_id, employee_code) [unique, note: 'D-ORG-03 — company အတွင်း unique']
+  }
+
+  Note: '''
+  Login ရ = users.status IN (1 ACTIVE, 2 INVITED) AND employees.status = 1 ACTIVE (D-DB-03)
+  အလုပ်ထွက် = status ပြောင်း၊ record မဖျက် (🔒 D-EMP-02, D-EMP-04)
+  '''
+}
+
+Table employee_branches {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  branch_id uuid [not null, ref: > branches.id]
+  effective_from date [not null]
+  effective_to date
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (employee_id, branch_id, effective_from) [unique]
+  }
+
+  Note: '''
+  🔒 D-EMP-01 — branch အများကြီး + history
+  F-P1-04 (SQL): branch တစ်ခုကို ဖွင့်ထားတဲ့ assignment ၁ ခုပဲ — branch မတူရင် ရ
+  တစ်ရက်အတွင်း ဘယ်အချိန် ဘယ် branch = schedule (Part 2, D-SCH-01/02)
+  branch.company_id = employee.company_id (app စစ် — V1 company ၁ ခု)
+  '''
+}
+
+Table roles {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(100) [not null, note: 'D-DB-04']
+  name_en varchar(100) [note: 'D-DB-04']
+  description_mm text [note: 'D-DB-04']
+  description_en text [note: 'D-DB-04']
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE (D-DB-03)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'Role = position၊ admin ဖန်တီး (D-ROLE-01) · (company_id, name_mm) unique — archive မလုပ်ရသေးတာတွေအတွင်း (SQL)'
+}
+
+Table permissions {
+  id uuid [pk]
+  code varchar(200) [not null, unique, note: 'ဥပမာ booking.cancel — permissions.json key (D-ROLE-08) · rename / ပြန်သုံး ✖']
+  module varchar(100) [not null]
+  action varchar(100) [not null]
+  description text [note: 'Developer မှတ်ချက် — screen label က language file (key = code)']
+  archived_at timestamptz [note: 'permissions.json ကဖြုတ်ရင် sync က archive (hard delete ✖)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (module, action) [unique]
+  }
+
+  Note: 'Module → action (D-ROLE-02) · company_id မထား (system တစ်ခုလုံး) · admin မဖန်တီး၊ permissions.json → DB sync (D-ROLE-08)'
+}
+
+Table role_permissions {
+  id uuid [pk]
+  role_id uuid [not null, ref: > roles.id]
+  permission_id uuid [not null, ref: > permissions.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (role_id, permission_id) [unique]
+  }
+
+  Note: 'Admin က role မှာ ✔ ခြစ် (D-ROLE-02) · archive ဖြစ်ပြီးသား permission = စစ်ချိန်မှာ မတွက်'
+}
+
+Table employee_roles {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  role_id uuid [not null, ref: > roles.id]
+  scope_type smallint [not null, note: '1 COMPANY (branch အကုန် + နောက်ဖွင့်မယ့် branch) · 2 BRANCHES (employee_role_branches ထဲကပဲ) — D-DB-03']
+  assigned_at timestamptz [not null, note: 'F-P1-03']
+  revoked_at timestamptz [note: 'F-P1-03 — ဖြုတ်တဲ့ စက္ကန့်ကစ access ပိတ် (D-ROLE-06)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: '''
+  🔒 D-ROLE-04 — role အများကြီး၊ grant-only union
+  🔒 D-ROLE-05 — branch scope က assignment တစ်ခုချင်းမှာ (Ko Aung: Barber → A + B၊ Manager → B)
+  🔒 D-ROLE-06 — assignment တစ်ခု ဖြုတ် / ပြောင်းရင် အဲ့ assignment ပဲ (ကျန်တာ မထိ)
+  F-P1-03 (SQL): role တူ active assignment ၁ ခုပဲ
+  '''
+}
+
+Table employee_role_branches {
+  id uuid [pk]
+  employee_role_id uuid [not null, ref: > employee_roles.id]
+  branch_id uuid [not null, ref: > branches.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (employee_role_id, branch_id) [unique]
+  }
+
+  Note: 'F-P1-02 — R364 role_branch_scopes အစား · scope_type = 2 BRANCHES ဆို row ၁ ခု အနည်းဆုံး၊ 1 COMPANY ဆို row မရှိ (app စစ်)'
+}

@@ -1,0 +1,47 @@
+// Point Barbershop — Part 1b: Login · v1 (30/Sep/2026)
+// 🔒 D-AUTH-01..08, D-AUTH-06 (REC-05) · Part 1 (D-DB-02) ရဲ့ users table ကို column ထပ်ဖြည့် + table အသစ် ၂ ခု
+// dbdiagram မှာ ကြည့်ရင် part1-foundation-v3.2.dbml နဲ့ တွဲ paste လုပ်ပါ (users ref)
+// Status / type = smallint + CHECK (D-DB-03) · CHECK / partial index = part1b-login-v1-constraints.sql
+// users မှာ ထပ်ဖြည့်တဲ့ column ၇ ခု = part1-foundation-v3.2.dbml (users table)
+
+Table login_otps {
+  id uuid [pk, note: 'UUIDv7']
+  user_id uuid [not null, ref: > users.id]
+  code_hash varchar(255) [not null, note: 'OTP ၈ လုံးကို hash (HMAC-SHA256 + server secret) — raw code မသိမ်း (D-AUTH-04)']
+  expires_at timestamptz [not null, note: 'created_at + 5 မိနစ်']
+  consumed_at timestamptz [note: 'တစ်ခါသုံး — သုံးပြီးရင် set']
+  request_ip inet
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (user_id, created_at)
+  }
+
+  Note: '''
+  🔒 D-AUTH-04 — ၈ လုံး · ၅ မိနစ် · တစ်ခါသုံး · နောက်ဆုံးတောင်းတဲ့ OTP တစ်ခုပဲ သုံးလို့ရ
+  ပြန်တောင်းရင် ၆၀ စက္ကန့် စောင့် — နောက်ဆုံး row ရဲ့ created_at နဲ့ app စစ်
+  Email က users ထဲ မရှိ / DISABLED ဆို OTP မပို့ (row မဖန်တီး) — response ကတော့ အတူတူ (email ရှိ/မရှိ မသိအောင်)
+  '''
+}
+
+Table user_sessions {
+  id uuid [pk, note: 'UUIDv7']
+  user_id uuid [not null, ref: > users.id]
+  token_hash varchar(255) [not null, unique, note: 'HttpOnly cookie ထဲက token ကို hash — raw token မသိမ်း (D-AUTH-06)']
+  login_method smallint [not null, note: '1 GOOGLE · 2 EMAIL_OTP (D-DB-03)']
+  device_label varchar(255) [note: 'My Devices မှာ ပြ — ဥပမာ "Android · Chrome" (user agent ကနေ)']
+  user_agent text
+  ip_address inet [note: 'Login ဝင်တုန်းက IP']
+  created_at timestamptz [not null, default: `now()`, note: 'Login ဝင်ချိန် → in-app noti (D-AUTH-05, Part 8)']
+  last_seen_at timestamptz [not null, default: `now()`, note: '၅ မိနစ်တစ်ခါလောက်ပဲ update (DB write သက်သာအောင်)']
+  revoked_at timestamptz
+  revoked_by_user_id uuid [ref: > users.id, note: 'ကိုယ်တိုင် / admin · system ဆို NULL']
+  revoke_reason smallint [note: '1 LOGOUT · 2 DEVICE_REMOVED (My Devices) · 3 ADMIN_REVOKE_ALL · 4 ACCOUNT_INACTIVE (DISABLED / အလုပ်ထွက်) — D-DB-03']
+
+  Note: '''
+  🔒 D-AUTH-05 — စက်အများကြီး · My Devices ကဖြုတ် · admin က အကုန် logout
+  🔒 D-AUTH-06 — stay signed in (expiry / idle timeout မရှိ) · revoke ရင် ချက်ချင်း ထွက်
+  Request တိုင်း: session revoked_at IS NULL AND users.status = 1 AND employees.status = 1 (D-DB-03)
+  Login event (အောင် / မှား) = audit_events (Part 8)
+  '''
+}

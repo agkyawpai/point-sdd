@@ -1,0 +1,5281 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 7 · Finance & Daily Closing
+  version: 1.1.0
+  summary: Daily closing (preview, count, close, reopen), cash outs and returns, cash-out reasons, expense / income categories, expenses, manual incomes, P&L
+  description: 'Design document for Part 7 (docs/api/07-finance-closing.md). Conventions: docs/api/00-conventions.md (v1.5 — incl. the idempotency wording of contract 15).
+
+    v1.1 (02/Oct/2026) — OPEN-40 locked (owner "OPEN-40 OK"): (a) Expenses.removePayroll(run, actor, reason) soft-deletes the run''s source-3 salary expenses (deleted_at, deleted_by
+    = the actor, deletion_reason "Payroll reopened — <reason>"); DB Part 7 v1.2 = FK expenses.payroll_entry_branch_allocation_id ON DELETE SET NULL + expenses_source_refs_chk accepts
+    a NULL allocation on source 3 only when deleted_at IS NOT NULL; the next finalize posts fresh rows. No endpoint, DTO or code changed — description strings only.
+
+    Decisions served: D-FIN-01..09 (REC-15/16/17, OPEN-05 A, OPEN-25), D-PAY-02 (REC-11), D-VIS-07/13, D-SVC-06, D-PAYR-04/08, D-DSH-01/02, D-RPT-01 ⑤ ⑥, D-NTF-01..03, D-AUD-01/02, D-DAT-05,
+    D-ROLE-02/03/07/09 (ADR-011, ADR-012 + contract 1 amendment), D-DB-11 (F-P7-01..07), D-PLT-15/16.
+
+    Status: 🔒 LOCKED v1.1 — D-API-08 (owner one-sheet "အကုန်လုံး OK", 02/Oct/2026 00:06 — E1–E8, C2–C4, D1, D3, F6, F12, G (d), H (4); v1.1 = owner "OPEN-40 OK", 02/Oct/2026 — (a)).
+    DB Part 7 v1.2 (v1.1 = cash_outs / cash_returns cancelled_at, cancelled_by_user_id, cancel_reason; expenses / manual_incomes client_request_id; v1.2 = expenses allocation FK ON
+    DELETE SET NULL + expenses_source_refs_chk for soft-deleted payroll rows).
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "any staff (read scope)" = operational read, no code; "self" = own rows; levels
+    per ADR-012: closings, cash outs / returns, branch expenses / incomes, branch P&L = branch data; company-wide expenses / incomes (branch_id null) and the company P&L = company scope
+    for read and write (contract 1); SALARY-category expense rows = private (company-scope payroll.view); reasons and categories = company master.
+
+    DayLock (P7-RULE-02): drawer writes on a CLOSED branch-day → 422 day_closed (context.correction_path = "reopen"); KBZPay verification (Part 4) is exempt (owner E3), unverify is gated.
+
+    v1.0 (02/Oct, batch consistency pass — no version bump): Expenses.removePayroll(run, actor, reason) raised as OPEN-40 (owner — answered in v1.1: soft delete + DB Part 7
+    v1.2; no API change); Expenses.createAuto / postPayroll signatures shared with Parts 6 / 5; DayLock caller list = Part 4; Receivables.issue / cancelForCashOut
+    / updateForCashOut; attachment_invalid from Part 8. Fix-up 02/Oct (batch v5.2.15): staff-advance taker private — EMPLOYEE_BALANCE cash outs keep amount + reason, employee / note
+    / receivable_id only for company-scope payroll.view or receivable.issue (employee_hidden — owner C1 + D-FIN-06, P7-RULE-01); range_too_long { max_days }.
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating operations need X-Requested-With: point-app (API-AUTH-02). Idempotency-Key is required on cash outs, cash
+    returns, expenses and manual incomes (client_request_id); save / close / approve / reject / delete / cancel are idempotent by state (repeat → 200); reopen is by state too but a repeat
+    answers 409 invalid_transition.
+
+    Review fixes 02/Oct (independent review — no version bump): every write incl. close / reopen = READ COMMITTED with the locks first (close / reopen: exclusive day lock = first statement),
+    REPEATABLE READ READ ONLY only for previews / reports; lock order = day lock → payroll lock → sale → visit → booking → payments → receipt counter → cash-out / closing rows → stock
+    level rows; reopen inside a finalized payroll period = warning payroll_finalized_period; open_sales_exist covers difference sales and, for a past date, OPEN sales with earlier payments;
+    opening-hours rows count from their updated_at date; EMPLOYEE_BALANCE edit / cancel need receivable.issue; reject writes the rejecter into approved_by / approved_at; cancel of a
+    return the conversion was computed with → 409 cash_out_converted; job closing.month_end_must_return = daily 01:00 MMT, converting once the branch month is fully closed; cash-out
+    edit replaces the source-2 expense; category_in_use { count }; previous_month_pnl { date }; CashOutReduced; 422 system_category_not_allowed; 422 attachment_invalid on the attachment
+    endpoints; receivable.installment_amount ≥ 1.
+
+    Reconcile 02/Oct (cross-part reconcile — no version bump): staff-advance taker visible to company-scope payroll.view or receivable.issue holders and to the employee; a cash-out note
+    edit calls Part 5 Receivables.updateForCashOut; closures are archived while start_date ≥ today (P7-RULE-03 reference).
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; business dates MMT; status / type = smallint codes (D-DB-03); errors = RFC 9457 problem+json with code
+    = language key.'
+servers:
+- url: /api/v1
+  description: Same origin as the app — Caddy routes /api/* to NestJS (ADR-009)
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: daily-closings
+  description: Daily closing per branch and business date — D-FIN-06, D-PAY-02, owner E1–E3 / E8 (branch data)
+- name: cash-outs
+  description: Cash outs — D-FIN-07/08, owner E5 / C2 / C4 / D1 (branch data)
+- name: cash-returns
+  description: Cash returns and reversals — D-FIN-09, OPEN-25 (branch data — returning drawer)
+- name: cash-out-reasons
+  description: Cash-out reason master — D-FIN-08 (company master)
+- name: expense-categories
+  description: Expense categories — D-FIN-02, F-P7-01 (company master — module finance_category)
+- name: income-categories
+  description: Income categories — D-FIN-01 (company master — module finance_category)
+- name: expenses
+  description: Expenses — D-FIN-02/03/04/09, owner E4 / D3 (branch data; company-wide = company scope; salary rows private)
+- name: manual-incomes
+  description: Manual incomes — D-FIN-01/03, owner E4 / E7 (branch data; company-wide = company scope)
+- name: pnl
+  description: P&L — D-FIN-05/09, owner E6 / F6 (branch data / company scope)
+security:
+- sessionCookie: []
+paths:
+  /daily-closings:
+    get:
+      tags:
+      - daily-closings
+      operationId: closingList
+      summary: Closings list / company view (P7.CLS.01) — AD-CLS-07, AD-DSH-04
+      x-permission: closing.view+ (branch data — scope-filtered)
+      description: 'One row per branch × date: stored rows (OPEN draft or CLOSED snapshot) + virtual rows (exists=false, status 1, figures null) for dates that need closing (P7-RULE-03).
+        Sort -business_date, branch.'
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch in the grant
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today − 13 days
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: 'Default today; range ≤ 92 days (422 range_too_long { max_days: 92 })'
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            description: 1 OPEN (not closed / reopened) · 2 CLOSED (immutable snapshot — 🔒 D-FIN-06)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: needs_closing
+        in: query
+        schema:
+          type: boolean
+        description: 'true = only dates that need closing (P7-RULE-03) — with status=1: "days not closed"'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClosingListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /daily-closings/{branch_id}/{business_date}:
+    get:
+      tags:
+      - daily-closings
+      operationId: closingGet
+      summary: Closing preview / snapshot for one branch-day (P7.CLS.02) — AD-CLS-01..04
+      x-permission: closing.view+ (branch data)
+      description: 'P7-RULE-04: live figures for no row / OPEN (source=live), the stored snapshot for CLOSED (source=snapshot) + live verified_after_close_count / unverified_now_count
+        (owner E3). KBZPay list (effective method requires_verification — contract 8), movements, checks (open_sales / previous_open_dates = blockers), opening prefill from closing.opening_float_amount.
+        422 date_in_future; out of scope → 404.'
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The drawer's branch (branch data — ADR-012)
+      - name: business_date
+        in: path
+        required: true
+        schema:
+          type: string
+          format: date
+        description: MMT business date (D-PLT-15); ≤ today
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyClosing'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    put:
+      tags:
+      - daily-closings
+      operationId: closingSave
+      summary: Save the count (draft) (P7.CLS.03) — AD-WIZ-01
+      x-permission: closing.close (branch data)
+      description: P7-RULE-05 — creates the OPEN row on the first save (INSERT … ON CONFLICT DO NOTHING + FOR UPDATE); stores opening / counted / reasons / notes + recomputed components;
+        previous_closing_counted_amount stays NULL until close. CLOSED → 423 locked (correction_path reopen); 409 conflict; 422 date_in_future. No business checks on a draft.
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The drawer's branch (branch data — ADR-012)
+      - name: business_date
+        in: path
+        required: true
+        schema:
+          type: string
+          format: date
+        description: MMT business date (D-PLT-15); ≤ today
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClosingDraft'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyClosing'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /daily-closings/{branch_id}/{business_date}/close:
+    post:
+      tags:
+      - daily-closings
+      operationId: closingClose
+      summary: Close the day (P7.CLS.04) — 🔒 D-FIN-06, owner E2 / E8
+      x-permission: closing.close (branch data)
+      description: 'P7-RULE-06 — idempotent by state (no Idempotency-Key; CLOSED → 200 current state). One READ COMMITTED transaction: the exclusive day lock is its first statement,
+        every check and the figures come after it (never a REPEATABLE READ snapshot). 409 previous_day_open { dates[] } · 409 open_sales_exist { sales[] } (owner E2 — today: every OPEN
+        sale incl. difference sales; a past date: OPEN late-entry sales dated on or before it and OPEN sales holding payments received on or before it) · 409 closing_changed (body expected_cash_amount
+        / unverified_payment_count differ from the server figures — context has the new ones) · 400 reason_required (cash_difference_reason / unverified_reason / opening_difference_reason)
+        · 422 date_in_future. Difference beyond tolerance → notification closing.difference + warnings[] beyond_tolerance.'
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The drawer's branch (branch data — ADR-012)
+      - name: business_date
+        in: path
+        required: true
+        schema:
+          type: string
+          format: date
+        description: MMT business date (D-PLT-15); ≤ today
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClosingClose'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyClosing'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /daily-closings/{branch_id}/{business_date}/reopen:
+    post:
+      tags:
+      - daily-closings
+      operationId: closingReopen
+      summary: Reopen a closed day (P7.CLS.05) — 🔒 D-FIN-06 admin reopen
+      x-permission: closing.reopen (branch data — Admin seed)
+      description: 'P7-RULE-07 — READ COMMITTED, exclusive day lock first; not CLOSED → 409 invalid_transition (also a repeat: reopen is the one by-state action that does not answer
+        200); status 1, reopen_count + 1, last_reopened_*; values kept as the draft; warnings[] later_closings { dates[] } · payroll_finalized_period { run_id, period } (a day inside
+        a FINALIZED / PUBLISHED / PAID payroll period may be reopened — Part 4 still refuses late-entry START / FINISH with SERVICE lines there, 423 payroll_finalized); notification
+        closing.reopened.'
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The drawer's branch (branch data — ADR-012)
+      - name: business_date
+        in: path
+        required: true
+        schema:
+          type: string
+          format: date
+        description: MMT business date (D-PLT-15); ≤ today
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyClosing'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /cash-outs:
+    get:
+      tags:
+      - cash-outs
+      operationId: cashOutList
+      summary: Cash outs list (P7.CSO.01) — AD-FIN-01
+      x-permission: cashout.view+ (branch data — scope-filtered); mine=true = self (recorded by me, taken by me, or an advance / loan paid to me — no code)
+      description: 'Staff advance taker private (P7-RULE-01 — owner C1 + D-FIN-06): an EMPLOYEE_BALANCE cash out keeps amount, reason, dates and state for every reader (the cash count
+        needs them); employee, note and receivable_id are returned only to company-scope payroll.view or receivable.issue holders (both private, Admin seed) and to the employee themself
+        — others get null + employee_hidden: true (UI "Staff advance").'
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: accounting_type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+              the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        description: Repeatable
+        style: form
+        explode: true
+      - name: reason_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: state
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - done
+            - outstanding
+            - charged_to_expense
+            - returned
+            - cancelled
+            description: done = types 1–3 · outstanding = MUST_RETURN not fully returned · charged_to_expense = converted at month end, still owed (D-FIN-09) · returned = fully returned
+              · cancelled (owner E5)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: EMPLOYEE_BALANCE cash outs of this employee — needs company-scope payroll.view or receivable.issue (else 403 forbidden — P7-RULE-01, owner C1 + D-FIN-06)
+      - name: mine
+        in: query
+        schema:
+          type: boolean
+        description: true = cash outs I recorded, took (taken_by_user_id) or received as an advance / loan (employee_id = my employee) — self, no code
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Note or taker name (never matches a hidden advance note)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CashOutListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - cash-outs
+      operationId: cashOutCreate
+      summary: Record a cash out (P7.CSO.03) — 🔒 D-FIN-07/08, owner E1 / C2 / C4 / D1
+      x-permission: cashout.create (branch data — body.branch_id); EMPLOYEE_BALANCE reason also receivable.issue (Part 5 — private, company scope — owner C1 / C2)
+      description: 'P7-RULE-09 — DayLock on the occurred_at business date (422 day_closed); reason ACTIVE (422 reason_inactive); type fields (400 validation, 422 taker_required); EMPLOYEE_BALANCE
+        → Part 5 Receivables.issue (422 self_issue / employee_inactive); EXPENSE → APPROVED expense source 2 in the same transaction (automatic source — APPROVED by DB CHECK, 🔒 F-P7-04;
+        owner E4 governs manual entries only). Identifying fields for replay: branch_id, reason_id, amount (422 idempotency_mismatch).'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashOutCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOut'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOut'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-outs/to-be-returned:
+    get:
+      tags:
+      - cash-outs
+      operationId: cashOutToBeReturned
+      summary: '"To be returned" list (P7.CSO.02) — AD-FIN-03, 🔒 D-FIN-09'
+      x-permission: cashout.view+ (branch data — scope-filtered); mine=true = self (taken by me)
+      description: MUST_RETURN, not cancelled, outstanding > 0 (incl. charged_to_expense) with returns nested; oldest first; age_days.
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      - name: taken_by_user_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: mine
+        in: query
+        schema:
+          type: boolean
+        description: true = cash I took (self)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CashOut'
+                  totals:
+                    type: object
+                    properties:
+                      outstanding_amount:
+                        type: integer
+                        minimum: 0
+                        description: Whole MMK (D-PLT-04)
+                      count:
+                        type: integer
+                    required:
+                    - outstanding_amount
+                    - count
+                required:
+                - items
+                - totals
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /cash-outs/{id}:
+    get:
+      tags:
+      - cash-outs
+      operationId: cashOutGet
+      summary: Cash out detail (P7.CSO.04)
+      x-permission: cashout.view+ (branch data) or self (recorder / taker / the employee of an advance)
+      description: 'Staff advance taker private (P7-RULE-01 — owner C1 + D-FIN-06): an EMPLOYEE_BALANCE cash out keeps amount, reason, dates and state for every reader (the cash count
+        needs them); employee, note and receivable_id are returned only to company-scope payroll.view or receivable.issue holders (both private, Admin seed) and to the employee themself
+        — others get null + employee_hidden: true (UI "Staff advance").'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOut'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - cash-outs
+      operationId: cashOutUpdate
+      summary: Correct a cash out while the day is open (P7.CSO.05) — owner E5
+      x-permission: cashout.update (branch data); an EMPLOYEE_BALANCE cash out also receivable.issue (Part 5 — private)
+      description: 'P7-RULE-10 — DayLock on the stored and the new date (422 day_closed); 422 reason_type_change (same accounting type only) · use_cancel (EMPLOYEE_BALANCE amount / employee)
+        · amount_below_returned · date_in_future · reason_inactive; 409 invalid_transition (cancelled) · cash_out_converted · conflict (date changed between read and lock); 400 reason_required
+        (edit_reason — stored in the interceptor audit row cash_out.update); 403 forbidden (EMPLOYEE_BALANCE without receivable.issue). EXPENSE: the linked source-2 expense is soft-deleted
+        and a new APPROVED one inserted in the same transaction (an APPROVED expense is never edited in place). EMPLOYEE_BALANCE: a note edit updates the receivable reason (Part 5 Receivables.updateForCashOut).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashOutUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOut'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-outs/{id}/cancel:
+    post:
+      tags:
+      - cash-outs
+      operationId: cashOutCancel
+      summary: Cancel a cash out while the day is open (P7.CSO.06) — owner E5, DB v1.1
+      x-permission: cashout.delete (branch data); an EMPLOYEE_BALANCE cash out also receivable.issue (Part 5 — private)
+      description: P7-RULE-10 — repeat → 200; 422 day_closed; 409 cash_out_has_returns { count } · cash_out_converted { expense_id } · receivable_in_use (Part 5 Receivables.cancelForCashOut);
+        403 forbidden (EMPLOYEE_BALANCE without receivable.issue); linked expense soft-deleted; notification cash_out.cancelled.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOut'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-returns:
+    get:
+      tags:
+      - cash-returns
+      operationId: cashReturnList
+      summary: Cash returns list (P7.CRT.01)
+      x-permission: cashout.view+ (branch data — the returning branch, scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: cash_out_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: include_cancelled
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CashReturn'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /cash-outs/{id}/returns:
+    post:
+      tags:
+      - cash-returns
+      operationId: cashReturnCreate
+      summary: Record a cash return (P7.CRT.02) — 🔒 D-FIN-09, OPEN-25
+      x-permission: cashout.return (branch data — the returning drawer body.branch_id, default the cash out branch)
+      description: 'P7-RULE-11 — day lock (returning branch + date) first, then the cash out row FOR UPDATE. Response = CashOut, or CashOutReduced when the caller has no cashout.view+
+        on the cash out branch. 422 not_must_return · return_exceeds_outstanding { outstanding_amount } · day_closed · date_in_future · idempotency_mismatch; 409 invalid_transition (cancelled
+        cash out). Already converted → reversal expense (source 6, negative, original branch) in the same transaction. Identifying fields: cash_out_id, amount.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The MUST_RETURN cash out
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashReturnCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CashOut'
+                - $ref: '#/components/schemas/CashOutReduced'
+                description: 'CashOut when the caller holds cashout.view+ for the cash out branch (or is its recorder / taker); otherwise CashOutReduced (reduced: true) — P7-RULE-11'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CashOut'
+                - $ref: '#/components/schemas/CashOutReduced'
+                description: 'CashOut when the caller holds cashout.view+ for the cash out branch (or is its recorder / taker); otherwise CashOutReduced (reduced: true) — P7-RULE-11'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-returns/{id}/cancel:
+    post:
+      tags:
+      - cash-returns
+      operationId: cashReturnCancel
+      summary: Cancel a cash return while its day is open (P7.CRT.03) — owner E5, DB v1.1
+      x-permission: cashout.delete (branch data — the return branch)
+      description: P7-RULE-11 — repeat → 200; 422 day_closed; 409 cash_out_converted { expense_id } when the cash out is converted and this return has no reversal row (the conversion
+        was computed with it — D-FIN-09); otherwise its reversal expense is soft-deleted; settled_at cleared when outstanding again. Response = CashOut, or CashOutReduced without cashout.view+
+        on the cash out branch.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CashOut'
+                - $ref: '#/components/schemas/CashOutReduced'
+                description: 'CashOut when the caller holds cashout.view+ for the cash out branch (or is its recorder / taker); otherwise CashOutReduced (reduced: true) — P7-RULE-11'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-out-reasons:
+    get:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonList
+      summary: Cash-out reasons (P7.COR.01) — 🔒 D-FIN-08
+      x-permission: any staff (read scope) — operational for ACTIVE rows; status=0 or include_archived=true -> cashout_reason.view+ (company master, read-only at branch scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CashOutReason'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonCreate
+      summary: Add a cash-out reason (P7.COR.02)
+      x-permission: cashout_reason.create (company master — company scope)
+      description: P7-RULE-13 — type ⇔ fields (400 validation — DB cash_out_reasons_type_fields_chk); 409 already_exists; 422 category_inactive · system_category_not_allowed { system_code
+        } (expense_category_id may not be the SALARY or PRODUCT_PURCHASE system category).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashOutReasonCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOutReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-out-reasons/order:
+    put:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonReorder
+      summary: Reorder cash-out reasons (P7.COR.06)
+      x-permission: cashout_reason.update (company master — company scope)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  description: Every non-archived id, in the new order (400 validation otherwise)
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CashOutReason'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /cash-out-reasons/{id}:
+    patch:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonUpdate
+      summary: Edit a cash-out reason (P7.COR.03)
+      x-permission: cashout_reason.update (company master — company scope)
+      description: accounting_type / receivable_kind change only while unused (409 reason_in_use { cash_out_count }); 409 already_exists · conflict; 422 category_inactive · system_category_not_allowed
+        { system_code }.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashOutReasonUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOutReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /cash-out-reasons/{id}/archive:
+    post:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonArchive
+      summary: Archive a cash-out reason (P7.COR.04)
+      x-permission: cashout_reason.delete (company master — company scope)
+      description: Never deleted (D-DAT-05); past cash outs keep it.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOutReason'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /cash-out-reasons/{id}/restore:
+    post:
+      tags:
+      - cash-out-reasons
+      operationId: cashOutReasonRestore
+      summary: Restore a cash-out reason (P7.COR.05)
+      x-permission: cashout_reason.delete (company master — company scope)
+      description: 409 already_exists when the name is taken.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashOutReason'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /expense-categories:
+    get:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryList
+      summary: Expense categories (P7.CAT.01) — 🔒 D-FIN-02
+      x-permission: any staff (read scope) — operational for ACTIVE rows; status=0 or include_archived=true -> finance_category.view+ (company master, read-only at branch scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ExpenseCategory'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryCreate
+      summary: Add an expense category (P7.CAT.02)
+      x-permission: finance_category.create (company master — company scope)
+      description: 409 already_exists (name among non-archived).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpenseCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /expense-categories/order:
+    put:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryReorder
+      summary: Reorder expense categories (P7.CAT.06)
+      x-permission: finance_category.update (company master — company scope)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  description: Every non-archived id, in the new order (400 validation otherwise)
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ExpenseCategory'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /expense-categories/{id}:
+    patch:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryUpdate
+      summary: Edit an expense category (P7.CAT.03)
+      x-permission: finance_category.update (company master — company scope)
+      description: '409 already_exists · conflict. System rows (system_code 1–3): rename / reorder only — status → 409 system_row; deactivate while an active cash-out reason uses it
+        → 409 category_in_use { count }.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpenseCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /expense-categories/{id}/archive:
+    post:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryArchive
+      summary: Archive an expense category (P7.CAT.04)
+      x-permission: finance_category.delete (company master — company scope)
+      description: Past rows keep it. 409 system_row · category_in_use { count }.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpenseCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /expense-categories/{id}/restore:
+    post:
+      tags:
+      - expense-categories
+      operationId: expenseCategoryRestore
+      summary: Restore an expense category (P7.CAT.05)
+      x-permission: finance_category.delete (company master — company scope)
+      description: 409 already_exists.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpenseCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /income-categories:
+    get:
+      tags:
+      - income-categories
+      operationId: incomeCategoryList
+      summary: Income categories (P7.CAT.07) — 🔒 D-FIN-01
+      x-permission: any staff (read scope) — operational for ACTIVE rows; status=0 or include_archived=true -> finance_category.view+ (company master, read-only at branch scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IncomeCategory'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - income-categories
+      operationId: incomeCategoryCreate
+      summary: Add an income category (P7.CAT.08)
+      x-permission: finance_category.create (company master — company scope)
+      description: 409 already_exists (name among non-archived).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomeCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /income-categories/order:
+    put:
+      tags:
+      - income-categories
+      operationId: incomeCategoryReorder
+      summary: Reorder income categories (P7.CAT.12)
+      x-permission: finance_category.update (company master — company scope)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  description: Every non-archived id, in the new order (400 validation otherwise)
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IncomeCategory'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /income-categories/{id}:
+    patch:
+      tags:
+      - income-categories
+      operationId: incomeCategoryUpdate
+      summary: Edit an income category (P7.CAT.09)
+      x-permission: finance_category.update (company master — company scope)
+      description: 409 already_exists · conflict.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomeCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /income-categories/{id}/archive:
+    post:
+      tags:
+      - income-categories
+      operationId: incomeCategoryArchive
+      summary: Archive an income category (P7.CAT.10)
+      x-permission: finance_category.delete (company master — company scope)
+      description: Past rows keep it.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomeCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /income-categories/{id}/restore:
+    post:
+      tags:
+      - income-categories
+      operationId: incomeCategoryRestore
+      summary: Restore an income category (P7.CAT.11)
+      x-permission: finance_category.delete (company master — company scope)
+      description: 409 already_exists.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomeCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /expenses:
+    get:
+      tags:
+      - expenses
+      operationId: expenseList
+      summary: Expenses list (P7.EXP.01) — AD-FIN-04/05
+      x-permission: expense.view+ (branch rows scope-filtered; company-wide rows (branch_id null) only with company scope; SALARY-category rows private (company-scope payroll.view))
+        or self (mine=true)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      - name: company_wide
+        in: query
+        schema:
+          type: boolean
+        description: true = only company-wide rows (company scope — ignored otherwise)
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: expense_date from
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: expense_date to
+      - name: category_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: source
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            - 6
+            description: 1 MANUAL · 2 CASH_OUT · 3 PAYROLL · 4 PURCHASE · 5 MUST_RETURN_AUTO · 6 CASH_RETURN_REVERSAL (negative) — F-P7-04
+        description: Repeatable
+        style: form
+        explode: true
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        description: Repeatable — status=1 = the approval queue
+        style: form
+        explode: true
+      - name: paid_via
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: 1 BANK · 2 OWNER_PERSONAL · 3 OTHER — drawer cash is always a Cash Out (AD-FIN-04)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: include_deleted
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: mine
+        in: query
+        schema:
+          type: boolean
+        description: true = my own requests (self)
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Description
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ExpenseListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                  totals:
+                    type: object
+                    properties:
+                      amount:
+                        type: integer
+                        description: Whole MMK, may be negative (difference / reversal / net)
+                    required:
+                    - amount
+                required:
+                - items
+                - next_cursor
+                - totals
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - expenses
+      operationId: expenseCreate
+      summary: Add a manual expense (P7.EXP.03) — 🔒 D-FIN-02/03, owner E4
+      x-permission: expense.create (branch data — body.branch_id; null = company-wide -> company scope)
+      description: 'P7-RULE-15 — APPROVED at once only when the creator holds expense.approve through a company-scope assignment (owner E4), else PENDING + notification expense.pending.
+        422 category_inactive · date_in_future · idempotency_mismatch; 403 company_scope_required; warnings[] previous_month_pnl { date } for an earlier month. Identifying fields: branch_id,
+        category_id, amount, expense_date.'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpenseCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /expenses/{id}:
+    get:
+      tags:
+      - expenses
+      operationId: expenseGet
+      summary: Expense detail (P7.EXP.02)
+      x-permission: expense.view+ (branch rows scope-filtered; company-wide rows (branch_id null) only with company scope; SALARY-category rows private (company-scope payroll.view))
+        or self (requester)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - expenses
+      operationId: expenseUpdate
+      summary: Edit a PENDING expense (P7.EXP.04) — 🔒 D-FIN-03
+      x-permission: expense.update (branch data / company-wide -> company scope) or self (requester, PENDING)
+      description: APPROVED / automatic → 423 locked (correction_path); REJECTED / deleted → 409 invalid_transition; 409 conflict; 422 category_inactive · date_in_future.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpenseUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /expenses/{id}/approve:
+    post:
+      tags:
+      - expenses
+      operationId: expenseApprove
+      summary: Approve an expense (P7.EXP.05) — owner E4
+      x-permission: expense.approve (branch data / company-wide -> company scope)
+      description: Not one's own (422 self_approval); APPROVED → 200; other states → 409 invalid_transition. Notification expense.decided.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_updated_at:
+                  type: string
+                  format: date-time
+                  description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /expenses/{id}/reject:
+    post:
+      tags:
+      - expenses
+      operationId: expenseReject
+      summary: Reject an expense (P7.EXP.06) — owner E4
+      x-permission: expense.approve (branch data / company-wide -> company scope)
+      description: 422 self_approval; 400 reason_required; REJECTED → 200. Writes status 3, rejection_reason and approved_by / approved_at = the rejecter and the decision time (DB CHECK
+        — "decided by"). Notification expense.decided.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /expenses/{id}/delete:
+    post:
+      tags:
+      - expenses
+      operationId: expenseDelete
+      summary: Delete an expense with a reason (P7.EXP.07) — 🔒 D-FIN-03, owner D3
+      x-permission: expense.delete (branch data / company-wide; a PURCHASE row -> company scope — owner D3) or self (own PENDING row)
+      description: Soft delete (the word is Delete, never Void). Manual rows and source 4 PURCHASE (company scope); sources 2 / 3 / 5 / 6 → 423 locked (correction_path cancel_cash_out
+        / payroll_reopen / cash_return / cancel_cash_return). Deleted → 200.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /expenses/{id}/attachments:
+    post:
+      tags:
+      - expenses
+      operationId: expenseAttach
+      summary: Add receipts to an expense (P7.EXP.08) — 🔒 D-FIN-03
+      x-permission: expense.update (branch data / company-wide -> company scope) or self (requester)
+      description: Any non-deleted row (evidence, not money); deleted → 409 invalid_transition; 422 attachment_invalid { attachment_id, reason } (Part 8 Attachments.link).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                attachment_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 10
+                  description: Staging uploads (ADR-014 — POST /v1/attachments) re-pointed to this row by Part 8 Attachments.link (422 attachment_invalid)
+              required:
+              - attachment_ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Expense'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /manual-incomes:
+    get:
+      tags:
+      - manual-incomes
+      operationId: incomeList
+      summary: Manual incomes list (P7.INC.01) — 🔒 D-FIN-01
+      x-permission: income.view+ (branch rows scope-filtered; company-wide rows (branch_id null) only with company scope) or self (mine=true)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      - name: company_wide
+        in: query
+        schema:
+          type: boolean
+        description: true = only company-wide rows (company scope)
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: income_date from
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: income_date to
+      - name: category_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: payment_method_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        description: Repeatable — status=1 = the approval queue
+        style: form
+        explode: true
+      - name: include_deleted
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: mine
+        in: query
+        schema:
+          type: boolean
+        description: true = my own requests (self)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ManualIncomeListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                  totals:
+                    type: object
+                    properties:
+                      amount:
+                        type: integer
+                        minimum: 0
+                        description: Whole MMK (D-PLT-04)
+                    required:
+                    - amount
+                required:
+                - items
+                - next_cursor
+                - totals
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - manual-incomes
+      operationId: incomeCreate
+      summary: Add a manual income (P7.INC.03) — 🔒 D-FIN-01/03, owner E4 / E7
+      x-permission: income.create (branch data — body.branch_id; null = company-wide -> company scope)
+      description: 'P7-RULE-16 — cash method: branch required (422 cash_income_requires_branch), DayLock (422 day_closed), counted in the drawer at once even when PENDING (owner E7).
+        Approval as expenses (E4). 422 method_inactive · category_inactive · date_in_future · idempotency_mismatch. Identifying fields: branch_id, category_id, amount, income_date, payment_method_id.'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncomeCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /manual-incomes/{id}:
+    get:
+      tags:
+      - manual-incomes
+      operationId: incomeGet
+      summary: Manual income detail (P7.INC.02)
+      x-permission: income.view+ (branch rows scope-filtered; company-wide rows (branch_id null) only with company scope) or self (requester)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - manual-incomes
+      operationId: incomeUpdate
+      summary: Edit a PENDING manual income (P7.INC.04)
+      x-permission: income.update (branch data / company-wide -> company scope) or self (requester, PENDING)
+      description: 'PENDING only (APPROVED → 423 locked; REJECTED / deleted → 409 invalid_transition); cash: DayLock on the old and the new day (422 day_closed); 409 conflict.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncomeUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /manual-incomes/{id}/approve:
+    post:
+      tags:
+      - manual-incomes
+      operationId: incomeApprove
+      summary: Approve a manual income (P7.INC.05) — owner E4
+      x-permission: income.approve (branch data / company-wide -> company scope)
+      description: 422 self_approval; allowed on a closed day (P&L only); APPROVED → 200.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_updated_at:
+                  type: string
+                  format: date-time
+                  description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /manual-incomes/{id}/reject:
+    post:
+      tags:
+      - manual-incomes
+      operationId: incomeReject
+      summary: Reject a manual income (P7.INC.06) — owner E4
+      x-permission: income.approve (branch data / company-wide -> company scope)
+      description: 422 self_approval; cash → DayLock (422 day_closed — the drawer figure changes; reopen); REJECTED → 200. approved_by / approved_at = the rejecter (DB CHECK — "decided
+        by").
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /manual-incomes/{id}/delete:
+    post:
+      tags:
+      - manual-incomes
+      operationId: incomeDelete
+      summary: Delete a manual income with a reason (P7.INC.07) — 🔒 D-FIN-03
+      x-permission: income.delete (branch data / company-wide -> company scope) or self (own PENDING row)
+      description: Soft delete; cash and not rejected → DayLock (422 day_closed); deleted → 200.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason (400 reason_required when empty)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /manual-incomes/{id}/attachments:
+    post:
+      tags:
+      - manual-incomes
+      operationId: incomeAttach
+      summary: Add receipts to a manual income (P7.INC.08)
+      x-permission: income.update (branch data / company-wide -> company scope) or self (requester)
+      description: As P7.EXP.08 — deleted → 409 invalid_transition; 422 attachment_invalid { attachment_id, reason }.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                attachment_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 10
+                  description: Staging uploads (ADR-014 — POST /v1/attachments) re-pointed to this row by Part 8 Attachments.link (422 attachment_invalid)
+              required:
+              - attachment_ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManualIncome'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /pnl:
+    get:
+      tags:
+      - pnl
+      operationId: pnlGet
+      summary: Monthly P&L — branch or company (P7.PNL.01) — 🔒 D-FIN-05/09, owner E6 / F6
+      x-permission: pnl.view (mixed — branch P&L = branch data; company P&L = company scope)
+      description: 'P7-RULE-17 — live (ADR-015): revenue = FINISHED sales lines net of discount + service charge − kind-1 refunds on the refund date (F6) + APPROVED manual incomes; tax
+        excluded; expenses APPROVED by category with reversal rows labelled + note; SALARY = one total line (detail only for company-scope payroll.view — owner E6 / C1); completeness
+        notes.'
+      parameters:
+      - name: month
+        in: query
+        schema:
+          type: string
+          pattern: ^\d{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT calendar month)
+        description: Required; a future month → 422 date_in_future
+        required: true
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable — these branches combined (each covered by the grant, else 403 out_of_scope; company-wide rows never included). Omitted = company P&L (company scope —
+          403 company_scope_required)
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PnlReport'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /pnl/trend:
+    get:
+      tags:
+      - pnl
+      operationId: pnlTrend
+      summary: P&L trend by month (P7.PNL.02) — dashboard tile, report ⑥
+      x-permission: pnl.view (mixed — as P7.PNL.01)
+      parameters:
+      - name: from_month
+        in: query
+        schema:
+          type: string
+          pattern: ^\d{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT calendar month)
+        required: true
+      - name: to_month
+        in: query
+        schema:
+          type: string
+          pattern: ^\d{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT calendar month)
+        description: '≤ 12 months including from_month (422 range_too_long { max_days: 366 } — 12 whole months, the ADR-015 cap)'
+        required: true
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable — these branches combined (each covered by the grant, else 403 out_of_scope; company-wide rows never included). Omitted = company P&L (company scope —
+          403 company_scope_required)
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PnlTrend'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: client_request_id — one UUID per logical submit, kept across retries (API-IDEM-01 v1.5, 🔒 D-VIS-10, sheet G (d)); stored on cash_outs / cash_returns / expenses / manual_incomes.client_request_id;
+        missing → 400 idempotency_key_required
+  responses:
+    ValidationError:
+      description: 400 validation · reason_required (errors[].field) · idempotency_key_required
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden (context.required names the missing code — also receivable.issue for edit / cancel of an EMPLOYEE_BALANCE cash out) · out_of_scope · company_scope_required
+        (company-wide rows, company P&L, company master, purchase-expense delete — ADR-012) · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (unknown id, out-of-scope single read, company-wide / SALARY rows outside the caller's level)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 invalid_transition (also a repeated reopen) · conflict (expected_updated_at; a row whose date changed between read and lock) · open_sales_exist · previous_day_open
+        · closing_changed · cash_out_has_returns · cash_out_converted · reason_in_use · category_in_use · system_row · already_exists · idempotency_in_progress · receivable_in_use (Part
+        5)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/07-finance-closing.md §12 (day_closed, date_in_future, range_too_long, reason_inactive, category_inactive, method_inactive, taker_required,
+        reason_type_change, use_cancel, amount_below_returned, not_must_return, return_exceeds_outstanding, cash_income_requires_branch, self_approval, system_category_not_allowed, idempotency_mismatch,
+        self_issue / employee_inactive from Part 5, attachment_invalid from Part 8)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: 423 locked (CLOSED closing; APPROVED / automatic expense; APPROVED income — context.correction_path)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data (API-ERR-01 v1.4): day_closed → { branch_id, business_date, closed_at, closed_by, correction_path: "reopen" } · open_sales_exist → { sales: [{ sale_id,
+            visit_id, performer, started_at, is_late_entry, total_amount, paid_amount }] } · previous_day_open → { dates[] } · closing_changed → { expected_cash_amount, unverified_payment_count,
+            components } · return_exceeds_outstanding → { outstanding_amount } · amount_below_returned → { returned_amount } · cash_out_has_returns → { count } · cash_out_converted →
+            { expense_id } · reason_in_use → { cash_out_count } · category_in_use → { count } · system_category_not_allowed → { system_code } · locked → { locked_by, locked_at, correction_path
+            } · invalid_transition → { status } · forbidden → { required } · range_too_long → { max_days } (92 closings list · 366 P&L trend = 12 whole months — same context as Part
+            8) · attachment_invalid → { attachment_id, reason } (Part 8 Attachments.link)'
+      required:
+      - type
+      - title
+      - status
+      - code
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: 'beyond_tolerance { difference_amount, tolerance_amount } · later_closings { dates[] } · pending_discount_requests { count } · pending_cash_incomes { count } ·
+            previous_month_pnl { date } (same code and context as Part 6) · payroll_finalized_period { run_id, period: { start, end } } (reopen) · charged_to_expense { expense_id }'
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    ClosingDraft:
+      type: object
+      properties:
+        opening_cash_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        opening_difference_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        counted_cash_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        cash_difference_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        unverified_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        expected_updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: updated_at the client last read (null / omitted when the row does not exist yet) — mismatch → 409 conflict
+      required:
+      - opening_cash_amount
+      description: Saved as the OPEN draft (P7-RULE-05) — no business checks
+    ClosingClose:
+      type: object
+      properties:
+        opening_cash_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        opening_difference_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        counted_cash_amount:
+          type: integer
+          minimum: 0
+          description: Cash counted in the drawer (after the takings handover Cash Out — owner E1)
+        cash_difference_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        unverified_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        expected_cash_amount:
+          type: integer
+          description: The figure the closer saw (P7.CLS.02) — differs from the server → 409 closing_changed
+        unverified_payment_count:
+          type: integer
+          minimum: 0
+          description: The count the closer saw — differs → 409 closing_changed
+        expected_updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: updated_at the client last read (null / omitted when the row does not exist yet) — mismatch → 409 conflict
+      required:
+      - opening_cash_amount
+      - counted_cash_amount
+      - expected_cash_amount
+      - unverified_payment_count
+    VerificationItem:
+      type: object
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+        sale_id:
+          type: string
+          format: uuid
+        receipt_number:
+          type:
+          - string
+          - 'null'
+        received_at:
+          type: string
+          format: date-time
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        external_reference:
+          type:
+          - string
+          - 'null'
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            is_cash:
+              type: boolean
+            requires_verification:
+              type: boolean
+          required:
+          - id
+          - code
+          - name_mm
+          - is_cash
+        collected_by:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        verified_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        verified_after_close:
+          type: boolean
+          description: verified at or after closed_at (owner E3)
+      required:
+      - payment_id
+      - sale_id
+      - received_at
+      - amount
+      - payment_method
+      - collected_by
+      - verified_at
+      - verified_after_close
+      description: A payment whose EFFECTIVE method requires_verification (Part 4 EffectiveSale — contract 8); tick / untick = Part 4 P4.PAY.05 / 06
+    OpenSale:
+      type: object
+      properties:
+        sale_id:
+          type: string
+          format: uuid
+        visit_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        performer:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        is_late_entry:
+          type: boolean
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        paid_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+      required:
+      - sale_id
+      - is_late_entry
+      - total_amount
+      - paid_amount
+      description: 'An OPEN sale that blocks the close (owner E2): today — every OPEN sale incl. difference sales; a past date — an OPEN late-entry sale dated on or before it, or an
+        OPEN sale holding non-voided payments received on or before it'
+    CashRefundLine:
+      type: object
+      properties:
+        refund_id:
+          type: string
+          format: uuid
+        refund_receipt_number:
+          type: string
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALE_REFUND · 2 OVERPAYMENT_RETURN (automatic change — Part 4 owner B5)
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        refunded_at:
+          type: string
+          format: date-time
+      required:
+      - refund_id
+      - refund_receipt_number
+      - kind
+      - amount
+      - refunded_at
+    DailyClosing:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        exists:
+          type: boolean
+          description: false = no row yet (live preview only)
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 OPEN (not closed / reopened) · 2 CLOSED (immutable snapshot — 🔒 D-FIN-06)
+        source:
+          type: string
+          enum:
+          - live
+          - snapshot
+          description: live = computed now (no row / OPEN) · snapshot = stored at close (CLOSED — F-P7-06)
+        needs_closing:
+          type: boolean
+          description: P7-RULE-03
+        opening:
+          type: object
+          properties:
+            opening_cash_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            prefill_amount:
+              type: integer
+              minimum: 0
+              description: closing.opening_float_amount (branch override → company default 0 — OPEN-05 A)
+            previous_closing:
+              oneOf:
+              - type: object
+                properties:
+                  business_date:
+                    type: string
+                    format: date
+                  counted_cash_amount:
+                    type: integer
+                    minimum: 0
+                    description: Whole MMK (D-PLT-04)
+                required:
+                - business_date
+                - counted_cash_amount
+              - type: 'null'
+            matches_previous:
+              type:
+              - boolean
+              - 'null'
+              description: null when there is no previous closing
+            opening_difference_reason:
+              type:
+              - string
+              - 'null'
+          required:
+          - opening_cash_amount
+          - prefill_amount
+          - previous_closing
+          - matches_previous
+          - opening_difference_reason
+        components:
+          type: object
+          properties:
+            cash_sales_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            cash_sales_count:
+              type: integer
+            cash_refunds_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            cash_outs_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            cash_returns_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            cash_manual_incomes_amount:
+              type: integer
+              minimum: 0
+              description: PENDING + APPROVED cash incomes (owner E7)
+          required:
+          - cash_sales_amount
+          - cash_sales_count
+          - cash_refunds_amount
+          - cash_outs_amount
+          - cash_returns_amount
+          - cash_manual_incomes_amount
+          description: REC-17 components (🔒 D-FIN-06 — formula = DB CHECK, owner E8)
+        expected_cash_amount:
+          type: integer
+          description: opening + sales − refunds − outs + returns + manual cash income
+        counted_cash_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        cash_difference_amount:
+          type:
+          - integer
+          - 'null'
+          description: counted − expected (DB generated column); null while counted is empty
+        cash_difference_reason:
+          type:
+          - string
+          - 'null'
+        tolerance_amount:
+          type: integer
+          minimum: 0
+          description: closing.cash_difference_tolerance_amount (company, default 0)
+        difference_state:
+          type:
+          - string
+          - 'null'
+          enum:
+          - balanced
+          - within_tolerance
+          - beyond_tolerance
+          - null
+          description: null while counted is empty · balanced = 0 · within / beyond closing.cash_difference_tolerance_amount
+        noncash:
+          type: object
+          properties:
+            expected_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            verified_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            unverified_payment_count:
+              type: integer
+            verified_after_close_count:
+              type: integer
+              description: CLOSED only — ticked after closed_at (owner E3); 0 otherwise
+            unverified_now_count:
+              type: integer
+              description: Live count still unticked
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/VerificationItem'
+          required:
+          - expected_amount
+          - verified_amount
+          - unverified_payment_count
+          - verified_after_close_count
+          - unverified_now_count
+          - items
+        unverified_reason:
+          type:
+          - string
+          - 'null'
+        movements:
+          type: object
+          properties:
+            cash_outs:
+              type: array
+              items:
+                $ref: '#/components/schemas/CashOutListItem'
+            cash_returns:
+              type: array
+              items:
+                $ref: '#/components/schemas/CashReturn'
+            cash_incomes:
+              type: array
+              items:
+                $ref: '#/components/schemas/ManualIncomeListItem'
+            cash_refunds:
+              type: array
+              items:
+                $ref: '#/components/schemas/CashRefundLine'
+          required:
+          - cash_outs
+          - cash_returns
+          - cash_incomes
+          - cash_refunds
+          description: 'Each line links to its record (AD-CLS-01 #2); cash sales drill down to Part 4 lists. EMPLOYEE_BALANCE cash outs keep amount + reason; their taker is masked unless
+            company-scope payroll.view or receivable.issue (P7-RULE-01 — owner C1 + D-FIN-06)'
+        checks:
+          type: object
+          properties:
+            open_sales:
+              type: array
+              items:
+                $ref: '#/components/schemas/OpenSale'
+              description: Blocker (owner E2)
+            previous_open_dates:
+              type: array
+              items:
+                type: string
+                format: date
+              description: Blocker — earlier dates that need closing and are not CLOSED
+            pending_discount_requests:
+              type: integer
+              description: Warning (AD-CLS-05)
+            pending_cash_incomes:
+              type: integer
+              description: Info — already counted, awaiting approval (owner E7)
+          required:
+          - open_sales
+          - previous_open_dates
+          - pending_discount_requests
+          - pending_cash_incomes
+        notes:
+          type:
+          - string
+          - 'null'
+        closed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        closed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        reopen_count:
+          type: integer
+        last_reopened_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_reopened_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        last_reopen_reason:
+          type:
+          - string
+          - 'null'
+        actions:
+          type: object
+          properties:
+            can_save:
+              type: boolean
+            can_close:
+              type: boolean
+            can_reopen:
+              type: boolean
+            can_verify:
+              type: boolean
+          required:
+          - can_save
+          - can_close
+          - can_reopen
+          - can_verify
+          description: What the caller may do now (AD-PERM-02)
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - branch_id
+      - business_date
+      - exists
+      - status
+      - source
+      - needs_closing
+      - opening
+      - components
+      - expected_cash_amount
+      - counted_cash_amount
+      - cash_difference_amount
+      - tolerance_amount
+      - difference_state
+      - noncash
+      - movements
+      - checks
+      - reopen_count
+      - actions
+      - warnings
+    ClosingListItem:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        exists:
+          type: boolean
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 OPEN (not closed / reopened) · 2 CLOSED (immutable snapshot — 🔒 D-FIN-06)
+        needs_closing:
+          type: boolean
+        expected_cash_amount:
+          type:
+          - integer
+          - 'null'
+        counted_cash_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        cash_difference_amount:
+          type:
+          - integer
+          - 'null'
+        beyond_tolerance:
+          type:
+          - boolean
+          - 'null'
+        noncash_expected_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        noncash_verified_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        unverified_payment_count:
+          type:
+          - integer
+          - 'null'
+        reopen_count:
+          type: integer
+        closed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        closed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+      required:
+      - branch_id
+      - business_date
+      - exists
+      - status
+      - needs_closing
+      - reopen_count
+      description: Stored values for existing rows (draft or snapshot); virtual rows (exists=false) have null figures
+    CashOutCreate:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        reason_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        occurred_at:
+          type: string
+          format: date-time
+          description: Default now; ≤ now; may be earlier on a not-closed day (paper notebook — 🔒 D-FIN-07)
+        taken_by_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: MUST_RETURN — the user who took the cash (or taken_by_name)
+        taken_by_name:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+          description: MUST_RETURN — a taker who is not a user
+        expected_return_date:
+          type:
+          - string
+          - 'null'
+          format: date
+          description: MUST_RETURN — optional (F-P7-03)
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: EMPLOYEE_BALANCE — required; the caller's own employee → 422 self_issue (owner C2)
+        receivable:
+          oneOf:
+          - type: object
+            properties:
+              installment_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 1
+                description: Whole MMK > 0 (Part 5 DB CHECK); null = the whole balance at the next payroll (owner C2)
+              repayment_start_date:
+                type:
+                - string
+                - 'null'
+                format: date
+          - type: 'null'
+      required:
+      - branch_id
+      - reason_id
+      - amount
+      description: Fields of another accounting type → 400 validation (DB cash_outs_type_fields_chk)
+    CashOutUpdate:
+      type: object
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        occurred_at:
+          type: string
+          format: date-time
+        reason_id:
+          type: string
+          format: uuid
+          description: Same accounting type only (422 reason_type_change)
+        taken_by_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        taken_by_name:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        expected_return_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        edit_reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+      required:
+      - edit_reason
+      description: 'P7-RULE-10 — EMPLOYEE_BALANCE: needs receivable.issue; note / occurred_at on the same date only (422 use_cancel); a note edit updates the receivable reason (Part
+        5 Receivables.updateForCashOut). edit_reason has no column — it is stored in the interceptor audit row cash_out.update'
+    CashReturn:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cash_out_id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+          description: The returning drawer
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        returned_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        received_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        note:
+          type:
+          - string
+          - 'null'
+        reversal_expense_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Source 6 row when the cash out was already converted (D-FIN-09)
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        cancelled_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancel_reason:
+          type:
+          - string
+          - 'null'
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - cash_out_id
+      - branch_id
+      - amount
+      - returned_at
+      - business_date
+      - received_by
+      - created_at
+    CashReturnCreate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Returning drawer; default the cash out branch
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        returned_at:
+          type: string
+          format: date-time
+          description: Default now; ≤ now
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      required:
+      - amount
+    CashOutListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        reason:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        note:
+          type:
+          - string
+          - 'null'
+          description: D-FIN-07 note; for EMPLOYEE_BALANCE it is the receivable reason (P5-RULE-11) — null when employee_hidden
+        occurred_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        recorded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        taken_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - display_name
+          - type: 'null'
+        employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+          description: EMPLOYEE_BALANCE — the employee who took the advance / loan; null when hidden (employee_hidden — P7-RULE-01, owner C1 + D-FIN-06) and for other types
+        employee_hidden:
+          type: boolean
+          description: true = an EMPLOYEE_BALANCE cash out whose taker, note and receivable_id are hidden from this caller (neither company-scope payroll.view nor receivable.issue, not
+            the employee) — UI label "Staff advance" (P7-RULE-01, owner C1 + D-FIN-06); false otherwise
+        returned_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        outstanding_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        state:
+          type: string
+          enum:
+          - done
+          - outstanding
+          - charged_to_expense
+          - returned
+          - cancelled
+          description: done = types 1–3 · outstanding = MUST_RETURN not fully returned · charged_to_expense = converted at month end, still owed (D-FIN-09) · returned = fully returned
+            · cancelled (owner E5)
+      required:
+      - id
+      - branch_id
+      - reason
+      - accounting_type
+      - amount
+      - occurred_at
+      - business_date
+      - recorded_by
+      - employee_hidden
+      - returned_amount
+      - outstanding_amount
+      - state
+    CashOut:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        reason:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        note:
+          type:
+          - string
+          - 'null'
+          description: D-FIN-07 note; for EMPLOYEE_BALANCE it is the receivable reason (P5-RULE-11) — null when employee_hidden
+        occurred_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        recorded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        taken_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - display_name
+          - type: 'null'
+        expected_return_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+          description: EMPLOYEE_BALANCE — the employee who took the advance / loan; null when hidden (employee_hidden — P7-RULE-01, owner C1 + D-FIN-06) and for other types
+        employee_hidden:
+          type: boolean
+          description: true = an EMPLOYEE_BALANCE cash out whose taker, note and receivable_id are hidden from this caller (neither company-scope payroll.view nor receivable.issue, not
+            the employee) — UI label "Staff advance" (P7-RULE-01, owner C1 + D-FIN-06); false otherwise
+        receivable_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: EMPLOYEE_BALANCE — Part 5 receivable; null unless company-scope payroll.view or receivable.issue, or the employee themself (P7-RULE-01)
+        expense_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: EXPENSE — the live (non-deleted) source-2 row; an edit replaces it (soft delete + new row)
+        conversion_expense_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: MUST_RETURN converted at month end — the source-5 row
+        returned_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        outstanding_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        state:
+          type: string
+          enum:
+          - done
+          - outstanding
+          - charged_to_expense
+          - returned
+          - cancelled
+          description: done = types 1–3 · outstanding = MUST_RETURN not fully returned · charged_to_expense = converted at month end, still owed (D-FIN-09) · returned = fully returned
+            · cancelled (owner E5)
+        age_days:
+          type:
+          - integer
+          - 'null'
+          description: MUST_RETURN outstanding — days since business_date
+        converted_expense_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        settled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        cancelled_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancel_reason:
+          type:
+          - string
+          - 'null'
+        returns:
+          type: array
+          items:
+            $ref: '#/components/schemas/CashReturn'
+        day_status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: Closing status of the cash out branch-day (1 also when no row)
+        actions:
+          type: object
+          properties:
+            can_edit:
+              type: boolean
+            can_cancel:
+              type: boolean
+            can_return:
+              type: boolean
+          required:
+          - can_edit
+          - can_cancel
+          - can_return
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - reason
+      - accounting_type
+      - amount
+      - occurred_at
+      - business_date
+      - recorded_by
+      - employee_hidden
+      - returned_amount
+      - outstanding_amount
+      - state
+      - returns
+      - day_status
+      - actions
+      - created_at
+    CashOutReduced:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+          description: The cash out branch
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        state:
+          type: string
+          enum:
+          - done
+          - outstanding
+          - charged_to_expense
+          - returned
+          - cancelled
+          description: done = types 1–3 · outstanding = MUST_RETURN not fully returned · charged_to_expense = converted at month end, still owed (D-FIN-09) · returned = fully returned
+            · cancelled (owner E5)
+        outstanding_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        reduced:
+          type: boolean
+          enum:
+          - true
+        returns:
+          type: array
+          items:
+            $ref: '#/components/schemas/CashReturn'
+          description: Returns of branches in the caller scope
+      required:
+      - id
+      - branch_id
+      - accounting_type
+      - state
+      - outstanding_amount
+      - reduced
+      - returns
+      description: 'P7.CRT.02 / 03 answer for a caller without cashout.view+ on the cash out branch (a return into another drawer): no amount, reason, note, taker or recorder of the
+        original (P7-RULE-11)'
+    CashOutReason:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        expense_category:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              system_code:
+                type:
+                - integer
+                - 'null'
+                enum:
+                - 1
+                - 2
+                - 3
+                - null
+                description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+            required:
+            - id
+            - name_mm
+          - type: 'null'
+        receivable_kind:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (Part 5)
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        used_count:
+          type: integer
+          description: Cash outs using it (type change allowed only at 0)
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - accounting_type
+      - sort_order
+      - status
+      - used_count
+      - updated_at
+    CashOutReasonCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        expense_category_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Required for 1 EXPENSE and 4 MUST_RETURN; absent otherwise
+        receivable_kind:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: Required for 2 EMPLOYEE_BALANCE; absent otherwise
+        sort_order:
+          type: integer
+      required:
+      - name_mm
+      - accounting_type
+    CashOutReasonUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        accounting_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 EXPENSE (→ expenses source 2) · 2 EMPLOYEE_BALANCE (→ advance / loan, Part 5) · 3 CASH_MOVEMENT (no expense — bank, takings to owner, stock / salary paid from
+            the drawer) · 4 MUST_RETURN (outstanding — D-FIN-09) — 🔒 D-FIN-08
+        expense_category_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        receivable_kind:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+          description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (Part 5)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ExpenseCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        system_code:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+          description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+        is_system:
+          type: boolean
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - system_code
+      - is_system
+      - sort_order
+      - status
+      - updated_at
+    IncomeCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - sort_order
+      - status
+      - updated_at
+    CategoryCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        sort_order:
+          type: integer
+      required:
+      - name_mm
+    CategoryUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ExpenseCreate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: null = company-wide (company scope — D-FIN-02)
+        category_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        expense_date:
+          type: string
+          format: date
+          description: ≤ today (MMT); no lower bound
+        description_mm:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        paid_via:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 BANK · 2 OWNER_PERSONAL · 3 OTHER — drawer cash is always a Cash Out (AD-FIN-04)
+        attachment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          maxItems: 10
+      required:
+      - branch_id
+      - category_id
+      - amount
+      - expense_date
+      - paid_via
+    ExpenseUpdate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        expense_date:
+          type: string
+          format: date
+        description_mm:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        paid_via:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 BANK · 2 OWNER_PERSONAL · 3 OTHER — drawer cash is always a Cash Out (AD-FIN-04)
+        attachment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          maxItems: 10
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ExpenseActions:
+      type: object
+      properties:
+        can_edit:
+          type: boolean
+        can_approve:
+          type: boolean
+        can_delete:
+          type: boolean
+        can_attach:
+          type: boolean
+      required:
+      - can_edit
+      - can_approve
+      - can_delete
+      - can_attach
+    ExpenseListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        company_wide:
+          type: boolean
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            system_code:
+              type:
+              - integer
+              - 'null'
+              enum:
+              - 1
+              - 2
+              - 3
+              - null
+              description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+          required:
+          - id
+          - name_mm
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          description: 1 MANUAL · 2 CASH_OUT · 3 PAYROLL · 4 PURCHASE · 5 MUST_RETURN_AUTO · 6 CASH_RETURN_REVERSAL (negative) — F-P7-04
+        amount:
+          type: integer
+          description: '> 0; source 6 reversal < 0'
+        expense_date:
+          type: string
+          format: date
+        description_mm:
+          type:
+          - string
+          - 'null'
+        paid_via:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        requested_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        deleted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        attachment_count:
+          type: integer
+      required:
+      - id
+      - branch_id
+      - company_wide
+      - category
+      - source
+      - amount
+      - expense_date
+      - status
+      - requested_by
+      - attachment_count
+    Expense:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        company_wide:
+          type: boolean
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            system_code:
+              type:
+              - integer
+              - 'null'
+              enum:
+              - 1
+              - 2
+              - 3
+              - null
+              description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+          required:
+          - id
+          - name_mm
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          description: 1 MANUAL · 2 CASH_OUT · 3 PAYROLL · 4 PURCHASE · 5 MUST_RETURN_AUTO · 6 CASH_RETURN_REVERSAL (negative) — F-P7-04
+        amount:
+          type: integer
+          description: '> 0; source 6 reversal < 0'
+        expense_date:
+          type: string
+          format: date
+        description_mm:
+          type:
+          - string
+          - 'null'
+        paid_via:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+          description: MANUAL only — 1 BANK · 2 OWNER_PERSONAL · 3 OTHER
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        requested_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        approved_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+          description: Decided by — the approver, or on a REJECTED row the rejecter (DB approved_by_user_id)
+        approved_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Decided at
+        rejection_reason:
+          type:
+          - string
+          - 'null'
+        deleted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        deleted_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        deletion_reason:
+          type:
+          - string
+          - 'null'
+        links:
+          type: object
+          properties:
+            cash_out_id:
+              type:
+              - string
+              - 'null'
+              format: uuid
+            purchase_id:
+              type:
+              - string
+              - 'null'
+              format: uuid
+            payroll_run_id:
+              type:
+              - string
+              - 'null'
+              format: uuid
+            cash_return_id:
+              type:
+              - string
+              - 'null'
+              format: uuid
+            original_expense:
+              oneOf:
+              - type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  expense_date:
+                    type: string
+                    format: date
+                  amount:
+                    type: integer
+                    minimum: 0
+                    description: Whole MMK (D-PLT-04)
+                  cash_out_date:
+                    type:
+                    - string
+                    - 'null'
+                    format: date
+                required:
+                - id
+                - expense_date
+                - amount
+              - type: 'null'
+          required:
+          - cash_out_id
+          - purchase_id
+          - payroll_run_id
+          - cash_return_id
+          - original_expense
+        attachments:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              file_name:
+                type: string
+              mime_type:
+                type: string
+              size_bytes:
+                type: integer
+              created_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - file_name
+            - mime_type
+            - size_bytes
+            - created_at
+            description: Download = Part 8 GET /v1/attachments/{id}/url (signed URL — ADR-014)
+        actions:
+          $ref: '#/components/schemas/ExpenseActions'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - company_wide
+      - category
+      - source
+      - amount
+      - expense_date
+      - status
+      - requested_by
+      - links
+      - attachments
+      - actions
+      - created_at
+      - updated_at
+    IncomeCreate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: null = company-wide (company scope); a cash method needs a branch (422 cash_income_requires_branch)
+        category_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        income_date:
+          type: string
+          format: date
+          description: ≤ today (MMT)
+        payment_method_id:
+          type: string
+          format: uuid
+        description_mm:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        attachment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          maxItems: 10
+      required:
+      - branch_id
+      - category_id
+      - amount
+      - income_date
+      - payment_method_id
+    IncomeUpdate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Whole MMK > 0 (D-PLT-04)
+        income_date:
+          type: string
+          format: date
+        payment_method_id:
+          type: string
+          format: uuid
+        description_mm:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        attachment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          maxItems: 10
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ManualIncomeListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        company_wide:
+          type: boolean
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        income_date:
+          type: string
+          format: date
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            is_cash:
+              type: boolean
+            requires_verification:
+              type: boolean
+          required:
+          - id
+          - code
+          - name_mm
+          - is_cash
+        in_drawer:
+          type: boolean
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        requested_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        deleted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        attachment_count:
+          type: integer
+      required:
+      - id
+      - branch_id
+      - company_wide
+      - category
+      - amount
+      - income_date
+      - payment_method
+      - in_drawer
+      - status
+      - requested_by
+      - attachment_count
+    ManualIncome:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        company_wide:
+          type: boolean
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        income_date:
+          type: string
+          format: date
+        payment_method:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            is_cash:
+              type: boolean
+            requires_verification:
+              type: boolean
+          required:
+          - id
+          - code
+          - name_mm
+          - is_cash
+        in_drawer:
+          type: boolean
+          description: Cash and not rejected / deleted — counted in expected cash (owner E7)
+        description_mm:
+          type:
+          - string
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 PENDING · 2 APPROVED (in the P&L) · 3 REJECTED — 🔒 D-FIN-03
+        requested_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        approved_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+          description: Decided by — the approver, or on a REJECTED row the rejecter
+        approved_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Decided at
+        rejection_reason:
+          type:
+          - string
+          - 'null'
+        deleted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        deleted_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        deletion_reason:
+          type:
+          - string
+          - 'null'
+        attachments:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              file_name:
+                type: string
+              mime_type:
+                type: string
+              size_bytes:
+                type: integer
+              created_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - file_name
+            - mime_type
+            - size_bytes
+            - created_at
+            description: Download = Part 8 GET /v1/attachments/{id}/url (signed URL — ADR-014)
+        actions:
+          $ref: '#/components/schemas/ExpenseActions'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - company_wide
+      - category
+      - amount
+      - income_date
+      - payment_method
+      - in_drawer
+      - status
+      - requested_by
+      - attachments
+      - actions
+      - created_at
+      - updated_at
+    Drilldown:
+      type: object
+      properties:
+        path:
+          type: string
+          description: List endpoint, e.g. /v1/expenses
+        query:
+          type: object
+          additionalProperties: true
+      required:
+      - path
+      - query
+    PnlExpenseRow:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - this_month
+          - returned
+          description: returned = source 6 reversal (OPEN-25)
+        label:
+          type:
+          - string
+          - 'null'
+          description: 'returned: "taken <original date> · <original amount>"'
+        original_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        original_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        amount:
+          type: integer
+          description: Whole MMK, may be negative (difference / reversal / net)
+      required:
+      - kind
+      - amount
+    PnlExpenseLine:
+      type: object
+      properties:
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            system_code:
+              type:
+              - integer
+              - 'null'
+              enum:
+              - 1
+              - 2
+              - 3
+              - null
+              description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+          required:
+          - id
+          - name_mm
+        system_code:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+          description: 1 SALARY · 2 PRODUCT_PURCHASE · 3 HOME_SERVICE_TRANSPORT (system rows — F-P7-01); null = admin category
+        amount:
+          type: integer
+          description: Whole MMK, may be negative (difference / reversal / net)
+        salary_detail_available:
+          type: boolean
+          description: 'SALARY: true only for company-scope payroll.view holders (owner E6 / C1); always one line here'
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/PnlExpenseRow'
+        drilldown:
+          oneOf:
+          - $ref: '#/components/schemas/Drilldown'
+          - type: 'null'
+      required:
+      - category
+      - amount
+      - salary_detail_available
+      - rows
+    PnlReport:
+      type: object
+      properties:
+        month:
+          type: string
+          pattern: ^\d{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT calendar month)
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        scope:
+          type: object
+          properties:
+            level:
+              type: string
+              enum:
+              - company
+              - branches
+            branch_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+          required:
+          - level
+          - branch_ids
+        revenue:
+          type: object
+          properties:
+            services_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            products_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            transport_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            service_charge_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            refunds_amount:
+              type: integer
+              description: ≤ 0 — kind-1 refunds on the refund business date (owner F6)
+            sales_net_amount:
+              type: integer
+              description: Whole MMK, may be negative (difference / reversal / net)
+            manual_incomes:
+              type: array
+              items:
+                type: object
+                properties:
+                  category:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                      name_mm:
+                        type: string
+                      name_en:
+                        type:
+                        - string
+                        - 'null'
+                    required:
+                    - id
+                    - name_mm
+                  amount:
+                    type: integer
+                    minimum: 0
+                    description: Whole MMK (D-PLT-04)
+                  drilldown:
+                    oneOf:
+                    - $ref: '#/components/schemas/Drilldown'
+                    - type: 'null'
+                required:
+                - category
+                - amount
+            manual_incomes_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+            total_amount:
+              type: integer
+              description: Whole MMK, may be negative (difference / reversal / net)
+          required:
+          - services_amount
+          - products_amount
+          - transport_amount
+          - service_charge_amount
+          - refunds_amount
+          - sales_net_amount
+          - manual_incomes
+          - manual_incomes_amount
+          - total_amount
+          description: Lines net of discount; tax excluded; over-transfer change excluded (research E11)
+        expenses:
+          type: array
+          items:
+            $ref: '#/components/schemas/PnlExpenseLine'
+        expenses_total_amount:
+          type: integer
+          description: Whole MMK, may be negative (difference / reversal / net)
+        net_amount:
+          type: integer
+          description: Whole MMK, may be negative (difference / reversal / net)
+        notes:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+                description: reversals_included { amount } · days_not_closed { count } · payroll_not_finalized (present exactly when completeness.payroll_finalized = false) · pending_expenses
+                  { count, amount } · pending_incomes { count, amount } · outstanding_must_return { amount }
+              params:
+                type: object
+                additionalProperties: true
+            required:
+            - code
+        completeness:
+          type: object
+          properties:
+            days_not_closed:
+              type: integer
+            payroll_finalized:
+              type: boolean
+            pending_expenses:
+              type: integer
+            pending_incomes:
+              type: integer
+            outstanding_must_return_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+          required:
+          - days_not_closed
+          - payroll_finalized
+          - pending_expenses
+          - pending_incomes
+          - outstanding_must_return_amount
+        generated_at:
+          type: string
+          format: date-time
+      required:
+      - month
+      - from
+      - to
+      - scope
+      - revenue
+      - expenses
+      - expenses_total_amount
+      - net_amount
+      - notes
+      - completeness
+      - generated_at
+    PnlTrend:
+      type: object
+      properties:
+        months:
+          type: array
+          items:
+            type: object
+            properties:
+              month:
+                type: string
+                pattern: ^\d{4}-(0[1-9]|1[0-2])$
+                description: YYYY-MM (MMT calendar month)
+              revenue_amount:
+                type: integer
+                description: Whole MMK, may be negative (difference / reversal / net)
+              expenses_amount:
+                type: integer
+                description: Whole MMK, may be negative (difference / reversal / net)
+              net_amount:
+                type: integer
+                description: Whole MMK, may be negative (difference / reversal / net)
+            required:
+            - month
+            - revenue_amount
+            - expenses_amount
+            - net_amount
+        generated_at:
+          type: string
+          format: date-time
+      required:
+      - months
+      - generated_at

@@ -1,30 +1,52 @@
 # point-sdd
 
-Spec-driven development hub for the Point Barbershop System. It holds specs (OpenSpec), test cases and the tools that generate them. No application code lives here — app repos are cloned beside this one under `D:\point_flow\`.
+Spec-driven development hub for the Point Barbershop System. It holds the planning sources (decisions, DB / API / UX design, ADRs), the specs (OpenSpec), the test cases and the tools that generate them. **No application code lives here** — the app is `point-barber`, cloned beside this repo in one workspace folder:
 
-Workflow guide (Myanmar): [docs/SDD-Workflow-Guide-MM.md](docs/SDD-Workflow-Guide-MM.md)
+```
+point/
+├── point-sdd/      this repo — OpenSpec store "point-sdd"
+└── point-barber/   application — points here with `store: point-sdd` (ADR-016)
+```
+
+Workflow guide (Myanmar): [docs/SDD-Workflow-Guide-MM.md](docs/SDD-Workflow-Guide-MM.md) · Rules for Claude Code in this repo: [CLAUDE.md](CLAUDE.md) · Setup: [SETUP.md](SETUP.md)
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `docs/briefs/` | Feature briefs written after brainstorming |
-| `openspec/` | Changes and specs — created by `openspec init` |
+| `openspec/config.yaml` | Project context and artifact rules every proposal / spec / design / tasks file follows |
+| `openspec/changes/<change-id>/` | Active changes — proposal, spec deltas, design, tasks |
+| `openspec/specs/<capability>/` | Current specs — changed only by `/opsx:archive` |
+| `docs/briefs/` | Feature briefs (one per change) |
+| `docs/decisions/` | Planning review (master record) + `decision-register.md` (generated from its Appendix A — 🔒 rows are the requirements) |
+| `docs/db/` | DBML, constraint SQL and constraint tests (91 tables, PostgreSQL 16) |
+| `docs/ux/` | `admin-panel.md` (AD-…) · `frontend-website.md` (FE-…) |
+| `docs/api/` | `00-conventions.md` (API-…) · `01..08-*.md` (P1.… … P8.…) · `openapi/*.yaml` |
+| `docs/adr/` · `docs/architecture/` | ADR-001..016 · system design review |
+| `docs/plan/` | `dev-plan.md` · `roadmap.md` (change list and order) · `spec-fixtures.md` (people, branches, prices used in every scenario) |
 | `templates/Test Case - Function.xlsx` | Blank test case workbook (built by `tools/point-make-template.py`) |
-| `tools/point-testgen.py` | Fills the template from reviewed test JSON |
-| `tools/point-docgen.py` | Builds a documentation workbook from reviewed JSON |
+| `tools/point-testgen.py` · `tools/point-docgen.py` | Workbook builders |
+| `tools/extract-decision-register.py` | Rebuilds `docs/decisions/decision-register.md` from the review |
 | `.claude/skills/point-generate-tests/` | Specs → test cases → workbook |
 | `.claude/skills/point-browser-tester/` | Runs workbook cases in a browser (Playwright), records evidence and OK / NG |
 | `.claude/skills/point-generate-docs/` | Changes → documentation workbook |
 | `work/` | Generated output. Only `work/Test Cases/**/temp_manifest.json` and `temp_tests.json` are committed |
 
-Setup: [SETUP.md](SETUP.md)
-
 ## Workflow
 
 ```
-brief → /opsx:explore → /opsx:propose → review → /opsx:apply (app repo)
+brief → /opsx:explore → /opsx:propose → review → /opsx:apply (run inside point-barber)
       → /point-generate-tests → review → test (manual or /point-browser-tester) → /opsx:archive
+```
+
+Everything except `/opsx:apply` runs in this repo. A change to the database, the API contract, a UX rule or an architecture decision is made **here first** (version bump + register note), then implemented in `point-barber`.
+
+Useful commands:
+
+```powershell
+openspec list                                  # active changes
+openspec validate --all --strict               # format check
+python tools\extract-decision-register.py      # after editing Appendix A of the review
 ```
 
 ## Test cases
@@ -50,7 +72,9 @@ To change tester names or the layout, edit `tools/point-make-template.py` and ru
 
 ## Browser testing
 
-In Claude Code: `/point-browser-tester "work\Test Cases\Test Case - <name>.xlsx"`. Credentials come from environment variables (`POINT_TEST_<PROFILE>_USER` / `_PASSWORD`), never from files or chat. Cases that change data run only when you approve them. Evidence goes to `work\Test Cases\<Topic> Evidence\runs\<run-id>\`.
+In Claude Code: `/point-browser-tester "work\Test Cases\Test Case - <name>.xlsx"`.
+
+The Point staff app has **no passwords**. A runner signs in with the e-mail code: set `POINT_TEST_<PROFILE>_EMAIL` (a fixture person, e.g. `POINT_TEST_BARBER_EMAIL=aung@point.test`) and `POINT_TEST_MAILPIT_URL` (the test environment's Mailpit, e.g. `http://localhost:8025`); the harness reads the code from Mailpit. Nothing secret goes into files or chat. Cases that change data run only when you approve them. Evidence goes to `work\Test Cases\<Topic> Evidence\runs\<run-id>\`. Never run it against production.
 
 ## Documentation
 

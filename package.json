@@ -4,7 +4,9 @@
   "private": true,
   "description": "Spec-driven development hub for the Point Barbershop System.",
   "scripts": {
-    "test:browser-tester": "node --test .claude/skills/point-browser-tester/tests/"
+    "test:browser-tester": "node --test .claude/skills/point-browser-tester/tests/harness.test.js",
+    "decisions": "python tools/extract-decision-register.py",
+    "validate": "openspec validate --all --strict"
   },
   "devDependencies": {
     "playwright": "^1.61.1"

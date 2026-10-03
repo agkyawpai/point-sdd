@@ -1,0 +1,362 @@
+// Point Barbershop — Part 4: Service execution / Sales / Payments · v1 🔒 D-DB-08 (30/Sep/2026) · constraints v1.2 (02/Oct/2026)
+// v1.2 (02/Oct/2026 — G (owner one-sheet 02/Oct 00:06) · owner G (f)): **schema မပြောင်း** — FINISH ပြီး guard trigger ၄ ခု = part4-visits-sales-payments-v1-constraints.sql v1.2
+//   (sales_finished_guard · sale_items_finished_guard · payments_finished_guard · visits_final_guard → SQLSTATE P0001 `finished_immutable` — 🔒 D-VIS-08, API P4-RULE-01)
+//   FINISHED / CANCELLED sale = customer_id ပဲ · FINISHED sale ရဲ့ payment = verified_* + external_reference ပဲ (owner B10 / E3) · FINISHED / INCOMPLETE visit = updated_at ပဲ
+// Part 1 (D-DB-02) + 1b (D-DB-05) + 2 (D-DB-06) + 3 (D-DB-07) ပေါ်မှာ ဆောက် — dbdiagram မှာ part1 + part2 + part3 နဲ့ တွဲ paste
+// 🔒 D-VIS-01..13 (v5.1: D-VIS-02 / 06 / 12 / 13), D-PAY-01..09 (v5.1: D-PAY-02 / 04 / 06 / 08), D-SVC-04 / 06, D-COM-02 / 03 / 04,
+//    D-KPI-01 / 02, D-DAT-05, D-AUD-02, D-ORG-03, D-DB-01 / 03 / 04, D-PLT-15
+// Status / type = smallint + CHECK (D-DB-03) · CHECK / partial unique / generated column = part4-visits-sales-payments-v1-constraints.sql
+// F-P4-nn = review finding (§6.4d) — D-DB-08 နဲ့ approve ပြီး
+// ငွေ table (sales, sale_items, payments, refunds, sale_adjustments) ပြောင်းတိုင်း DB trigger → audit_events (Part 8 — D-AUD-02)
+// Products (D-PAY-03) = Part 6 — sale_items.product_id ကို note ပဲ (§6.5 #9 future FK)
+
+// ───────────────────────── Visit (service execution) ─────────────────────────
+
+Table visits {
+  id uuid [pk, note: 'UUIDv7']
+  client_request_id uuid [not null, unique, note: 'App က request တိုင်း ထုတ် — double submit ကာ (🔒 D-VIS-10) · F-P4-08']
+  branch_id uuid [not null, ref: > branches.id, note: 'Home service ဆိုလည်း barber ရဲ့ branch (D-SVC-06)']
+  booking_id uuid [ref: > bookings.id, note: 'Booking ကလာရင် (D-VIS-01) · booking ၁ ခု = visit ၁ ခု (partial unique — SQL) · NULL = walk-in']
+  performed_by_employee_id uuid [not null, ref: > employees.id, note: '🔒 D-VIS-03 Actual service barber · commission / KPI (D-COM-03, D-KPI-01)']
+  performer_change_reason text [note: 'booking.booked_employee_id ≠ performed_by ဆို မဖြစ်မနေ (🔒 D-VIS-04 — app စစ်)']
+  proxy_reason smallint [note: 'NULL = barber ကိုယ်တိုင် ကိုယ့်ဖုန်းနဲ့ မှတ် (D-VIS-11) · 1 PHONE_UNAVAILABLE (🔒 D-VIS-12 — B က payment / FINISH ပါ လုပ်ရ) · 2 OTHER (D-VIS-04 ကူမှတ်)']
+  location_type smallint [not null, default: 1, note: '1 BRANCH · 2 HOME (D-SVC-06)']
+  home_address text [note: 'HOME ဆို မဖြစ်မနေ (booking ကနေ ကူး / walk-in ဆို ရိုက်)']
+  status smallint [not null, default: 1, note: '0 INCOMPLETE (D-VIS-09) · 1 STARTED · 2 COMPLETED (service ပြီး၊ ငွေမရှင်းသေး) · 3 FINISHED (D-VIS-07)']
+  started_at timestamptz [not null, note: 'တကယ် စချိန် — late entry ဆို user ရိုက် (performed_at — D-VIS-13)']
+  started_by_user_id uuid [not null, ref: > users.id, note: 'START နှိပ်သူ = Recorded by (D-VIS-03 / 12)']
+  completed_at timestamptz [note: 'တကယ် ပြီးချိန်']
+  completed_by_user_id uuid [ref: > users.id, note: 'D-VIS-03 Completed by']
+  finished_at timestamptz [note: '= sales.finished_at (D-VIS-07)']
+  incomplete_reason text [note: 'D-VIS-09 — status 0 ဆို မဖြစ်မနေ']
+  incomplete_at timestamptz
+  incomplete_by_user_id uuid [ref: > users.id]
+  is_late_entry boolean [not null, default: false, note: '🔒 D-VIS-13 — စက္ကူ / မေ့သွား → နောက်မှ သွင်း · report flag']
+  late_entry_reason smallint [note: '1 INTERNET_OUTAGE · 2 POWER_OUTAGE · 3 PHONE_BROKEN · 4 FORGOT · 9 OTHER (D-VIS-13 preset) — is_late_entry ⇔ ဖြည့်']
+  late_entry_note text [note: 'OTHER ဆို မဖြစ်မနေ (CHECK)']
+  business_date date [not null, note: 'started_at ရဲ့ MMT ရက် (D-PLT-15) · late entry = ဒီ branch-day closing မပိတ်ခင်ပဲ (Part 7 — app စစ်)']
+  created_at timestamptz [not null, default: `now()`, note: '= recorded_at (D-VIS-13: performed_at ≠ recorded_at)']
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, business_date)
+    (performed_by_employee_id, started_at)
+  }
+
+  Note: '''
+  🔒 D-VIS-11 flow: START (barber + branch ပဲ — D-VIS-02 v5.1) → COMPLETE (service မဖြစ်မနေ) → payment → FINISH · visit ၁ ခု = barber ၁ ယောက် (V1 UI)
+  🔒 D-VIS-07 — payment မပြီး FINISH ✖ · 🔒 D-VIS-08 — FINISHED ⇒ visit + sale immutable (refund / adjustment ပဲ)
+  🔒 D-VIS-09 — INCOMPLETE = revenue / commission ✖ → sale status 0 CANCELLED · F-P4-13 booking → 3 COMPLETED
+  Customer = sales.customer_id (FINISH မှာ optional — D-VIS-02) / booking.customer_id
+  Late entry ⇒ started_at / completed_at / payments.received_at = user ရိုက်၊ created_at = သွင်းချိန် · F-P4-09 product-only sale late entry ⏭
+  Booking status: START → 2 STARTED · FINISH → 3 COMPLETED (Part 3 — app)
+  '''
+}
+
+// ───────────────────────── Sale (checkout document) ─────────────────────────
+
+Table sales {
+  id uuid [pk]
+  client_request_id uuid [not null, unique, note: 'D-VIS-10 · F-P4-08']
+  branch_id uuid [not null, ref: > branches.id]
+  visit_id uuid [unique, ref: - visits.id, note: 'Service sale = visit ၁ ခု : sale ၁ ခု · NULL = product-only sale (🔒 D-PAY-03) · F-P4-01']
+  customer_id uuid [ref: > customers.id, note: 'Optional (D-VIS-02 v5.1) — booking ကနေ / FINISH မှာ ဖုန်း · once_per_customer code သုံးရင် မဖြစ်မနေ (app)']
+  status smallint [not null, default: 1, note: '0 CANCELLED (visit INCOMPLETE) · 1 OPEN (ပြင်ရ) · 2 FINISHED (immutable — D-VIS-08)']
+  subtotal_amount bigint [not null, default: 0, note: 'Σ active line (unit × qty) — MMK · app / Part 8 trigger']
+  discount_amount bigint [not null, default: 0, note: 'Code / approval ကနေ — sale တစ်ခုလုံး (D-PAY-04) · line တွေဆီ ခွဲ = sale_items.line_discount_amount']
+  discount_code_id uuid [ref: > discount_codes.id, note: 'Standing code — sale ၁ ခု code ၁ ခု (D-PAY-04)']
+  discount_request_id uuid [ref: - discount_requests.id, note: 'App ထဲ တောင်း / ✔ (D-PAY-04 v5.1) — APPROVED ပဲ (app) · code နဲ့ တစ်ခုပဲ (CHECK)']
+  service_charge_rate numeric(5,2) [not null, default: 0, note: 'Snapshot % (D-PAY-08 — Additional Settings, default OFF = 0)']
+  service_charge_amount bigint [not null, default: 0]
+  tax_rate numeric(5,2) [not null, default: 0, note: 'Snapshot % (D-PAY-08)']
+  tax_amount bigint [not null, default: 0]
+  total_amount bigint [not null, default: 0, note: '= subtotal − discount + service charge + tax (CHECK) · Σ payments = total (app — F-P4-10)']
+  receipt_number varchar(40) [unique, note: '🔒 D-PAY-06 v5.1 `B3-2026-OCT-00125` — FINISH မှာ receipt_counters ကနေ (gapless) · F-P4-04']
+  receipt_year smallint
+  receipt_month smallint
+  receipt_seq integer [note: '(branch, year, month) အတွင်း ဆက်တိုက် — unique (SQL)']
+  business_date date [note: 'finished_at ရဲ့ MMT ရက် = ဝင်ငွေရက် (D-PLT-15) · daily closing (Part 7) ဒီရက်နဲ့ · F-P4-12']
+  finished_at timestamptz [note: 'D-VIS-07 — payment ပြီးမှ']
+  finished_by_user_id uuid [ref: > users.id, note: 'FINISH နှိပ်သူ — performer / proxy (D-VIS-12) / override']
+  cancelled_at timestamptz [note: 'status 0 (visit INCOMPLETE)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, business_date)
+    (customer_id, finished_at)
+    (branch_id, receipt_year, receipt_month, receipt_seq) [unique]
+  }
+
+  Note: '''
+  START မှာ OPEN sale ဖန်တီး (visit နဲ့ အတူ) → COMPLETE မှာ service line → payment → FINISH = receipt နံပါတ် + immutable
+  FINISH ⇔ receipt / finished_at / finished_by / business_date (CHECK — SQL)
+  Discount: sale တစ်ခုလုံး · code XOR request · ကားခ line မလျှော့ (app) · line ခွဲ ဈေးအချိုး (app) — D-PAY-04 v5.1
+  Tax / service charge = amount snapshot (D-PAY-08) — တွက်အစဉ် 🟡 ဖွင့်မှ
+  Commission estimate (D-COM-04) = screen မှာ တွက်ပြ၊ DB မသိမ်း · final = Part 5
+  '''
+}
+
+Table sale_items {
+  id uuid [pk]
+  sale_id uuid [not null, ref: > sales.id]
+  sort_order smallint [not null]
+  line_type smallint [not null, note: '1 SERVICE · 2 PRODUCT (D-PAY-03 — Part 6) · 3 TRANSPORT_FEE (ကားခ — D-SVC-06, commission ✖)']
+  service_id uuid [ref: > services.id, note: 'SERVICE ⇒ မဖြစ်မနေ (CHECK)']
+  service_variant_id uuid [ref: > service_variants.id, note: 'OPTIONS service ⇒ ကွက် (D-SVC-05) · ဒီ service ရဲ့ variant ပဲ (composite FK — SQL)']
+  product_id uuid [note: 'PRODUCT ⇒ မဖြစ်မနေ (CHECK) · → products (Part 6) — FK Part 6 မှာ ထည့် (§6.5 #9)']
+  booking_item_id uuid [ref: > booking_items.id, note: 'Booking ကနေ ကြိုဖြည့်တဲ့ line (D-VIS-02 v5.1) · NULL = visit မှာ ထည့်']
+  performed_by_employee_id uuid [ref: > employees.id, note: 'SERVICE ⇒ မဖြစ်မနေ — commission / KPI (D-COM-03) · V1 = visit.performed_by (app) · F-P4-02']
+  description_mm varchar(300) [not null, note: 'Receipt စာသား snapshot (service + ကွက် / product / ကားခ) — reprint တူအောင် (D-PAY-06) · F-P4-11']
+  description_en varchar(300) [note: 'D-DB-04']
+  quantity integer [not null, default: 1, note: 'SERVICE / TRANSPORT_FEE = 1']
+  list_price_amount bigint [not null, note: 'ဈေး table / ကားခ setting ကနေ ရှာတဲ့ ဈေး — ဝန်ဆောင်မှုရက် (D-SVC-04 / 08, D-SVC-06)']
+  unit_price_amount bigint [not null, note: 'တကယ် ယူတဲ့ ဈေး — ≠ list ဆို override reason + by (CHECK) · barber ✖ (D-SVC-04) · F-P4-03']
+  price_override_reason text
+  price_override_by_user_id uuid [ref: > users.id, note: 'Permission `sale.override_price` (D-SVC-04 / D-SVC-06 ကားခ လျှော့)']
+  line_discount_amount bigint [not null, default: 0, note: 'sales.discount_amount ကို ဈေးအချိုးနဲ့ ခွဲ (D-PAY-04 v5.1) — TRANSPORT_FEE = 0 (CHECK) · commission = net (D-COM-02)']
+  added_reason text [note: 'Booking visit မှာ booking ထဲ မပါတဲ့ service ထည့်ရင် (🔒 D-VIS-05 — app စစ်)']
+  removed_at timestamptz [note: 'Sale OPEN တုန်း ဖြုတ် — row မဖျက် (D-DAT-05) · totals ထဲ မပါ']
+  removed_by_user_id uuid [ref: > users.id]
+  removed_reason text [note: 'D-VIS-05 — removed_at ⇔ (CHECK)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (sale_id, sort_order) [unique]
+    (performed_by_employee_id, created_at)
+  }
+
+  Note: '''
+  Service line = "visit item" — visit_items table သီးသန့် မထား (ဈေး snapshot တစ်နေရာတည်း) · F-P4-01
+  line_total_amount = unit × qty − line_discount (generated — SQL)
+  Commissionable (D-COM-02) = SERVICE line ပဲ (PRODUCT / TRANSPORT_FEE ✖) — Part 5 က ဖတ်
+  HOME visit ⇒ TRANSPORT_FEE line ၁ ခု (list = branch setting / booking snapshot; 0 = ဆိုင်ခံ) — app
+  '''
+}
+
+// ───────────────────────── Payment ─────────────────────────
+
+Table payment_methods {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  code varchar(30) [not null, note: 'CASH · KBZPAY (code ထဲ constant) — နောက်ထပ် ထည့်နိုင် (D-PAY-01)']
+  name_mm varchar(100) [not null, note: 'D-DB-04']
+  name_en varchar(100)
+  kind smallint [not null, note: '1 CASH · 2 MOBILE_WALLET · 3 BANK_TRANSFER · 4 CARD (D-DB-03)']
+  is_cash boolean [not null, default: false, note: 'Drawer cash in (D-FIN-07) · closing expected cash']
+  requires_reference boolean [not null, default: false, note: 'KBZPay = true (🔒 D-PAY-02)']
+  requires_verification boolean [not null, default: false, note: 'KBZPay = true — closing မှာ တစ်ခုချင်း ✔ (D-PAY-02 v5.1)']
+  reference_regex varchar(200) [note: 'Reference ပုံစံ စစ် — Additional Settings (D-PLT-07, OPEN-24) · NULL = မစစ်']
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Indexes {
+    (company_id, code) [unique]
+  }
+
+  Note: 'Seed: CASH (kind 1, is_cash) · KBZPAY (kind 2, reference + verification) — D-PAY-01 · Tips ✖ (D-PAY-09)'
+}
+
+Table payments {
+  id uuid [pk]
+  client_request_id uuid [not null, unique, note: 'D-VIS-10 · F-P4-08']
+  sale_id uuid [not null, ref: > sales.id]
+  payment_method_id uuid [not null, ref: > payment_methods.id]
+  amount bigint [not null, note: '> 0 · Σ (voided မပါ) = sales.total_amount (app — F-P4-10 split payment ရ)']
+  collected_by_employee_id uuid [not null, ref: > employees.id, note: '🔒 D-VIS-06 ငွေလက်ခံသူ — default performer · proxy (D-VIS-12) = B · closing တာဝန်']
+  received_at timestamptz [not null, note: 'တကယ် လက်ခံချိန် (late entry = user ရိုက်)']
+  recorded_by_user_id uuid [not null, ref: > users.id]
+  external_reference varchar(100) [note: 'KBZPay transaction ref (D-DB-01 naming) — method requires_reference ⇒ မဖြစ်မနေ (app) · method အလိုက် unique (partial — SQL) 🔒 D-PAY-02']
+  verified_at timestamptz [note: 'D-PAY-02 v5.1 — closing မှာ KBZPay app history နဲ့ တိုက်ပြီး ✔']
+  verified_by_user_id uuid [ref: > users.id]
+  voided_at timestamptz [note: 'Sale OPEN တုန်း မှားရိုက်တာ ပြန်ဖြုတ် — row မဖျက် (D-DAT-05) · FINISHED ⇒ refund / adjustment ပဲ']
+  voided_by_user_id uuid [ref: > users.id]
+  void_reason text
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (sale_id)
+    (payment_method_id, received_at)
+  }
+
+  Note: '''
+  Verify ≠ FINISH (C-1 — D-VIS-07): FINISH = payment *မှတ်ပြီး*; verify = closing (Part 7)
+  Closing list = requires_verification method · voided_at IS NULL · verified_at IS NULL · sale.business_date = ရက် (partial index — SQL)
+  '''
+}
+
+Table receipt_counters {
+  branch_id uuid [not null, ref: > branches.id]
+  kind smallint [not null, note: '1 SALE · 2 REFUND (RF series — D-PAY-06)']
+  receipt_year smallint [not null]
+  receipt_month smallint [not null, note: '1–12 (MMT business date)']
+  last_seq integer [not null, default: 0]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, kind, receipt_year, receipt_month) [pk]
+  }
+
+  Note: '''
+  F-P4-04 — FINISH / refund transaction ထဲမှာ row lock (UPDATE … SET last_seq = last_seq + 1 RETURNING) → gapless (🔒 D-PAY-06 v5.1)
+  Row မရှိသေးရင် INSERT … ON CONFLICT · transaction တို (FINISH click တစ်ခုတည်း)
+  '''
+}
+
+// ───────────────────────── Discount (🔒 D-PAY-04 v5.1) ─────────────────────────
+
+Table discount_codes {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  code varchar(40) [not null, note: 'ရိုက် / ပြောတဲ့ code — uppercase သိမ်း · (company_id, code) unique (archive ပါ — code ပြန်မသုံး)']
+  name_mm varchar(150) [not null, note: 'Admin label — ဥပမာ ပုံမှန် customer (D-DB-04)']
+  name_en varchar(150)
+  discount_type smallint [not null, note: '1 PERCENT · 2 AMOUNT']
+  discount_percent smallint [note: 'PERCENT ⇒ 1–100 (CHECK)']
+  discount_amount bigint [note: 'AMOUNT ⇒ > 0 MMK (CHECK)']
+  is_public boolean [not null, default: false, note: 'true = social media promo — customer ပြောမှ၊ barber checkout list မှာ မပြ · false = internal (list ကနေ ရွေး)']
+  once_per_customer boolean [not null, default: false, note: 'true ⇒ customer ဖုန်း မဖြစ်မနေ (app) · discount_code_customer_uses unique']
+  max_uses integer [note: 'NULL = အကန့်အသတ်မဲ့ · N = စုစုပေါင်း (app — code row lock ပြီး count)']
+  scope_type smallint [not null, default: 1, note: '1 ALL_BRANCHES · 2 BRANCHES (discount_code_branches)']
+  valid_from date [note: 'MMT · NULL = ချက်ချင်း']
+  valid_to date [note: 'NULL = သက်တမ်း မကုန်']
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_by_user_id uuid [not null, ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Indexes {
+    (company_id, code) [unique]
+  }
+
+  Note: 'Report: code / barber / ကြိမ် / ပမာဏ = sales (discount_code_id) ကနေ · ဘယ် code ကြိုဖန်တီး = go-live data · service ကန့်သတ် ⏭ · website /book မှာ code ⏭'
+}
+
+Table discount_code_branches {
+  id uuid [pk]
+  discount_code_id uuid [not null, ref: > discount_codes.id]
+  branch_id uuid [not null, ref: > branches.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (discount_code_id, branch_id) [unique]
+  }
+
+  Note: 'scope_type = 2 ⇒ row ၁ ခု အနည်းဆုံး (app) — employee_role_branches ပုံစံ'
+}
+
+Table discount_code_customer_uses {
+  id uuid [pk]
+  discount_code_id uuid [not null, ref: > discount_codes.id]
+  customer_id uuid [not null, ref: > customers.id]
+  sale_id uuid [not null, ref: - sales.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (discount_code_id, customer_id) [unique, note: 'once_per_customer code — customer ၁ ယောက် ၁ ကြိမ် (DB ကာ) · F-P4-05']
+  }
+
+  Note: 'once_per_customer = true code သုံးတဲ့ FINISH မှာပဲ INSERT (app) · unique က ၂ ကြိမ် တားတယ်'
+}
+
+Table discount_requests {
+  id uuid [pk]
+  sale_id uuid [not null, ref: > sales.id, note: 'OPEN sale · PENDING ၁ ခုပဲ (partial unique — SQL)']
+  requested_by_user_id uuid [not null, ref: > users.id, note: 'Barber — checkout မှာ "လျှော့ခွင့် တောင်း"']
+  requested_at timestamptz [not null, default: `now()`]
+  discount_type smallint [not null, note: '1 PERCENT · 2 AMOUNT']
+  discount_percent smallint
+  discount_amount bigint
+  reason text [not null, note: 'မဖြစ်မနေ (D-PAY-04 v5.1)']
+  status smallint [not null, default: 1, note: '0 CANCELLED (barber ပြန်ရုပ် / ဈေးအပြည့်နဲ့ FINISH) · 1 PENDING · 2 APPROVED · 3 REJECTED']
+  decided_by_user_id uuid [ref: > users.id, note: 'Permission `discount.approve` (admin / manager — role အလိုက် ပိုင်ရှင် ရွေး)']
+  decided_at timestamptz
+  decision_note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (status, requested_at)
+  }
+
+  Note: '''
+  F-P4-05 — in-app noti (D-NTF-01) → ✔ → sales.discount_request_id = ဒီ row၊ discount_amount တွက် (app) · ဖုန်း ✖
+  အဖြေမရ → barber က CANCELLED + ဈေးအပြည့် FINISH → admin နောက်မှ refund (D-PAY-05)
+  Report: barber အလိုက် တောင်းတဲ့ / ရတဲ့ အရေအတွက်
+  '''
+}
+
+// ───────────────────────── After FINISH (🔒 D-VIS-08, D-PAY-05) ─────────────────────────
+
+Table refunds {
+  id uuid [pk]
+  client_request_id uuid [not null, unique, note: 'D-VIS-10']
+  sale_id uuid [not null, ref: > sales.id, note: 'FINISHED sale ပဲ (app)']
+  branch_id uuid [not null, ref: > branches.id]
+  kind smallint [not null, note: '1 SALE_REFUND (full / partial — refund_items ⇒ commission reversal, Part 5) · 2 OVERPAYMENT_RETURN (KBZPay ၂ ခါ လွှဲ — ဝင်ငွေ မလျော့၊ commission မထိ — D-PAY-05) · F-P4-06']
+  payment_method_id uuid [not null, ref: > payment_methods.id, note: 'ပြန်ပေးပုံ (cash / KBZPay)']
+  amount bigint [not null, note: '> 0 · kind 1 ⇒ = Σ refund_items (app)']
+  external_reference varchar(100) [note: 'KBZPay နဲ့ ပြန်လွှဲရင် ref']
+  reason text [not null, note: 'မဖြစ်မနေ (D-VIS-08)']
+  refund_receipt_number varchar(40) [not null, unique, note: '`B3-RF-2026-OCT-00003` — receipt_counters kind 2 (D-PAY-06 v5.1)']
+  receipt_year smallint [not null]
+  receipt_month smallint [not null]
+  receipt_seq integer [not null]
+  business_date date [not null, note: 'refunded_at ရဲ့ MMT ရက် — closing (Part 7) · commission period (Part 5, 🟡 OPEN-26 finalize ပြီးမှ)']
+  refunded_at timestamptz [not null]
+  refunded_by_user_id uuid [not null, ref: > users.id, note: 'Permission `sale.refund`']
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (sale_id)
+    (branch_id, business_date)
+    (branch_id, receipt_year, receipt_month, receipt_seq) [unique]
+  }
+}
+
+Table refund_items {
+  id uuid [pk]
+  refund_id uuid [not null, ref: > refunds.id]
+  sale_item_id uuid [not null, ref: > sale_items.id]
+  quantity integer [not null, default: 1]
+  amount bigint [not null, note: '> 0 · ≤ line_total_amount − ယခင် refund (app)']
+
+  Indexes {
+    (refund_id, sale_item_id) [unique]
+  }
+
+  Note: 'Partial refund → ဘယ် line / ဘယ် performer → commission reversal (D-PAY-05, Part 5)'
+}
+
+Table sale_adjustments {
+  id uuid [pk]
+  sale_id uuid [not null, ref: > sales.id, note: 'FINISHED sale — sale / payment row မပြင် (D-VIS-08) · report / closing / commission က adjustment ကို ပေါင်းဖတ် · F-P4-07']
+  adjustment_type smallint [not null, note: '1 PAYMENT_METHOD (payment X → method Y) · 2 PERFORMER (line → barber) · 3 COLLECTED_BY (payment → ငွေလက်ခံသူ) · 9 OTHER (note ပဲ)']
+  payment_id uuid [ref: > payments.id, note: 'type 1 / 3 ⇒ မဖြစ်မနေ (CHECK)']
+  sale_item_id uuid [ref: > sale_items.id, note: 'type 2 ⇒ မဖြစ်မနေ (CHECK)']
+  new_payment_method_id uuid [ref: > payment_methods.id, note: 'type 1']
+  new_employee_id uuid [ref: > employees.id, note: 'type 2 / 3']
+  reason text [not null]
+  adjusted_by_user_id uuid [not null, ref: > users.id, note: 'Permission `sale.adjust` (admin override — D-VIS-06)']
+  adjusted_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (sale_id, adjusted_at)
+  }
+
+  Note: '''
+  ငွေပမာဏ ပြင်တာ ✖ — ပိုယူမိ = refund · လျော့ယူမိ = product-only sale ပုံစံ line အသစ် (app) · KBZPay ၂ ခါ = refunds kind 2
+  Audit before / after = audit_events (Part 8 — D-AUD-02)
+  '''
+}
+
+// ── Setting (Part 8 settings store — ဒီ part က ဖတ်) ──
+// home_service.transport_fee_amount (branch — D-SVC-06; Part 2 list)
+// sales.service_charge_enabled / sales.service_charge_rate (company — D-PAY-08, Additional Settings, default OFF)
+// sales.tax_enabled / sales.tax_rate (company — D-PAY-08, Additional Settings, default OFF)
+// Permission (permissions.json — D-ROLE-08): sale.late_entry (barber default ✔ — D-VIS-13) · discount.approve · sale.override_price · sale.refund · sale.adjust · payment.verify

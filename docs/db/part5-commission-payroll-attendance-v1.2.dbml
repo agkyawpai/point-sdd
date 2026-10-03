@@ -1,0 +1,426 @@
+// Point Barbershop — Part 5: Commission / Payroll / Attendance · v1.2 🔒 D-DB-09 (30/Sep/2026 · v1.1 = 02/Oct/2026 · v1.2 = 02/Oct/2026)
+// v1.1 → v1.2 (02/Oct/2026 — owner "OPEN-40 OK" · OPEN-40 (b) = B · 🔒 D-DB-09 v1.2 · review §0.9): employee_salaries + employee_commission_plans
+//   .archived_at / archived_by_user_id (→ users) / archive_reason — မှားထည့်မိ + မသုံးရသေးတဲ့ လစာ row / plan assignment ကို "ရုပ်သိမ်း" = archive (row မဖျက် — D-DAT-05; P5.EPY.04 / P5.CPA.04)
+//   + CHECK employee_salaries_archive_chk / employee_commission_plans_archive_chk (all-or-none · reason ဗလာ ✖) · EXCLUDE employee_salaries_no_overlap /
+//   employee_commission_plans_no_overlap = WHERE (archived_at IS NULL) — archived row က ရက်တူ row အသစ်ကို မပိတ်ဆို့ (Part 2 v1.3 archived_at ပုံစံတူ) · constraints v1.3
+//   table / တခြား column မပြောင်း · OPEN-40 (a) = Part 7 v1.2 (expenses FK ON DELETE SET NULL — reopen မှာ allocation ဖျက်ရ) · (c) = DB ပြောင်းစရာ မလို
+// v1 → v1.1 (02/Oct/2026 — G (owner one-sheet 02/Oct 00:06) · G (a)(b)): attendance_records.voided_at / voided_by_user_id / void_reason (manual attendance မှား = void — G a)
+//   + employee_receivables / employee_receivable_repayments.client_request_id (uuid UNIQUE NULL — advance / repayment ၂ ခါ မှတ်မိ ကာ — G b) · constraints v1.2
+//   Payroll ဖြတ်ငွေ repayment row = run **Mark paid** မှာ INSERT (FINALIZE ✖ — reopen မှာ ငွေ row မဖျက် — G b, D-PAYR-04) · cash ပြန်ဆပ် = owner / admin လက်ထဲ, ဗီရို ✖ (owner C3)
+// Part 1 (D-DB-02) + 1b + 2 (D-DB-06) + 3 (D-DB-07) + 4 (D-DB-08) ပေါ်မှာ ဆောက် — dbdiagram မှာ part1–4 နဲ့ တွဲ paste
+// 🔒 D-COM-01..04 (v5.1: OPEN-03 A, OPEN-26), D-PAYR-01..08 (v5.1: OPEN-06 A, REC-19), D-ATT-01..06 (v5.1: OPEN-19), D-FIN-04 (Gross),
+//    D-LV-01..05 (Part 2 leaves ကို ဖတ်), D-SCH-01 (schedule_shifts ကို ဖတ်), D-ORG-03, D-DB-01 / 03 / 04, D-PLT-15
+// Status / type = smallint + CHECK (D-DB-03) · EXCLUDE / CHECK / partial unique = part5-commission-payroll-attendance-v1-constraints.sql
+// F-P5-nn = review finding (§6.4e) — D-DB-09 နဲ့ approve ပြီး (F-P5-05 = attendance_exceptions ပုံစံ)
+// ငွေ table (payroll_runs / entries / lines, commission_results, employee_receivables) ပြောင်းတိုင်း DB trigger → audit_events (Part 8 — D-AUD-02)
+// Deduction rule / allocation basis / period type / auto clock-out = Additional Settings (Part 8) — run မှာ snapshot
+// Attendance exception detect job (ABSENT / INCOMPLETE — ညနေ) = REC-31 ပုံစံ (Part 2 shift ထုတ် job လို)
+
+// ───────────────────────── Commission (🔒 D-COM-01..04) ─────────────────────────
+
+Table commission_plans {
+  id uuid [pk, note: 'UUIDv7']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04 — seed: "Point ပုံမှန်" (15% / 20%)']
+  name_en varchar(150)
+  description_mm text
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'Progressive tier plan (D-COM-01) · basis = commissionable sales (D-COM-02 — SERVICE line net of discount, FINISHED, ကားခ ✖) · period = payroll run period · (company_id, name_mm) unique (SQL)'
+}
+
+Table commission_plan_tiers {
+  id uuid [pk]
+  commission_plan_id uuid [not null, ref: > commission_plans.id]
+  tier_order smallint [not null, note: '1, 2, 3 …']
+  from_amount bigint [not null, note: 'MMK ≥ 0 — ပထမ tier = 0']
+  to_amount bigint [note: 'NULL = အဆုံးမရှိ (နောက်ဆုံး tier) · Point: 0 → 2,250,000 = 15% · 2,250,000 → ∞ = 20%']
+  rate_percent numeric(5,2) [not null, note: '0–100']
+
+  Indexes {
+    (commission_plan_id, tier_order) [unique]
+  }
+
+  Note: 'Tier ထပ် ✖ (EXCLUDE int8range — SQL) · ကွက်လပ် မရှိရ (app) · plan ကို employee assign ပြီးရင် tier ပြင်ရင် plan အသစ် (history — app)'
+}
+
+Table employee_commission_plans {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  commission_plan_id uuid [not null, ref: > commission_plans.id]
+  branch_id uuid [ref: > branches.id, note: 'NULL = branch အကုန်ပေါင်း (default — C-2) · ဖြည့် = အဲ့ branch ရဲ့ sales ပဲ (P63 branch % မတူ case — branch တစ်ခုချင်း row) · F-P5-01']
+  effective_from date [not null, note: '"Qualify" ဖြစ်တဲ့ရက် — admin assign (D-COM-01 v5.1)']
+  effective_to date [note: 'NULL = ဆက်သက်ရောက်']
+  assigned_by_user_id uuid [not null, ref: > users.id]
+  note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz [note: 'v1.2 OPEN-40 (b) — မှားချိတ်မိ + မသုံးရသေး (FINALIZED / PUBLISHED / PAID run ရဲ့ commission_results မချိတ် — app) ⇒ ရုပ်သိမ်း = archive (row မဖျက် — D-DAT-05) · archived ⇒ commission တွက် / EXCLUDE ထဲ မပါ (P5.CPA.04)']
+  archived_by_user_id uuid [ref: > users.id, note: 'ရုပ်သိမ်းသူ (API P5.CPA.04 — permission `commission.assign`, private level)']
+  archive_reason text [note: 'archived_at ⇔ by ⇔ reason (CHECK — all-or-none, reason ဗလာ ✖)']
+
+  Note: '''
+  🔒 D-COM-01 (v5.1) — employee ၁ ယောက် scope တူ plan ၁ ခု (EXCLUDE daterange — SQL; v1.2 = archived မပါ) · assignment မရှိ = commission ✖ (basic ပဲ)
+  Branch-all row နဲ့ branch row တစ်ချိန်တည်း ✖ (app)
+  v1.2 (OPEN-40 b) — မှား assignment = archive (archived_at / by / reason) ပြီးမှ ရှေ့ row ရဲ့ effective_to ပြန်ချိတ် / မှန်တဲ့ row အသစ် ထည့် (archived row = history — audit log မှာ မြင်ရ; Pay tab မှာ ပြဖို့ = API filter အသစ် လို — OPEN-41)
+  '''
+}
+
+Table commission_results {
+  id uuid [pk]
+  payroll_run_id uuid [not null, ref: > payroll_runs.id]
+  employee_id uuid [not null, ref: > employees.id]
+  employee_commission_plan_id uuid [not null, ref: > employee_commission_plans.id, note: 'ဘယ် assignment (plan + scope) နဲ့ တွက်လဲ']
+  commissionable_amount bigint [not null, default: 0, note: 'Period စုစုပေါင်း (D-COM-02) — Σ EARN lines']
+  commission_amount bigint [not null, default: 0, note: 'Tier နဲ့ တွက်ပြီး (final — D-COM-04)']
+  effective_rate_percent numeric(7,4) [not null, default: 0, note: 'commission ÷ commissionable — line ခွဲ / reversal % (OPEN-26) · F-P5-02']
+  tier_breakdown jsonb [note: 'Payslip ပြဖို့ — [{from, to, rate, base, amount}] snapshot']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (payroll_run_id, employee_commission_plan_id) [unique]
+    (employee_id, payroll_run_id)
+  }
+
+  Note: 'Run Calculate မှာ ထုတ် · Finalize ⇒ immutable (D-PAYR-06) · Reopen ⇒ ဖျက်ပြီး ပြန်တွက် (run DRAFT ပြန်ဖြစ်မှ)'
+}
+
+Table commission_result_lines {
+  id uuid [pk]
+  commission_result_id uuid [not null, ref: > commission_results.id]
+  kind smallint [not null, note: '1 EARN (sale line) · 2 REVERSAL (finalize ပြီးမှ refund — OPEN-26)']
+  sale_item_id uuid [ref: > sale_items.id, note: 'EARN ⇒ မဖြစ်မနေ · line ၁ ခု ၁ ကြိမ်ပဲ (partial unique)']
+  refund_item_id uuid [ref: > refund_items.id, note: 'REVERSAL ⇒ မဖြစ်မနေ · ၁ ကြိမ်ပဲ']
+  original_line_id uuid [ref: > commission_result_lines.id, note: 'REVERSAL → မူလ EARN line (မူလ % ယူ)']
+  branch_id uuid [not null, ref: > branches.id, note: 'sale.branch_id — branch P&L ခွဲ (D-PAYR-08 / C-2)']
+  base_amount bigint [not null, note: 'EARN = line_total (net of discount) > 0 · REVERSAL = − refund_item.amount']
+  rate_percent numeric(7,4) [not null, note: 'EARN = result.effective_rate · REVERSAL = original_line.rate_percent (D-COM-04 v5.1)']
+  commission_amount bigint [not null, note: 'base × rate (rounded) — REVERSAL အနုတ်']
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (commission_result_id)
+    (branch_id)
+  }
+
+  Note: '''
+  Finalize မတိုင်ခင် refund = sale line ကို EARN ထဲ မထည့် / base လျှော့ (D-COM-02 fully paid) — REVERSAL မလို
+  Finalize ပြီး refund → refund လ run မှာ REVERSAL line (payslip: "28/Oct ဆိုးဆေး refund — 6,000")
+  ထွက်သွားလို့ run မရှိ → REVERSAL ကို admin ဆုံးဖြတ် (🟡 app screen — "ပြန်ယူစရာ")
+  '''
+}
+
+// ───────────────────────── Salary / Payroll (🔒 D-PAYR-01..08, D-FIN-04) ─────────────────────────
+
+Table employee_salaries {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  basic_salary_amount bigint [not null, note: 'MMK / လ (D-PAYR-02) — period weekly ဆို app prorate']
+  effective_from date [not null]
+  effective_to date
+  set_by_user_id uuid [not null, ref: > users.id]
+  note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz [note: 'v1.2 OPEN-40 (b) — မှားထည့်မိ + မသုံးရသေး (နောက်ဆုံး finalize ပြီး period နောက်မှ စတဲ့ row — app) ⇒ ရုပ်သိမ်း = archive (row မဖျက် — D-DAT-05) · archived ⇒ payroll တွက် / EXCLUDE ထဲ မပါ (P5.EPY.04)']
+  archived_by_user_id uuid [ref: > users.id, note: 'ရုပ်သိမ်းသူ (API P5.EPY.04 — permission `payroll.update`, private level)']
+  archive_reason text [note: 'archived_at ⇔ by ⇔ reason (CHECK — all-or-none, reason ဗလာ ✖)']
+
+  Note: '''
+  🔒 D-PAYR-02 — ၁ ယောက် ၁ ခု + effective date + history (EXCLUDE daterange — SQL; v1.2 = archived မပါ) · branch မခွဲ · မရှိ = basic 0 (commission ပဲ case)
+  v1.2 (OPEN-40 b) — မှား row = archive (archived_at / by / reason) ပြီးမှ ရှေ့ row ရဲ့ effective_to ပြန်ချိတ် / မှန်တဲ့ row အသစ် ထည့် (archived row = history — audit log မှာ မြင်ရ; Pay tab မှာ ပြဖို့ = API filter အသစ် လို — OPEN-41)
+  '''
+}
+
+Table payroll_line_categories {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04']
+  name_en varchar(150)
+  kind smallint [not null, note: '1 EARNING · 2 DEDUCTION']
+  system_code smallint [note: 'NULL = admin ဖန်တီး (D-PAYR-03) · system: 1 BASIC · 2 COMMISSION · 3 COMMISSION_REVERSAL · 4 LATE · 5 ABSENT · 6 UNPAID_LEAVE · 7 ADVANCE_REPAYMENT · 8 LOAN_REPAYMENT — archive ✖']
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'Seed system ၈ ခု · (company_id, system_code) unique · (company_id, name_mm) unique (SQL) · F-P5-03'
+}
+
+Table payroll_runs {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03 — payroll = company-level']
+  period_type smallint [not null, default: 1, note: '1 MONTHLY (default) · 2 WEEKLY · 3 BIWEEKLY · 4 CUSTOM (D-PAYR-01)']
+  period_start date [not null, note: 'MMT']
+  period_end date [not null]
+  status smallint [not null, default: 1, note: '0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED (lock) · 4 PUBLISHED (payslip noti) · 5 PAID (D-PAYR-06)']
+  rules_snapshot jsonb [note: 'Calculate ချိန်က deduction rule + allocation basis + period setting (D-PAYR-05 v5.1 snapshot) · F-P5-04']
+  calculated_at timestamptz
+  calculated_by_user_id uuid [ref: > users.id]
+  finalized_at timestamptz
+  finalized_by_user_id uuid [ref: > users.id]
+  published_at timestamptz
+  published_by_user_id uuid [ref: > users.id]
+  paid_at timestamptz [note: 'D-PAYR-06 Paid (date / by)']
+  paid_by_user_id uuid [ref: > users.id]
+  paid_note text
+  reopen_count smallint [not null, default: 0]
+  last_reopened_at timestamptz
+  last_reopened_by_user_id uuid [ref: > users.id]
+  last_reopen_reason text [note: 'Reopen = reason + audit (D-PAYR-06)']
+  cancelled_at timestamptz
+  created_by_user_id uuid [not null, ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (company_id, period_start)
+  }
+
+  Note: '''
+  Period ထပ် ✖ (EXCLUDE daterange — CANCELLED မပါ — SQL) · status ⇔ timestamp (CHECK)
+  FINALIZED+ ⇒ entries / lines / commission_results immutable — reopen (→ DRAFT) မှ ပြန်တွက်; PAID reopen ✖ (app)
+  Salary expense (Part 7 P&L) = Σ entries.gross_amount (D-FIN-04 Gross) · branch ခွဲ = payroll_entry_branch_allocations
+  '''
+}
+
+Table payroll_entries {
+  id uuid [pk]
+  payroll_run_id uuid [not null, ref: > payroll_runs.id]
+  employee_id uuid [not null, ref: > employees.id]
+  basic_salary_amount bigint [not null, default: 0, note: 'employee_salaries snapshot (prorate ပြီး)']
+  gross_amount bigint [not null, default: 0, note: 'Σ EARNING lines (basic + commission + other) — Salary expense = Gross (D-FIN-04)']
+  deduction_amount bigint [not null, default: 0, note: 'Σ DEDUCTION lines (late / absent / unpaid / advance / loan / other)']
+  net_amount bigint [not null, default: 0, note: '= gross − deduction (CHECK) · တကယ်ပေးရမယ့်ငွေ']
+  late_count smallint [not null, default: 0, note: 'Attendance summary snapshot (payslip ပြ) — detail = payroll_attendance_items']
+  late_minutes integer [not null, default: 0]
+  absent_days numeric(4,1) [not null, default: 0, note: 'နေ့တစ်ဝက် = 0.5']
+  unpaid_leave_days numeric(4,1) [not null, default: 0]
+  scheduled_days numeric(4,1) [not null, default: 0, note: 'Period ထဲ schedule ရက် (÷ schedule ရက် basis)']
+  note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (payroll_run_id, employee_id) [unique]
+  }
+
+  Note: 'Payslip ၁ ခု (D-PAYR-07 PDF / Excel = app render) · gross / deduction = Σ lines (app / Part 8 trigger)'
+}
+
+Table payroll_lines {
+  id uuid [pk]
+  payroll_entry_id uuid [not null, ref: > payroll_entries.id]
+  category_id uuid [not null, ref: > payroll_line_categories.id]
+  kind smallint [not null, note: '1 EARNING · 2 DEDUCTION — = category.kind (app)']
+  source smallint [not null, note: '1 AUTO (system တွက်) · 2 MANUAL (admin ထည့် — D-PAYR-03)']
+  description_mm varchar(300) [not null, note: 'Payslip စာသား — ဥပမာ "နောက်ကျ × 3"']
+  description_en varchar(300)
+  amount bigint [not null, note: '≥ 0 (kind က အနုတ် / အပေါင်း ဆုံးဖြတ်)']
+  auto_amount bigint [note: 'AUTO ⇒ system တွက်တဲ့ မူလ · amount ≠ auto ⇒ override reason + by (CHECK — D-PAYR-05)']
+  override_reason text
+  override_by_user_id uuid [ref: > users.id]
+  commission_result_id uuid [ref: > commission_results.id, note: 'COMMISSION / COMMISSION_REVERSAL line']
+  employee_receivable_id uuid [ref: > employee_receivables.id, note: 'ADVANCE / LOAN repayment line → employee_receivable_repayments']
+  sort_order smallint [not null, default: 0]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (payroll_entry_id, sort_order)
+  }
+
+  Note: 'MANUAL line = admin ထည့် (category admin manage) · AUTO line ဖျက် ✖ — amount 0 + reason'
+}
+
+Table payroll_attendance_items {
+  id uuid [pk]
+  payroll_entry_id uuid [not null, ref: > payroll_entries.id]
+  item_date date [not null, note: 'MMT']
+  item_type smallint [not null, note: '1 LATE · 2 EARLY_LEAVE · 3 ABSENT · 4 UNPAID_LEAVE (D-LV-01 unpaid) · 5 LATE_TO_ABSENT (N ကြိမ် = ၁ ရက်)']
+  attendance_exception_id uuid [ref: > attendance_exceptions.id, note: 'LATE / EARLY_LEAVE / ABSENT ⇒ မဖြစ်မနေ (OPEN / CONFIRMED exception ပဲ — app) · entry ၁ ခုမှာ ၁ ကြိမ်ပဲ']
+  leave_id uuid [ref: > leaves.id, note: 'UNPAID_LEAVE ⇒ မဖြစ်မနေ (APPROVED unpaid leave)']
+  minutes integer [note: 'LATE / EARLY_LEAVE (exception snapshot)']
+  day_portion numeric(3,1) [note: 'ABSENT / UNPAID_LEAVE / LATE_TO_ABSENT = 1 / 0.5']
+  auto_deduction_amount bigint [not null, default: 0, note: 'Rule snapshot နဲ့ တွက်']
+  deduction_amount bigint [not null, default: 0, note: 'Override ပြီး (≠ auto ⇒ reason + by — CHECK)']
+  override_reason text
+  override_by_user_id uuid [ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (payroll_entry_id, item_date)
+  }
+
+  Note: '''
+  F-P5-05 — Calculate မှာ attendance_exceptions (OPEN / CONFIRMED) + leaves (unpaid, APPROVED) ကနေ ထုတ် (D-PAYR-05) · payslip မှာ ရက်အလိုက် ပြ
+  Σ deduction_amount (type အလိုက်) → payroll_lines AUTO (LATE / ABSENT / UNPAID_LEAVE) · item override = payroll ချိန် (exception EXCUSED = calculate မတိုင်ခင် manager ဆုံးဖြတ်)
+  '''
+}
+
+Table payroll_entry_branch_allocations {
+  id uuid [pk]
+  payroll_entry_id uuid [not null, ref: > payroll_entries.id]
+  branch_id uuid [not null, ref: > branches.id]
+  ratio numeric(7,4) [not null, note: '0–1 · Σ = 1 (app)']
+  allocated_gross_amount bigint [not null, note: 'gross × ratio (rounded; နောက်ဆုံး row က ကျန်ငွေ)']
+  basis smallint [not null, note: '1 ATTENDANCE_HOURS (default — REC-19) · 2 SCHEDULED_HOURS · 3 MANUAL_PERCENT · 4 PRIMARY_BRANCH (attendance မရှိ)']
+
+  Indexes {
+    (payroll_entry_id, branch_id) [unique]
+  }
+
+  Note: '''
+  🔒 D-PAYR-08 (v5.1) — report / P&L ပဲ (ငွေပေး ၁ ခု) · Finalize snapshot · commission ကတော့ commission_result_lines.branch_id
+  v1.2 (OPEN-40 a — Part 7 v1.2): reopen ⇒ run ရဲ့ salary expense (Part 7 expenses source 3) ကို soft delete အရင် ပြီးမှ ဒီ row ဖျက် (🔒 F-P5-09 ပြန်တွက်) — expenses FK = ON DELETE SET NULL; expense soft delete မလုပ်ရသေးရင် DB က ဖျက်ခွင့် မပေး (expenses_source_refs_chk)
+  '''
+}
+
+// ───────────────────────── Salary Advance / Staff Loan (🔒 D-PAYR-04) ─────────────────────────
+
+Table employee_receivables {
+  id uuid [pk]
+  client_request_id uuid [unique, note: 'v1.1 G (b) — P5.RCV.03 Idempotency-Key (ဗီရိုကနေ မဟုတ်တဲ့ advance / loan — ၂ ခါ မှတ်မိ ကာ, D-VIS-10) · NULL = ဗီရို advance (Part 7 cash_outs.client_request_id က ကာ) / migration']
+  employee_id uuid [not null, ref: > employees.id]
+  kind smallint [not null, note: '1 SALARY_ADVANCE · 2 STAFF_LOAN — balance သီးခြား (D-PAYR-04) · F-P5-06']
+  principal_amount bigint [not null, note: '> 0 MMK']
+  issued_at timestamptz [not null]
+  issued_by_user_id uuid [not null, ref: > users.id]
+  cash_out_id uuid [note: 'ငွေထုတ်ပေးတဲ့ Cash Out (Part 7 — reason = employee balance, expense ✖ — D-FIN-07 / 08) · FK Part 7 မှာ']
+  installment_amount bigint [note: 'Payroll တစ်ကြိမ် ဖြတ်မယ့် ပမာဏ (NULL = နောက် payroll မှာ အကုန် — advance ပုံမှန်)']
+  repayment_start_date date [note: 'ဒီရက် နောက်ပိုင်း period ကစ ဖြတ်']
+  status smallint [not null, default: 1, note: '0 CANCELLED · 1 ACTIVE · 2 SETTLED']
+  settled_at timestamptz
+  reason text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (employee_id, status)
+  }
+
+  Note: '''
+  Receivable (ဆိုင်က ပြန်ရမယ့်ငွေ) — expense ✖ (REC-15 🔒), salary expense မလျှော့ (D-FIN-04)
+  Balance = principal − Σ repayments − pending (FINALIZED / PUBLISHED run ရဲ့ ADVANCE / LOAN line — Mark paid မတိုင်ခင်; v1.1 G b) (view / app — P5-RULE-11) · SETTLED ⇔ balance 0 (app)
+  '''
+}
+
+Table employee_receivable_repayments {
+  id uuid [pk]
+  client_request_id uuid [unique, note: 'v1.1 G (b) — P5.RCV.05 cash repayment ရဲ့ Idempotency-Key (၂ ခါ မှတ်မိ ကာ) · payroll repayment = NULL (payroll_line_id unique က ကာ)']
+  employee_receivable_id uuid [not null, ref: > employee_receivables.id]
+  amount bigint [not null, note: '> 0']
+  payroll_line_id uuid [unique, ref: - payroll_lines.id, note: 'Payroll deduction နဲ့ ဖြတ် (ပုံမှန်) — run **Mark paid** မှာ ထည့် (v1.1 — G b, D-PAYR-04 · FINALIZE ✖ — reopen မှာ ငွေ row မဖျက်)']
+  received_at timestamptz [note: 'Cash နဲ့ ပြန်ဆပ် (payroll မဟုတ်) ⇒ received_at + received_by (CHECK — တစ်မျိုးပဲ) · owner / admin လက်ထဲ — ဗီရို ✖ (owner C3)']
+  received_by_user_id uuid [ref: > users.id, note: 'ငွေလက်ခံတဲ့ owner / admin (P5.RCV.05 caller — owner C3)']
+  note text
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Payroll line ✖ cash ✖ ၂ ခုလုံး / တစ်ခုမှ မရှိ ✖ (CHECK) · payroll repayment = Mark paid မှာ INSERT (G b, D-PAYR-04) · cash ပြန်ဆပ် = owner / admin လက်ထဲ, ဗီရို ✖ — Part 7 closing expected cash မပါ (owner C3)'
+}
+
+// ───────────────────────── Attendance (🔒 D-ATT-01..06) ─────────────────────────
+
+Table branch_attendance_qr_tokens {
+  id uuid [pk]
+  branch_id uuid [not null, ref: > branches.id]
+  token varchar(64) [not null, unique, note: 'QR ထဲ — random (branch id သက်သက် ✖) · print ပြန်ထုတ်ရင် အသစ် + အဟောင်း revoke']
+  created_by_user_id uuid [not null, ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+  revoked_at timestamptz
+  revoked_by_user_id uuid [ref: > users.id]
+
+  Note: 'F-P5-07 — branch ၁ ခု active token ၁ ခု (partial unique — SQL) · D-ATT-01 static QR · GPS radius = branches.location_radius_meters (Part 1)'
+}
+
+Table attendance_records {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  branch_id uuid [not null, ref: > branches.id, note: 'QR ရဲ့ branch · တစ်ရက် branch အများကြီး = record အများကြီး (D-ATT-02)']
+  business_date date [not null, note: 'clock_in_at ရဲ့ MMT ရက် (D-PLT-15)']
+  clock_in_at timestamptz [not null]
+  clock_out_at timestamptz [note: 'NULL = ဆိုင်ထဲ ရှိနေ (active) · employee ၁ ယောက် active ၁ ခု (partial unique — voided မပါ, v1.1)']
+  method smallint [not null, note: '1 QR_GPS (ကိုယ့်ဖုန်း) · 2 MANUAL (Manager / Admin — D-ATT-06)']
+  qr_token_id uuid [ref: > branch_attendance_qr_tokens.id, note: 'QR_GPS ⇒ scan လုပ်တဲ့ token']
+  clock_in_latitude numeric(10,7) [note: 'QR_GPS ⇒ မဖြစ်မနေ (CHECK)']
+  clock_in_longitude numeric(10,7)
+  clock_in_distance_meters integer [note: 'ဆိုင်နဲ့ အကွာအဝေး — radius ကျော်ရင် app ပယ် (D-ATT-01)']
+  clock_in_device_label varchar(255) [note: 'user_sessions.device_label (D-AUTH-05)']
+  clock_out_source smallint [note: '1 SELF (QR_GPS) · 2 MANUAL (Manager / Admin — D-ATT-04) · 3 AUTO_SHIFT_END (setting — D-ATT-04) · NULL = မထွက်သေး']
+  clock_out_latitude numeric(10,7)
+  clock_out_longitude numeric(10,7)
+  clock_out_distance_meters integer
+  manual_reason smallint [note: 'MANUAL ⇒ 1 PHONE_UNAVAILABLE · 9 OTHER (D-ATT-06 preset) — CHECK']
+  manual_note text [note: 'OTHER ⇒ မဖြစ်မနေ']
+  entered_by_user_id uuid [ref: > users.id, note: 'MANUAL ⇒ Manager / Admin (permission `attendance.manual`)']
+  schedule_shift_id uuid [ref: > schedule_shifts.id, note: 'ကိုက်တဲ့ shift (app match) — late / early leave တွက်ဖို့']
+  late_minutes integer [not null, default: 0, note: 'clock_in − shift.starts_at (grace မနုတ်ခင် raw) · payroll က rule နဲ့ တွက်']
+  early_leave_minutes integer [not null, default: 0]
+  corrected_at timestamptz [note: 'D-ATT-05 — Manager / Admin ပြင် (before / after = audit_events)']
+  corrected_by_user_id uuid [ref: > users.id]
+  correction_reason text
+  voided_at timestamptz [note: 'v1.1 G (a) — လူ / branch မှား / ထပ်ထည့်မိ ⇒ void (row မဖျက် — D-DAT-05) · voided ⇒ hours / allocation / one-open / overlap ထဲ မပါ (P5-RULE-15)']
+  voided_by_user_id uuid [ref: > users.id, note: 'Manager / Admin (permission `attendance.update`) — ကိုယ့် record ✖ (owner C11 — app)']
+  void_reason text [note: 'voided_at ⇔ by ⇔ reason (CHECK — all-or-none, reason ဗလာ ✖)']
+  created_at timestamptz [not null, default: `now()`, note: '= recorded_at']
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (employee_id, business_date)
+    (branch_id, business_date)
+  }
+
+  Note: '''
+  🔒 D-ATT-01 (v5.1) — GPS / QR ကို setting နဲ့ ပိတ်ရ (method မပြောင်း) · F-P5-08
+  🔒 D-ATT-06 — colleague က သူများအတွက် clock-in ✖ (QR_GPS record ရဲ့ session user = employee.user — app) · MANUAL screen မှာ အဲ့နေ့ visit သက်သေပြ · လစဉ် manual count (employee အလိုက်) report
+  Late / early leave / absent / incomplete → attendance_exceptions (detect ပြီး row သိမ်း — D-ATT-03) · Incomplete = clock_out NULL နေ့ကုန် (auto / manual ပိတ် — D-ATT-04)
+  Record ထပ် ✖ — employee တစ်ယောက် အချိန်ထပ် (EXCLUDE tstzrange — SQL)
+  v1.1 (G a) — void = voided_at / by / reason · one_open + no_overlap = voided မပါ (SQL) · LATE / EARLY / INCOMPLETE exception → VOID, ABSENT ပြန်စစ် (app — P5-RULE-15)
+  '''
+}
+
+Table attendance_exceptions {
+  id uuid [pk]
+  employee_id uuid [not null, ref: > employees.id]
+  branch_id uuid [not null, ref: > branches.id, note: 'Shift ရဲ့ branch (ABSENT) / record ရဲ့ branch']
+  business_date date [not null, note: 'MMT']
+  exception_type smallint [not null, note: '1 LATE · 2 EARLY_LEAVE · 3 ABSENT (shift ရှိ၊ record / leave မရှိ) · 4 INCOMPLETE (clock-out မလုပ် — D-ATT-04) — 🔒 D-ATT-03 auto']
+  schedule_shift_id uuid [ref: > schedule_shifts.id, note: 'LATE / EARLY_LEAVE / ABSENT ⇒ မဖြစ်မနေ · shift ၁ ခု type ၁ ခု ၁ ကြိမ် (partial unique)']
+  attendance_record_id uuid [ref: > attendance_records.id, note: 'LATE / EARLY_LEAVE / INCOMPLETE ⇒ မဖြစ်မနေ · ABSENT = NULL']
+  minutes integer [note: 'LATE / EARLY_LEAVE ⇒ > 0 (grace မနုတ်ခင် raw — rule = payroll)']
+  detected_at timestamptz [not null, default: `now()`, note: 'LATE = clock-in ချိန် · EARLY_LEAVE = clock-out · ABSENT / INCOMPLETE = ညနေ job (REC-31 ပုံစံ)']
+  status smallint [not null, default: 1, note: '0 VOID (detect မှား — schedule ပြင်) · 1 OPEN · 2 EXCUSED (ခွင့်လွှတ် — မဖြတ်) · 3 CONFIRMED (ဖြတ်) · 4 LEAVE (ခွင့်အဖြစ် ပြောင်း)']
+  leave_id uuid [ref: > leaves.id, note: 'LEAVE ⇒ မဖြစ်မနေ (leave record — reason / approval အဲ့မှာ)']
+  resolution_reason text [note: 'VOID / EXCUSED ⇒ မဖြစ်မနေ · CONFIRMED optional']
+  resolved_by_user_id uuid [ref: > users.id, note: 'Manager / Admin (permission `attendance.resolve`) — status ≠ OPEN ⇒ မဖြစ်မနေ']
+  resolved_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (employee_id, business_date)
+    (branch_id, business_date, status)
+    (status, detected_at)
+  }
+
+  Note: '''
+  F-P5-05 (v1 ပြင်) — "ဒီနေ့ ဘယ်သူ ပျက်လဲ / ဘာကြောင့်လဲ" admin screen + manager က အဲ့နေ့မှာပဲ ဆုံးဖြတ် (ဖုန်းဆက် → EXCUSED / LEAVE / CONFIRMED)
+  Detect ပြီး row သိမ်း — schedule နောက်မှ ပြင်လည်း မှတ်တမ်း မပျောက် (VOID နဲ့ပဲ ပိတ်) · D-ATT-03 "auto + admin manual ပြင်" · D-ATT-05 audit
+  Payroll calculate = OPEN + CONFIRMED ⇒ ဖြတ် · EXCUSED / LEAVE / VOID ⇒ မဖြတ် (unpaid leave = leaves ကနေ) · OPEN ကျန်နေရင် calculate မှာ သတိပေး (app)
+  Employee အလိုက် လစဉ် အရေအတွက် (type / status) report
+  '''
+}
+
+// ── Setting (Part 8 settings store — ဒီ part က ဖတ်; run မှာ snapshot) ──
+// payroll.period_type (company, default 1 MONTHLY — D-PAYR-01)
+// payroll.late_grace_minutes · payroll.late_deduction_mode (0 OFF · 1 FIXED_PER_OCCURRENCE · 2 PER_MINUTE) · payroll.late_deduction_amount · payroll.late_count_to_absent (0 OFF) — D-PAYR-05 v5.1
+// payroll.absent_daily_rate_basis (1 BASIC_30 · 2 BASIC_26 · 3 SCHEDULED_DAYS) · payroll.absent_deduction_enabled · payroll.unpaid_leave_deduction_enabled
+// payroll.branch_allocation_basis (1 ATTENDANCE_HOURS default · 2 SCHEDULED_HOURS · 3 MANUAL_PERCENT — D-PAYR-08) · employee manual % = Part 8 setting per employee
+// attendance.gps_required (default true) · attendance.qr_required (default true) · attendance.auto_clock_out_after_shift_minutes (D-ATT-04) — OPEN-19 ★
+// Permission: payroll.manage · payroll.finalize · payroll.pay · commission.manage · attendance.manual · attendance.correct · attendance.resolve · receivable.issue

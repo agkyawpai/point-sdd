@@ -1,11 +1,11 @@
 {
   "projects": [
     {
-      "id": "point-barber-app",
+      "id": "point-barber",
       "canonical": "Point Barbershop App",
-      "role": "Staff app, admin and customer booking site",
-      "tech": "TBD",
-      "path": "D:/point_flow/<app-repo-folder>"
+      "role": "Staff app, admin panel and customer website with online booking",
+      "tech": "NestJS + Prisma + PostgreSQL 16 (apps/api) · Next.js 16 (apps/web) · pnpm + Turborepo — ADR-001",
+      "path": "../point-barber"
     }
   ]
 }

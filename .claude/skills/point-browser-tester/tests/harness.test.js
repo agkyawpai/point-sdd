@@ -224,6 +224,121 @@ describe('credentials and sanitizing', () => {
   });
 });
 
+describe('passwordless sign-in', () => {
+  const requestTime = Date.now(); // `after` must be recent, so the fixture times are relative to the test run
+  const created = (offsetMs) => new Date(requestTime + offsetMs).toISOString();
+  const mailpit = (messages, bodies) => async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/api/v1/search') return { ok: true, status: 200, json: async () => ({ messages }) };
+    const id = decodeURIComponent(parsed.pathname.split('/').pop());
+    return { ok: true, status: 200, json: async () => bodies[id] };
+  };
+
+  test('getLoginEmail reads POINT_TEST_<PROFILE>_EMAIL and needs no password', async () => {
+    const email = await harness.getLoginEmail('barber', { env: { POINT_TEST_BARBER_EMAIL: 'aung@point.test' }, prompt: noPrompt });
+    assert.equal(email, 'aung@point.test');
+    assert.equal(await harness.getLoginEmail('admin', { env: { POINT_TEST_ADMIN_USER: 'kyawzin@point.test' }, prompt: noPrompt }), 'kyawzin@point.test');
+  });
+
+  test('getLoginEmail rejects a missing or malformed address', async () => {
+    await assert.rejects(harness.getLoginEmail('admin', { env: {}, prompt: noPrompt }), (error) => error.code === 'CREDENTIALS_UNAVAILABLE');
+    await assert.rejects(harness.getLoginEmail('admin', { env: { POINT_TEST_ADMIN_EMAIL: 'not-an-address' }, prompt: noPrompt }), (error) => error.code === 'CREDENTIALS_UNAVAILABLE');
+  });
+
+  const to = (address) => [{ Name: '', Address: address }];
+  const fakeRun = () => ({ secretValues: [] });
+
+  test('fetchLoginCode returns the newest 8-digit code sent after the request time', async () => {
+    const fetchImpl = mailpit(
+      [{ ID: 'old', Created: created(-60000), To: to('aung@point.test') }, { ID: 'new', Created: created(2000), To: to('aung@point.test') }, { ID: 'mid', Created: created(1000), To: to('aung@point.test') }],
+      { old: { Text: 'Your code is 11112222' }, new: { Text: 'Your Point sign-in code is 87654321. It expires in 5 minutes.' }, mid: { Text: 'Code 33334444' } },
+    );
+    const run = fakeRun();
+    const code = await harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), run, mailpitUrl: 'http://mailpit.test:8025/', fetchImpl, sleep: async () => {} });
+    assert.equal(code, '87654321');
+    assert.deepEqual(run.secretValues, ['87654321']);
+  });
+
+  test('fetchLoginCode ignores numbers that are not exactly 8 digits', async () => {
+    const fetchImpl = mailpit([{ ID: 'a', Created: created(1000), To: to('aung@point.test') }], { a: { Text: 'Ref 123456789 and phone 0977123456, code 12345678.' } });
+    assert.equal(await harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl, sleep: async () => {} }), '12345678');
+  });
+
+  test('fetchLoginCode refuses to run without `after` (an older code must never be typed)', async () => {
+    const fetchImpl = mailpit([{ ID: 'old', Created: created(-60000), To: to('aung@point.test') }], { old: { Text: 'Your code is 11112222' } });
+    await assert.rejects(harness.fetchLoginCode({ email: 'aung@point.test', run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl }), (error) => error.code === 'BAD_ARGUMENT');
+    for (const bad of ['not a date', '', 0, true, false, '2026', created(-11 * 60 * 1000)]) {
+      await assert.rejects(harness.fetchLoginCode({ email: 'aung@point.test', after: bad, run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl }), (error) => error.code === 'BAD_ARGUMENT', `after = ${JSON.stringify(bad)}`);
+    }
+  });
+
+  test('fetchLoginCode refuses to run without `run` (the code must be redacted)', async () => {
+    const fetchImpl = mailpit([{ ID: 'a', Created: created(1000), To: to('aung@point.test') }], { a: { Text: 'Your code is 24681357' } });
+    await assert.rejects(harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), mailpitUrl: 'http://mailpit.test:8025', fetchImpl }), (error) => error.code === 'BAD_ARGUMENT');
+  });
+
+  test('fetchLoginCode reads only mail addressed exactly to the e-mail', async () => {
+    const fetchImpl = mailpit(
+      [{ ID: 'other', Created: created(3000), To: to('admin@point.test') }, { ID: 'mine', Created: created(1000), To: [{ Name: 'Ko Min', Address: 'Min@point.test' }] }, { ID: 'none', Created: created(4000) }],
+      { other: { Text: 'Your code is 99998888' }, mine: { Text: 'Your code is 12121212' }, none: { Text: 'Your code is 55556666' } },
+    );
+    assert.equal(await harness.fetchLoginCode({ email: 'min@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl, sleep: async () => {} }), '12121212');
+  });
+
+  test('fetchLoginCode reads an HTML-only message with its tags removed', async () => {
+    const fetchImpl = mailpit([{ ID: 'h', Created: created(1000), To: to('aung@point.test') }], { h: { Text: '', HTML: '<style>.c{width:12345678px}</style><p>Your code</p><p><b>4455</b><b>6677</b> 44556677</p>' } });
+    assert.equal(await harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl, sleep: async () => {} }), '44556677');
+  });
+
+  test('fetchLoginCode polls, then fails with CREDENTIALS_UNAVAILABLE when nothing arrives', async () => {
+    let clock = 0;
+    let polls = 0;
+    const fetchImpl = async () => { polls += 1; return { ok: true, status: 200, json: async () => ({ messages: [] }) }; };
+    await assert.rejects(
+      harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl, timeoutMs: 3000, intervalMs: 1000, now: () => clock, sleep: async (ms) => { clock += ms; } }),
+      (error) => error.code === 'CREDENTIALS_UNAVAILABLE',
+    );
+    assert.equal(polls, 4); // at 0 s, 1 s, 2 s and 3 s
+  });
+
+  test('fetchLoginCode needs the Mailpit address and reports a Mailpit error', async () => {
+    const args = { email: 'aung@point.test', after: created(0), run: fakeRun() };
+    await assert.rejects(harness.fetchLoginCode({ ...args, mailpitUrl: '', fetchImpl: async () => ({}) }), (error) => error.code === 'CREDENTIALS_UNAVAILABLE');
+    const failing = async () => ({ ok: false, status: 502, json: async () => ({}) });
+    await assert.rejects(harness.fetchLoginCode({ ...args, mailpitUrl: 'http://mailpit.test:8025', fetchImpl: failing }), (error) => error.code === 'CREDENTIALS_UNAVAILABLE');
+  });
+
+  test('fetchLoginCode turns a network failure into CREDENTIALS_UNAVAILABLE (case = BLOCKED, not a crash)', async () => {
+    const args = { email: 'aung@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025' };
+    const down = async () => { throw new TypeError('fetch failed'); };
+    await assert.rejects(harness.fetchLoginCode({ ...args, fetchImpl: down }), (error) => error.name === 'HarnessError' && error.code === 'CREDENTIALS_UNAVAILABLE');
+    const notJson = async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <'); } });
+    await assert.rejects(harness.fetchLoginCode({ ...args, fetchImpl: notJson }), (error) => error.code === 'CREDENTIALS_UNAVAILABLE');
+  });
+
+  test('fetchLoginCode gives every Mailpit request a timeout signal', async () => {
+    const seen = [];
+    const inner = mailpit([{ ID: 'a', Created: created(1000), To: to('aung@point.test') }], { a: { Text: 'Your code is 24681357' } });
+    const fetchImpl = async (url, options) => { seen.push(options && options.signal); return inner(url); };
+    await harness.fetchLoginCode({ email: 'aung@point.test', after: created(0), run: fakeRun(), mailpitUrl: 'http://mailpit.test:8025', fetchImpl, sleep: async () => {} });
+    assert.equal(seen.length, 2);
+    for (const signal of seen) assert.ok(signal instanceof AbortSignal);
+  });
+
+  test('the e-mail and the code never reach results or diagnostics', async () => {
+    const run = await createRun(baseOptions());
+    const email = await harness.getLoginEmail('barber', { env: { POINT_TEST_BARBER_EMAIL: 'hidden-barber@point.test' }, run, prompt: noPrompt });
+    const fetchImpl = mailpit([{ ID: 'a', Created: created(1000), To: [{ Name: '', Address: email }] }], { a: { Text: 'Your code is 24681357' } });
+    const code = await harness.fetchLoginCode({ email, after: created(0), run, mailpitUrl: 'http://mailpit.test:8025', fetchImpl, sleep: async () => {} });
+    recordConsole(run, { type: 'error', text: `code ${code} refused for ${email}` });
+    addCaseResult(run, { caseNo: 1, status: 'FAIL', observed: `Typed ${code} for ${email}` });
+    await finalizeRun(run);
+    const everything = [fs.readFileSync(run.resultsPath, 'utf8'), fs.readFileSync(run.summaryPath, 'utf8'), readDiagnostics(run, 'console.jsonl')].join('\n');
+    assert.doesNotMatch(everything, /24681357|hidden-barber@point\.test/);
+    assert.match(everything, /\[REDACTED\]/);
+  });
+});
+
 describe('mutation approval', () => {
   const quiet = { env: {}, argv: [] };
 

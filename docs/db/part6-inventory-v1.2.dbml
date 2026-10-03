@@ -1,0 +1,259 @@
+// Point Barbershop — Part 6: Inventory · v1.2 🔒 D-DB-10 (30/Sep/2026 · v1.2 = 02/Oct/2026)
+// v1 → v1.1 (Part 7 ဆွဲချိန်): purchases.expense_id ဖြုတ် — purchase ၁ ခု branch အများကြီး ⇒ expense အများကြီး (branch P&L — D-FIN-05) ⇒ link = expenses.purchase_id + branch_id (Part 7)
+// v1.1 → v1.2 (02/Oct/2026 — G (owner one-sheet 02/Oct 00:06) · G (c)): stock_movements.client_request_id (uuid NULL) + partial unique (constraints v1.1) —
+//   barber "သုံးကုန်" (P6.STK.05) / manual adjust (P6.STK.07) ၂ ခါ နှိပ်မိ ကာ (API P6-RULE-06 / 12) · append-only trigger မပြောင်း (key = INSERT မှာပဲ)
+// Part 1 (D-DB-02) + 2 (D-DB-06) + 4 (D-DB-08 — sale_items / refund_items) ပေါ်မှာ ဆောက် — dbdiagram မှာ part1–5 နဲ့ တွဲ paste
+// 🔒 D-STK-01..06 (v5.1: D-STK-03 transfer ၂ ဆင့် — REC-14), D-PAY-03 (product sale), D-DAT-05, D-NTF-01 / 03 (low stock noti), D-ORG-03, D-DB-01 / 03 / 04, D-PLT-15
+// Status / type = smallint + CHECK (D-DB-03) · CHECK / partial unique / FK = part6-inventory-v1-constraints.sql
+// F-P6-nn = review finding (§6.4f) — D-DB-10 နဲ့ approve ပြီး
+// Part 4 ရဲ့ sale_items.product_id → products FK ကို ဒီ part ရဲ့ SQL မှာ ထည့် (§6.5 #9 future FK ပြေ)
+// ငွေ / stock ledger (stock_movements, purchases) ပြောင်းတိုင်း DB trigger → audit_events (Part 8 — D-AUD-02)
+
+// ───────────────────────── Product master ─────────────────────────
+
+Table product_categories {
+  id uuid [pk, note: 'UUIDv7']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04']
+  name_en varchar(150)
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'F-P6-01 — service_categories ပုံစံတူ (Fresha product category) · (company_id, name_mm) unique (SQL)'
+}
+
+Table products {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03 — company master (branch stock = branch_stock_levels)']
+  category_id uuid [not null, ref: > product_categories.id]
+  name_mm varchar(200) [not null, note: 'D-DB-04']
+  name_en varchar(200)
+  sku varchar(50) [note: 'Barcode / code (optional) — company အတွင်း unique (SQL) · F-P6-02']
+  is_sellable boolean [not null, default: true, note: 'true = customer ကို ရောင်း (D-PAY-03) · false = ဆိုင်သုံးပဲ (ဆိုးဆေး / shampoo — D-STK-04 usage)']
+  sell_price_amount bigint [note: 'MMK — sellable ⇒ မဖြစ်မနေ (CHECK) · company-level (branch override ⏭) · sale line = snapshot (list_price)']
+  default_low_stock_threshold integer [note: 'D-STK-06 — branch_stock_levels.low_stock_threshold NULL ဆို ဒါ']
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '''
+  🔒 D-STK-01 — unit = pcs (column မလို) · (company_id, name_mm) unique (SQL) · archive ပဲ (D-DAT-05)
+  Sale: sale_items.product_id (Part 4) → FINISH မှာ stock_movements SALE_OUT · refund kind 1 product line → SALE_RETURN_IN
+  ကုန်ကျစရိတ် = purchase_items.unit_cost_amount (product မှာ standard cost မထား) · P&L = purchase = Part 7 expense (F-P6-03)
+  '''
+}
+
+Table suppliers {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name varchar(200) [not null, note: 'ပြောတဲ့အတိုင်း ၁ ခု (D-DB-04)']
+  phone varchar(50)
+  address text
+  notes text
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: 'D-STK-02 — supplier optional · (company_id, name) unique (SQL)'
+}
+
+// ───────────────────────── Stock balance + ledger (🔒 D-STK-06) ─────────────────────────
+
+Table branch_stock_levels {
+  id uuid [pk]
+  branch_id uuid [not null, ref: > branches.id]
+  product_id uuid [not null, ref: > products.id]
+  quantity_on_hand integer [not null, default: 0, note: 'pcs — Σ stock_movements (cache; app same transaction · ညတိုင်း recompute check — F-P6-04) · အနုတ် ဖြစ်နိုင် (ရိုက်ကျန်) — report flag']
+  low_stock_threshold integer [note: 'D-STK-06 — NULL → products.default_low_stock_threshold · ≤ ⇒ admin noti (Part 8)']
+  low_stock_notified_at timestamptz [note: 'Noti ထပ်မပို့အောင် — threshold အထက် ပြန်ရောက်ရင် NULL']
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, product_id) [unique]
+  }
+
+  Note: '🔒 D-STK-01 branch အလိုက် stock · row = product ကို ဒီ branch မှာ သုံး / ရောင်း'
+}
+
+Table stock_movements {
+  id uuid [pk]
+  client_request_id uuid [note: 'v1.2 G (c) — usage (P6.STK.05) / manual adjust (P6.STK.07) ရဲ့ Idempotency-Key (double tap — D-VIS-10) · တခြား movement (FINISH / post / receive / count) = NULL · partial unique (SQL)']
+  branch_id uuid [not null, ref: > branches.id]
+  product_id uuid [not null, ref: > products.id]
+  movement_type smallint [not null, note: '1 PURCHASE_IN · 2 TRANSFER_OUT · 3 TRANSFER_IN · 4 SALE_OUT · 5 SALE_RETURN_IN · 6 USAGE_OUT (D-STK-04) · 7 COUNT_ADJUST (D-STK-05) · 8 MANUAL_ADJUST (D-STK-05 reason)']
+  quantity_delta integer [not null, note: '≠ 0 · IN = + · OUT = − (CHECK type ⇔ sign)']
+  purchase_item_id uuid [ref: > purchase_items.id, note: 'PURCHASE_IN']
+  stock_transfer_item_id uuid [ref: > stock_transfer_items.id, note: 'TRANSFER_OUT / TRANSFER_IN']
+  sale_item_id uuid [ref: > sale_items.id, note: 'SALE_OUT (Part 4 — FINISH)']
+  refund_item_id uuid [ref: > refund_items.id, note: 'SALE_RETURN_IN (Part 4)']
+  stock_count_item_id uuid [ref: > stock_count_items.id, note: 'COUNT_ADJUST']
+  adjustment_reason_id uuid [ref: > stock_adjustment_reasons.id, note: 'MANUAL_ADJUST ⇒ မဖြစ်မနေ (D-STK-05) · USAGE_OUT optional']
+  note text [note: 'MANUAL_ADJUST / USAGE_OUT — free text']
+  occurred_at timestamptz [not null, note: 'တကယ် ဖြစ်ချိန်']
+  business_date date [not null, note: 'occurred_at ရဲ့ MMT ရက် (D-PLT-15)']
+  recorded_by_user_id uuid [not null, ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, product_id, occurred_at)
+    (movement_type, business_date)
+  }
+
+  Note: '''
+  🔒 D-STK-06 movement history — **append-only ledger** (UPDATE / DELETE ✖ — ပြင်ရင် movement အသစ်) · F-P6-05
+  🔒 D-STK-04 usage = တစ်ဘူးလုံး ကုန်မှ USAGE_OUT (qty −1 ပုံမှန်) — barber / staff ကိုယ့်ဖုန်းကနေ
+  Type ⇔ ref တစ်ခုပဲ (CHECK) · ref ၁ ခု movement ၁ ခု (partial unique — transfer item = OUT + IN ၂ ခု)
+  v1.2 (G c) — ref မရှိတဲ့ USAGE_OUT / MANUAL_ADJUST = client_request_id နဲ့ ၂ ခါ ကာ (partial unique — SQL)
+  '''
+}
+
+Table stock_adjustment_reasons {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04 — ဥပမာ ပျက်စီး / ပျောက် / ရိုက်မှား']
+  name_en varchar(150)
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE (disable ပဲ) · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: '🔒 D-STK-05 — admin manage · delete ✖ (archived_at မထား — disable ပဲ) · (company_id, name_mm) unique'
+}
+
+// ───────────────────────── Purchase (🔒 D-STK-02) ─────────────────────────
+
+Table purchases {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  supplier_id uuid [ref: > suppliers.id, note: 'Optional (D-STK-02)']
+  invoice_reference varchar(100) [note: 'Supplier ဘောင်ချာ နံပါတ် (optional)']
+  status smallint [not null, default: 1, note: '0 CANCELLED · 1 DRAFT (ပြင်ရ) · 2 POSTED (stock ဝင်ပြီ — immutable)']
+  total_amount bigint [not null, default: 0, note: 'Σ items (app) — MMK']
+  purchased_at timestamptz [not null, note: 'ဝယ်တဲ့ရက် (POSTED မှာ movement occurred_at)']
+  business_date date [not null, note: 'MMT']
+  posted_at timestamptz
+  posted_by_user_id uuid [ref: > users.id]
+  cancelled_at timestamptz
+  notes text
+  created_by_user_id uuid [not null, ref: > users.id]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (company_id, business_date)
+  }
+
+  Note: 'Header = company (branch ၁ ခု / အများကြီး = items မှာ branch — D-STK-02) · POSTED ⇒ items တိုင်း PURCHASE_IN movement (branch အလိုက်) · ကုန်ကျစရိတ် → Part 7 expenses.purchase_id (purchase × branch ၁ ခု — F-P6-03 / F-P7-05; v1.1: expense_id column ဖြုတ်)'
+}
+
+Table purchase_items {
+  id uuid [pk]
+  purchase_id uuid [not null, ref: > purchases.id]
+  branch_id uuid [not null, ref: > branches.id, note: 'ဒီ line ဘယ် branch stock ထဲ ဝင် (D-STK-02)']
+  product_id uuid [not null, ref: > products.id]
+  quantity integer [not null, note: '> 0 pcs']
+  unit_cost_amount bigint [not null, note: 'MMK ≥ 0 — ကုန်ကျစရိတ် history (product မှာ cost မထား)']
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (purchase_id, branch_id, product_id) [unique]
+  }
+
+  Note: 'line_total = quantity × unit_cost (generated — SQL)'
+}
+
+// ───────────────────────── Transfer (🔒 D-STK-03 v5.1 — ၂ ဆင့်) ─────────────────────────
+
+Table stock_transfers {
+  id uuid [pk]
+  from_branch_id uuid [not null, ref: > branches.id]
+  to_branch_id uuid [not null, ref: > branches.id, note: '≠ from (CHECK)']
+  status smallint [not null, default: 1, note: '0 CANCELLED (DRAFT ကနေပဲ) · 1 DRAFT (ပြင် / cancel ရ) · 2 SENT (ထွက်ပြီ — source −, in transit) · 3 RECEIVED (destination +)']
+  receiver_type smallint [not null, note: '1 EMPLOYEE (တစ်ယောက်) · 2 BRANCH_STAFF (to_branch ဝန်ထမ်း အားလုံး) — noti (D-STK-03)']
+  receiver_employee_id uuid [ref: > employees.id, note: 'EMPLOYEE ⇒ မဖြစ်မနေ (CHECK)']
+  notes text
+  created_by_user_id uuid [not null, ref: > users.id]
+  sent_at timestamptz [note: 'SENT ⇒ (CHECK) — TRANSFER_OUT movement occurred_at']
+  sent_by_user_id uuid [ref: > users.id]
+  received_at timestamptz [note: 'RECEIVED ⇒ (CHECK) — TRANSFER_IN movement']
+  received_by_user_id uuid [ref: > users.id]
+  cancelled_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (from_branch_id, status)
+    (to_branch_id, status)
+  }
+
+  Note: '''
+  🔒 D-STK-03 (v5.1 — REC-14): DRAFT → SENT → RECEIVED · SENT ပြီး items ပြင် ✖ (app) · in transit report = SENT
+  Receive = actual qty + ကွာချက် reason (items) · noti receiver (Part 8)
+  '''
+}
+
+Table stock_transfer_items {
+  id uuid [pk]
+  stock_transfer_id uuid [not null, ref: > stock_transfers.id]
+  product_id uuid [not null, ref: > products.id]
+  quantity_sent integer [not null, note: '> 0']
+  quantity_received integer [note: 'RECEIVED မှာ ဖြည့် (≥ 0) · ≠ sent ⇒ difference_reason (CHECK)']
+  difference_reason text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (stock_transfer_id, product_id) [unique]
+  }
+
+  Note: 'TRANSFER_OUT = −quantity_sent (from) · TRANSFER_IN = +quantity_received (to) · ကွာချက် = ပျောက် (from branch ခံ — report) F-P6-06'
+}
+
+// ───────────────────────── Stock count (🔒 D-STK-05) ─────────────────────────
+
+Table stock_counts {
+  id uuid [pk]
+  branch_id uuid [not null, ref: > branches.id]
+  status smallint [not null, default: 1, note: '0 CANCELLED · 1 IN_PROGRESS · 2 POSTED (ကွာချက် movement ထုတ်ပြီ — immutable)']
+  started_at timestamptz [not null]
+  started_by_user_id uuid [not null, ref: > users.id]
+  posted_at timestamptz
+  posted_by_user_id uuid [ref: > users.id]
+  cancelled_at timestamptz
+  notes text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, started_at)
+  }
+
+  Note: 'Branch ၁ ခု IN_PROGRESS count ၁ ခုပဲ (partial unique) · POSTED ⇒ items ကွာချက် ≠ 0 တိုင်း COUNT_ADJUST movement'
+}
+
+Table stock_count_items {
+  id uuid [pk]
+  stock_count_id uuid [not null, ref: > stock_counts.id]
+  product_id uuid [not null, ref: > products.id]
+  expected_quantity integer [not null, note: 'Count စချိန် quantity_on_hand snapshot']
+  counted_quantity integer [note: 'ရေတဲ့ အရေအတွက် (≥ 0) — NULL = မရေရသေး (POSTED ⇒ NOT NULL — app)']
+  adjustment_reason_id uuid [ref: > stock_adjustment_reasons.id, note: 'ကွာချက် ≠ 0 ⇒ optional reason (D-STK-05)']
+  note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (stock_count_id, product_id) [unique]
+  }
+
+  Note: 'difference = counted − expected (generated — SQL)'
+}
+
+// ── Setting (Part 8) ──
+// stock.low_stock_notify_roles (company — D-NTF-03 ငွေ / ပစ္စည်း ကိစ္စ → admin)
+// Permission: product.manage · purchase.manage · purchase.post · transfer.create · transfer.send · transfer.receive · stock.usage (barber default ✔) · stock.adjust · stock.count

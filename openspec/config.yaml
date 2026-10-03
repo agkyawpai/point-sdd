@@ -1,0 +1,140 @@
+schema: spec-driven
+
+# Point Barbershop — OpenSpec project context (🔒 D-PLT-17 · D-PLT-20 · ADR-016)
+# OpenSpec CLI pinned at 1.14.0 (see SETUP.md). This repo is the OpenSpec store "point-sdd";
+# the app repo ../point-barber points at it with `store: point-sdd`.
+
+context: |
+  PROJECT
+  Point Barbershop System: 3 branches (B1, B2, B3), ~15 staff, one company. Staff/admin PWA + public
+  website with a booking modal + Android / Windows shells. One NestJS API, one PostgreSQL 16 database,
+  one Next.js app (ADR-001). V1 = every locked decision, no release split (D-PLT-14).
+
+  TWO REPOSITORIES (ADR-016) — workspace folder `point/` holds both, side by side:
+    point/point-sdd     this repo: specs, briefs, planning sources, test-case tools. No application code.
+    point/point-barber  application code, migrations, unit / integration / e2e tests, coding guideline.
+  Every code task in tasks.md names the repo it is done in. Code is never written in point-sdd.
+
+  SOURCES OF TRUTH — precedence, highest first. A conflict between two sources, or between two locked
+  decisions, is never resolved by the author: STOP, describe both sides, ask the owner (D-PLT-13).
+    1. docs/decisions/decision-register.md      🔒 rows only. ⚠️ recommendations and 🟡 open items are
+                                                 NOT requirements until the owner approves (D-PLT-11).
+    2. docs/db/                                  DBML + constraint SQL + tests (91 tables, all locked).
+    3. docs/ux/admin-panel.md (AD-…)             every screen behind login.
+       docs/ux/frontend-website.md (FE-…)        public website + booking modal.
+    4. docs/api/00-conventions.md (API-…), docs/api/01..08-*.md (P1.… … P8.…, Pn-RULE-nn),
+       docs/api/openapi/*.yaml
+    5. docs/adr/ADR-001..016, docs/architecture/system-design.md
+    6. ../point-barber/design-reference/         images: visual reference only, never a rule.
+    7. Fresha                                    reference only (D-PLT-09). The admin panel follows
+                                                 Fresha's layout about 80 % but must be easier to use.
+  docs/decisions/point-barbershop-system-review-*.md is the full planning record (about 1 MB). Read
+  decision-register.md first; open the review only for a section a decision row points to.
+
+  WHAT A SPEC MAY CONTAIN
+  Only behaviour that a locked source already states. A spec never adds, widens or narrows a business
+  rule. If a needed behaviour is in no locked source, write it under "Open questions" in the proposal
+  and stop — do not invent a default. Colours, logos and fonts are never invented (D-UX-02): tokens
+  come from ../point-barber/packages/ui/tokens.css.
+
+  FIXED CONVENTIONS (do not restate them as new decisions; cite the ID)
+  - Money: whole MMK, integer end to end, never float (D-PLT-04, API-DATA-02). App shows `7,000 ကျပ်` /
+    `7,000 Ks`; the public website shows `7,000 Ks` in both languages.
+  - Time: Asia/Yangon (UTC+06:30). `*_at` = timestamptz, `business_date` = Myanmar calendar date
+    (D-PLT-15). Display `05/Oct/2026`, `2:30 PM`, digits 0-9 in both languages (D-PLT-05).
+  - Text: every UI string comes from the language files (my, en); receipts are always English (D-PLT-03).
+  - Status / type values are smallint codes with named constants (D-DB-03).
+  - Access = permission AND data-level scope, enforced in the API (D-ROLE-03, ADR-011, ADR-012).
+    Permission codes are CRUD per menu (view / create / update / delete) plus named special actions;
+    there is no `manage` code. Levels: company / branch / mixed / shared / private.
+  - Transactional rows are never hard-deleted (D-DAT-05). Finished sales, payments and closings are
+    immutable; corrections are new rows with a reason (D-VIS-08).
+  - Row-creating money endpoints require `Idempotency-Key` (API-IDEM-01); state changes are idempotent
+    by state check.
+  - Errors: RFC 9457 problem details; `code` is the language key (API-ERR-01).
+
+  CAPABILITIES — the only allowed folder names under openspec/specs/ (one business area each):
+    auth                 login (Google, e-mail OTP), sessions, devices, CSRF
+    access               roles, permission codes, data-level scope, guards, /me grants
+    organization         company, branches, employees, branch assignment
+    services-pricing     categories, services, options, prices, eligibility, price quote
+    scheduling           patterns, shifts, availability
+    leave                leave types, requests, approval
+    customers            customer records, preferred barber, history
+    booking              staff + public booking, reschedule, cancel, no-show
+    visits               START, lines, COMPLETE, INCOMPLETE, late entry, proxy recording
+    sales-checkout       sale totals, FINISH, receipt number, receipt document, difference sale
+    payments             cash, KBZPay, split, change, verification, payment methods
+    discounts            discount codes, discount requests and approval
+    refunds              refunds, overpayment returns, sale adjustments
+    inventory            products, suppliers, stock, purchases, transfers, counts, usage
+    finance-closing      daily closing, cash out / return, expenses, incomes, P&L
+    commission-payroll   commission plans, payroll runs, payslips, receivables
+    attendance           clock in / out, QR + GPS, exceptions
+    settings             settings store, additional settings, maintenance mode
+    website              public pages, site content, opening hours, closures, booking QR
+    notifications        in-app notifications, approvals inbox, realtime delivery
+    reports-dashboards   the 10 reports, dashboards, KPIs, exports of reports
+    audit                audit events, audit log screen
+    data-management      import, export, backup / restore, attachments and files
+    platform-runtime     API shape, error format, health / status, origins and routing, request ids,
+                         idempotency contract, background jobs
+    ui-foundation        design tokens, formatters, language files, shared components, app shell
+  All 25 are approved by the owner (18 named by the owner, 5 approved on sheet 2, the last two approved
+  on sheet 3 - review 0.11 item S3, 02/Oct/2026).
+  A requirement lives in exactly one capability. A new capability needs the owner's approval.
+
+  CHANGE SIZE AND NAMING
+  One change = one form or one topic (Branch, Employee, Service, Discount request, …), 1–3 days of
+  work, reviewable in one sitting, about 20–30 test cases (D-PLT-20). Name = verb + feature:
+  add-…, change-…, remove-…, fix-…. A change lists the changes it depends on.
+
+  SCENARIO FIXTURE
+  Scenarios use the people, branches, services and prices of docs/plan/spec-fixtures.md so that every
+  change tells one consistent story and the test-case generator can reuse the same data.
+
+  LANGUAGE
+  Artifacts are written in English (requirement keywords SHALL / MUST, WHEN / THEN). Each proposal
+  starts with a short Myanmar summary for the owner (`## မြန်မာ အတိုချုပ်`).
+
+rules:
+  proposal:
+    - "Start with `## မြန်မာ အတိုချုပ်` (3–6 plain lines: what the owner gets, what is not included)."
+    - "List `Implements:` decision IDs, API endpoint IDs, UX rule IDs and ADR IDs the change covers."
+    - "State `Depends on:` (changes that must be archived or merged first) and `Repos:` touched."
+    - "Include `## Non-goals` naming what is deliberately left for a later change, with that change's name when known."
+    - "Include `## Open questions` with the blocks `### Needs the owner's answer` and `### Recorded readings` (and `### Answered by the owner` once answered). While `Needs the owner's answer` holds an item, the change is not applied at all - no task group starts (D-PLT-13)."
+    - "Name the developer role that owns it (Dev 1 or Dev 2) as proposed in docs/plan/roadmap.md."
+  specs:
+    - "Capability folder names come only from the CAPABILITIES list in the project context."
+    - "Every requirement title ends with its source IDs in brackets, e.g. `### Requirement: One pending discount request per sale (D-PAY-04 · P4.DRQ.01 · AD-POS-09)`."
+    - "Every requirement body has at least one SHALL / MUST sentence that states the actual value, limit, status or message key. A sentence that only points to an ID (`as defined in D-PAY-04`) is not a requirement."
+    - "One requirement = one rule that can be judged true or false on its own. Split compound rules."
+    - "Every requirement has at least one `#### Scenario:`; rules with a limit also get the boundary scenarios (at the limit, just outside it)."
+    - "Scenarios use concrete fixture data: named people and branches, amounts in MMK, dates and times in MMT, statuses by constant name with the code, exact error `code` values and HTTP statuses."
+    - "Expected results state the value, not the direction: `total_amount = 13,000` — not `the total goes up`. Show the arithmetic for a calculated number."
+    - "State who may do it: the permission code and its level, or the own-record rule."
+    - "Never copy long passages from the sources; one precise sentence plus the ID is the pattern."
+    - "MODIFIED requirements repeat the whole requirement with all its scenarios."
+  design:
+    - "Write design.md only for decisions the sources leave to the implementer; cite the ADR that bounds each one. Do not re-decide an ADR."
+    - "Name the tables (docs/db), endpoints (docs/api) and shared components (AD-IMPL-02) used. A DB change is made in docs/db first, with a version bump and a register note."
+    - "List module service interfaces the change introduces or calls (ADR-001 rule 1) and the lock order it follows (API-IDEM-06)."
+    - "State risks and how each is covered by a test."
+  tasks:
+    - "Each task is at most 2 hours and names its repo: `(point-barber)` or `(point-sdd)`."
+    - "Group order: data / migration → API (tests first for money, permission and date-boundary rules) → web → e2e → verification."
+    - "Each task cites the requirement or source ID it satisfies."
+    - "The last group is always verification: lint + typecheck + unit + integration + e2e green, `/point-generate-tests <change>`, NG fixed, then archive."
+    - "A task never says `etc.` or `as needed`."
+
+operations:
+  apply:
+    guidance:
+      - "Run from point-barber (the pointer repo). Follow ../point-barber/CLAUDE.md and docs/engineering/coding-guideline.md (CG-…)."
+      - "If the code needs behaviour the spec does not state, stop and fix the spec in point-sdd first."
+      - "Cite the change id, decision IDs and rule IDs in commits and the PR description."
+  archive:
+    guidance:
+      - "Archive only after the PR is merged and the test workbook has no open NG."
+      - "Never edit openspec/specs/ by hand; it changes only through archive."

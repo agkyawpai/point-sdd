@@ -1,0 +1,6255 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 8 · Platform
+  version: 1.0.0
+  summary: Notifications, attachments, employee documents, audit log, import, export, backups, website management, public site, reports, dashboards
+  description: 'Design document for Part 8 (docs/api/08-platform.md). Conventions: docs/api/00-conventions.md (v1.5 — incl. the idempotency wording of contract 15).
+
+    v1.0 (02/Oct, batch consistency pass — no version bump): notification catalogue re-checked against Parts 1–7; attention cards + negative stock / counts in progress; this part''s
+    research items written "research E…" (owner E3 / E6 = the sheet''s Part 7 answers). Fix-up 02/Oct (batch v5.2.15): EMPLOYEE_BALANCE cash-out audit rows = pay rows and report ⑤ masks
+    the staff-advance taker (owner C1 + D-FIN-06); public site responses Cache-Control public, max-age=10 (ADR-006 ~10 s target); backup.failed / job.failed basis D-DAT-03 + contract
+    14. Review fixes 02/Oct (independent review, 29 findings — docs §20; no version bump): closure archive = future only; import DTO fields mapped to the real columns; import_too_many_rows
+    = a FAILED job message, not an HTTP error; public media own limit 600 / min / IP and Cache-Control public, max-age=86400 + ETag; two internal secrets (INTERNAL_SSR_KEY for SSR calls,
+    INTERNAL_OPS_KEY for /internal/*) and P8.INT.01 kinds 1–3; Attachment.mime_type; dashboard tile schema; /backups/* usable during maintenance by backup.restore holders.
+
+    Reconcile 02/Oct (cross-part reconcile — no version bump): closure archive allowed while start_date ≥ today; an audit.view holder always sees the rows they authored, employee-targeted
+    rows carry the primary branch of the employee; EMPLOYEE_BALANCE cash-out audit rows and the report ⑤ taker = company-scope payroll.view or receivable.issue.
+
+    Decisions served: D-NTF-01..03, D-AUD-01/02, D-DAT-01..05, D-WEB-01..04, D-UX-05, D-RPT-01, D-KPI-01..03, D-DSH-01..04, D-EMP-03, D-FIN-03, D-PLT-03/04/05/07/08/15/16, D-ROLE-02/03/07/08/09
+    (ADR-011, ADR-012 + contract 1 private level), D-DB-12, ADR-002 / 006 / 007 / 009 / 013 / 014 / 015.
+
+    Status: 🔒 LOCKED v1.0 — D-API-09 (owner one-sheet "အကုန်လုံး OK", 02/Oct/2026 00:06 — F1–F12, G (e), H). DB Part 8 v1.1 (backup_runs_restore_chk: RESTORE_TEST may have performed_by_user_id
+    null; attachments_deleted_chk: deleted_at with deleted_by_user_id null = system clean-up).
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "any staff (read scope)" = operational, no code; "self" = own rows; "public"
+    = no session (security: []); "internal" = X-Internal-Key carrying INTERNAL_OPS_KEY, Docker network only (ADR-009). Levels per ADR-012 + contract 1: site content, notification types,
+    backups, imports = company master (backup and import reads need company scope too); hours, closures, reports ①–⑤ ⑧–⑩ = branch data; website.* = mixed (owner F7); audit.view = branch
+    (branch-less rows company scope, pay / document rows private — owner F10); report ⑦ and employee.documents = private; data.export = mixed on top of the source''s read right (owner
+    F2).
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating staff operations need X-Requested-With: point-app (API-AUTH-02). No operation of this part needs an Idempotency-Key
+    (no money rows); actions are idempotent by state.
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; business dates MMT; status / type = smallint codes (D-DB-03); errors = RFC 9457 problem+json with code
+    = language key; binary responses (exports, templates, error rows, media) are the only non-JSON bodies besides the multipart upload.'
+servers:
+- url: /api/v1
+  description: Same origin as the app — Caddy routes /api/* to NestJS (ADR-009)
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: notifications
+  description: Bell — own notifications (D-NTF-01/02) — self
+- name: notification-types
+  description: Notification types enable / disable (D-NTF-03) — company master
+- name: attachments
+  description: Staging uploads, metadata, signed URLs, removal (ADR-014) — policy = the owning entity
+- name: employee-documents
+  description: Staff documents (D-EMP-03, owner F11) — private
+- name: audit
+  description: Audit-log viewer (D-AUD-01/02, owner F10) — branch rows / company / private
+- name: imports
+  description: Import upload → map → validate → preview → confirm (D-DAT-01, owner F5) — company master
+- name: exports
+  description: Excel / CSV / PDF exports and posters (D-DAT-02, owner F2 / F3)
+- name: backups
+  description: Backup runs and restore authorisation (D-DAT-03/04, owner F9) — company master
+- name: internal
+  description: Backup sidecar / restore script reports (ADR-002, ADR-009) — internal key
+- name: website
+  description: Website management (D-WEB-01..04, owner F7 / F8) — mixed
+- name: public-site
+  description: Public site data and media (API-PUB-01..03) — no session
+- name: reports
+  description: The 10 reports (D-RPT-01, owner F1 / F6) — one code per report
+- name: dashboards
+  description: Dashboards and approval counts (D-DSH-01..04)
+security:
+- sessionCookie: []
+paths:
+  /notifications:
+    get:
+      tags:
+      - notifications
+      operationId: notificationList
+      summary: Bell — my notifications (P8.NTF.01) — 🔒 D-NTF-01, AD-NTF-01
+      x-permission: self
+      description: Newest first; deleted rows excluded; rows older than 90 days are purged (D-NTF-02). The client renders template_key + payload in the viewer's language (D-PLT-03).
+      parameters:
+      - name: unread
+        in: query
+        schema:
+          type: boolean
+        description: true = unread only
+      - name: category
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            - 6
+            description: 1 BOOKING · 2 STAFF · 3 MONEY · 4 STOCK · 5 PAYROLL · 6 SECURITY (D-NTF-03)
+        description: Repeatable
+        style: form
+        explode: true
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Notification'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                  unread_count:
+                    type: integer
+                required:
+                - items
+                - next_cursor
+                - unread_count
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /notifications/unread-count:
+    get:
+      tags:
+      - notifications
+      operationId: notificationUnreadCount
+      summary: Unread count (P8.NTF.02)
+      x-permission: self
+      description: Exact count; the UI caps the badge at 99+.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                required:
+                - count
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /notifications/{id}/read:
+    post:
+      tags:
+      - notifications
+      operationId: notificationRead
+      summary: Mark one read (P8.NTF.03)
+      x-permission: self
+      description: 'Idempotent — already read → 200 unchanged. Realtime notification.updated { change: "read" }. Another user''s id → 404.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /notifications/read-all:
+    post:
+      tags:
+      - notifications
+      operationId: notificationReadAll
+      summary: Mark all read (P8.NTF.04)
+      x-permission: self
+      description: Every unread row created ≤ up_to (default now). Realtime notification.read_all.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadAllRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated_count:
+                    type: integer
+                  unread_count:
+                    type: integer
+                required:
+                - updated_count
+                - unread_count
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /notifications/{id}:
+    delete:
+      tags:
+      - notifications
+      operationId: notificationDelete
+      summary: Delete my notification (P8.NTF.05) — 🔒 D-NTF-02
+      x-permission: self
+      description: 'Realtime notification.updated { change: "deleted" }.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '204':
+          description: Deleted (soft — deleted_at); repeat → 204
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /notification-types:
+    get:
+      tags:
+      - notification-types
+      operationId: notificationTypeList
+      summary: Notification types (P8.NTT.01) — AD-NTF-02
+      x-permission: notification.view+ (company master — read-only at branch scope)
+      description: Mandatory types carry a lock; categories and recipients are read-only. Archived types (removed from notifications.json) are excluded.
+      parameters:
+      - name: category
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            - 6
+            description: 1 BOOKING · 2 STAFF · 3 MONEY · 4 STOCK · 5 PAYROLL · 6 SECURITY (D-NTF-03)
+        description: Repeatable
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotificationType'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /notification-types/{code}:
+    patch:
+      tags:
+      - notification-types
+      operationId: notificationTypeUpdate
+      summary: Enable / disable a type (P8.NTT.02) — 🔒 D-NTF-03
+      x-permission: notification.update (company master — company scope)
+      description: Mandatory + enabled false → 409 notification_mandatory (DB CHECK notification_types_mandatory_chk); 409 conflict. Company-level only — no per-user mute (research E12).
+        Audit notification_type.enable / disable.
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$
+        description: notifications.json code
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationTypeUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationType'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /attachments:
+    post:
+      tags:
+      - attachments
+      operationId: attachmentUpload
+      summary: Upload a file — staging row (P8.ATT.01) — ADR-014
+      x-permission: any staff (self — staging)
+      description: 'Staging row (entity_type uploads, entity_id = the uploader, expires_at +24 h); type by magic bytes (image JPEG / PNG / WebP / HEIC→JPEG, document = + PDF, import
+        = CSV / XLSX — CSV has no signature: accepted when the content decodes as UTF-8 without NUL bytes or as UTF-16 with a BOM, review fix 02/Oct); EXIF / GPS stripped; WebP variants
+        400 / 800 / 1600. 422 file_too_large { max_mb } (setting system.upload_max_mb) · file_type_not_allowed { allowed }; 400 zawgyi_text for a Zawgyi file name (the client converts
+        — API-SHAPE-05). Linked later by the owning endpoint (Attachments.link / replace — 422 attachment_invalid).'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AttachmentUpload'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    get:
+      tags:
+      - attachments
+      operationId: attachmentList
+      summary: Files of one entity (P8.ATT.02)
+      x-permission: entity read right (P8-RULE-03 policy table)
+      description: 'Non-deleted files; no URLs (P8.ATT.04). Rows are filtered per (entity, kind) policy — entity_type employees: the photo (kind 2) for any staff, documents (kind 1)
+        only with company-scope employee.documents (private); rows the caller may not read are left out (review fix 02/Oct).'
+      parameters:
+      - name: entity_type
+        in: query
+        schema:
+          type: string
+        description: expenses · manual_incomes · employees · services · companies · site · sales · refunds · import_jobs
+        required: true
+      - name: entity_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Attachment'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /attachments/{id}:
+    get:
+      tags:
+      - attachments
+      operationId: attachmentGet
+      summary: File metadata (P8.ATT.03)
+      x-permission: entity read right (P8-RULE-03 policy table) or self (own staging row)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /attachments/{id}/url:
+    get:
+      tags:
+      - attachments
+      operationId: attachmentUrl
+      summary: Signed download URL (P8.ATT.04)
+      x-permission: entity read right (P8-RULE-03 policy table) or self (own staging row)
+      description: Presigned GET valid 5 minutes (ADR-014). Staff-document URLs are audited (employee.document_view — owner F11).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: variant
+        in: query
+        schema:
+          type: string
+          enum:
+          - original
+          - w400
+          - w800
+          - w1600
+          description: Image variant — WebP widths 400 / 800 / 1600 (contract 11)
+      - name: download
+        in: query
+        schema:
+          type: boolean
+        description: true = Content-Disposition attachment
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedUrl'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /attachments/{id}/remove:
+    post:
+      tags:
+      - attachments
+      operationId: attachmentRemove
+      summary: Remove a file (P8.ATT.05)
+      x-permission: entity remove right (P8-RULE-03 policy table) or self (own staging row)
+      description: Soft delete; reason required except for one's own staging row (400 reason_required); a file referenced by a single-image field → 409 attachment_in_use { field }; receipts
+        / exports / import files → 403; already deleted → 200. Audit attachment.remove.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemoveRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /employees/{id}/documents:
+    get:
+      tags:
+      - employee-documents
+      operationId: employeeDocumentList
+      summary: Staff documents (P8.DOC.01) — 🔒 D-EMP-03, owner F11
+      x-permission: employee.documents (private — company scope)
+      description: Kind-1 documents of the employee (any status). Branch-scope grant → 403 company_scope_required.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Attachment'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags:
+      - employee-documents
+      operationId: employeeDocumentAttach
+      summary: Attach staff documents (P8.DOC.02)
+      x-permission: employee.documents (private — company scope)
+      description: Staging uploads with purpose document; ≤ 20 per employee (422 attachment_invalid too_many). Audit employee.document_add. Remove = P8.ATT.05.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentAttach'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Attachment'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /audit-events:
+    get:
+      tags:
+      - audit
+      operationId: auditList
+      summary: Audit log (P8.AUD.01) — 🔒 D-AUD-01/02, AD-AUD-01
+      x-permission: 'audit.view (branch — rows of the grant''s branches and the rows the caller authored (actor_user_id = caller — reconcile 02/Oct); other branch-less rows company scope;
+        pay rows company-scope payroll.view — EMPLOYEE_BALANCE cash-out rows (owner C1 + D-FIN-06): payroll.view or receivable.issue; document rows company-scope employee.documents —
+        owner F10)'
+      description: Read-only — no write endpoint exists (append-only, DB role INSERT / SELECT). An audit.view holder always sees the rows they authored themselves in addition to the
+        rows of their branches (D-AUD-01); private rows (pay data, staff documents) keep their own rule. branch_id of an employee-targeted action = the acted-on branch, else the primary
+        branch of the employee (API-AUD-01). Hidden rows are left out (no count leak). Keyset cursor (occurred_at, id), newest first.
+      parameters:
+      - name: entity_type
+        in: query
+        schema:
+          type: string
+      - name: entity_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: actor_user_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: source
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: 1 APP · 2 DB_TRIGGER · 3 SYSTEM_JOB (D-AUD-02)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: action
+        in: query
+        schema:
+          type: string
+        description: Prefix match, e.g. sale.
+      - name: request_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT date on occurred_at; default today − 6
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today; ≤ 366 days (422 range_too_long)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEventListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /audit-events/{id}:
+    get:
+      tags:
+      - audit
+      operationId: auditGet
+      summary: Audit event detail (P8.AUD.02)
+      x-permission: 'audit.view (branch — rows of the grant''s branches and the rows the caller authored (actor_user_id = caller — reconcile 02/Oct); other branch-less rows company scope;
+        pay rows company-scope payroll.view — EMPLOYEE_BALANCE cash-out rows (owner C1 + D-FIN-06): payroll.view or receivable.issue; document rows company-scope employee.documents —
+        owner F10)'
+      description: Field-level changes with label keys, raw before / after (secrets redacted), related rows with the same request_id (visible only). Hidden row → 404.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEvent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /imports:
+    get:
+      tags:
+      - imports
+      operationId: importList
+      summary: Import jobs (P8.IMP.01)
+      x-permission: import.run (company master — company scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            - 4
+            description: 0 CANCELLED · 1 UPLOADED · 2 VALIDATED (preview) · 3 CONFIRMED · 4 FAILED (D-DAT-01)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: entity_type
+        in: query
+        schema:
+          type: string
+          enum:
+          - customers
+          - service_categories
+          - services
+          - product_categories
+          - products
+          - suppliers
+          - employees
+          description: Master data only — owner F5 (P8-RULE-07)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ImportJob'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - imports
+      operationId: importCreate
+      summary: Create an import (P8.IMP.03) — 🔒 D-DAT-01 step 1
+      x-permission: import.run (company master — company scope)
+      description: Links the staging file (kind 3), detects headers, suggested_mapping (Fresha aliases / template names). 422 attachment_invalid · import_file_unreadable; 400 validation.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /imports/templates/{entity_type}:
+    get:
+      tags:
+      - imports
+      operationId: importTemplate
+      summary: Download a template (P8.IMP.02)
+      x-permission: import.run (company master — company scope)
+      parameters:
+      - name: entity_type
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - customers
+          - service_categories
+          - services
+          - product_categories
+          - products
+          - suppliers
+          - employees
+          description: Master data only — owner F5 (P8-RULE-07)
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - xlsx
+          - csv
+        description: Default xlsx
+      responses:
+        '200':
+          description: Template — header row (current branch codes), example row, Read me sheet MM / EN
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="…"
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /imports/{id}:
+    get:
+      tags:
+      - imports
+      operationId: importGet
+      summary: Import job (P8.IMP.04)
+      x-permission: import.run (company master — company scope)
+      description: Status, processing (validating / confirming / null), headers, mapping, counts, error message, result.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /imports/{id}/mapping:
+    put:
+      tags:
+      - imports
+      operationId: importMapping
+      summary: Map columns (P8.IMP.05)
+      x-permission: import.run (company master — company scope)
+      description: Status 1 / 2 only (409 invalid_transition); a VALIDATED job returns to UPLOADED — validated_at cleared, counts reset, its import_job_rows deleted (staging data, not
+        transactions — P8-RULE-07, review fix 02/Oct); 422 import_mapping_incomplete { missing }.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportMapping'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /imports/{id}/validate:
+    post:
+      tags:
+      - imports
+      operationId: importValidate
+      summary: Validate (P8.IMP.06) — job import.run (validate)
+      x-permission: import.run (company master — company scope)
+      description: → 2 VALIDATED or 4 FAILED (error_message = import_too_many_rows / import_file_unreadable — the message of the FAILED job, not an HTTP error of this call); realtime
+        import.updated. Not UPLOADED → 409 invalid_transition; already queued → 202 same; no mapping → 422 import_mapping_incomplete.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '202':
+          description: Accepted — background job queued (API-SHAPE-04)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /imports/{id}/rows:
+    get:
+      tags:
+      - imports
+      operationId: importRows
+      summary: Preview rows (P8.IMP.07)
+      x-permission: import.run (company master — company scope)
+      description: Valid / Errors tabs; mapped_data and outcome per VALID row (create · reuse_existing · duplicate_in_file) are computed on read — the DB stores raw_data, status, errors
+        and, after confirm, entity_id (P8-RULE-07).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            description: 1 PENDING · 2 VALID · 3 ERROR · 4 IMPORTED · 5 SKIPPED
+        description: Repeatable
+        style: form
+        explode: true
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ImportRow'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /imports/{id}/error-rows:
+    get:
+      tags:
+      - imports
+      operationId: importErrorRows
+      summary: Download error rows (P8.IMP.08) — AD-IMP-01
+      x-permission: import.run (company master — company scope)
+      description: Not validated yet → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - csv
+          - xlsx
+        description: Default csv
+      responses:
+        '200':
+          description: Original columns + an Error column (current language)
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="…"
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /imports/{id}/confirm:
+    post:
+      tags:
+      - imports
+      operationId: importConfirm
+      summary: Confirm (P8.IMP.09) — job import.run (confirm)
+      x-permission: import.run (company master — company scope)
+      description: 'One transaction: VALID rows → IMPORTED / SKIPPED + import_source_refs, status 3; a DB error → 4 FAILED (nothing written). 409 invalid_transition (not VALIDATED);
+        422 import_no_valid_rows. Audit import.confirm.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: Already CONFIRMED — current state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '202':
+          description: Accepted — background job queued (API-SHAPE-04)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /imports/{id}/cancel:
+    post:
+      tags:
+      - imports
+      operationId: importCancel
+      summary: Cancel (P8.IMP.10)
+      x-permission: import.run (company master — company scope)
+      description: From UPLOADED / VALIDATED → 0 CANCELLED; CANCELLED → 200; others → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /exports:
+    post:
+      tags:
+      - exports
+      operationId: exportCreate
+      summary: Export / poster (P8.EXP.01) — 🔒 D-DAT-02, owner F2 / F3
+      x-permission: '@Staff() + export policy (API-PERM-02 handler policy — the code depends on kind / key): data.export (mixed) + the source screen''s read right (kinds report / list);
+        website.view+ (branch) for booking_qr_poster; attendance_qr.view+ (branch) for attendance_qr_poster'
+      description: P8-RULE-08. > 50,000 rows → 422 export_too_large { row_count, max_rows }; 422 range_too_long · report_timeout · date_in_future; 400 validation (unknown key, format
+        not allowed for the kind); 403 forbidden (context.required) · out_of_scope. CSV = UTF-8 with BOM + formula-injection guard; XLSX = exceljs; PDF = summary + ≤ 1,000 rows (DocumentRenderer).
+        Audit export.run.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportCreate'
+      responses:
+        '200':
+          description: CSV / XLSX ≤ 5,000 rows — streamed, nothing stored
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="…"
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+        '202':
+          description: Background export (> 5,000 rows or any PDF) — job export.run; realtime export.ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    get:
+      tags:
+      - exports
+      operationId: exportList
+      summary: My exports (P8.EXP.02)
+      x-permission: self
+      description: Background exports of the last 24 h, newest first.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Export'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /exports/{id}:
+    get:
+      tags:
+      - exports
+      operationId: exportGet
+      summary: Export status (P8.EXP.03)
+      x-permission: self
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /exports/{id}/url:
+    get:
+      tags:
+      - exports
+      operationId: exportUrl
+      summary: Signed download URL (P8.EXP.04)
+      x-permission: self
+      description: 5 minutes, download disposition; not completed / expired → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedUrl'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /backups:
+    get:
+      tags:
+      - backups
+      operationId: backupList
+      summary: Backup runs (P8.BAK.01) — 🔒 D-DAT-03, AD-BAK-01
+      x-permission: backup.view+ (company master — company scope for reads too; + = any backup code; usable during maintenance — API-AUTH-06)
+      parameters:
+      - name: kind
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            description: 1 DAILY (30 days) · 2 WEEKLY (1 year) · 3 RESTORE_TEST (monthly, automatic) · 4 RESTORE (D-DAT-03/04)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: '1 RUNNING (kind 4: authorised, waiting for the script) · 2 SUCCESS · 3 FAILED'
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BackupRun'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                  summary:
+                    $ref: '#/components/schemas/BackupSummary'
+                required:
+                - items
+                - next_cursor
+                - summary
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /backups/{id}:
+    get:
+      tags:
+      - backups
+      operationId: backupGet
+      summary: Backup run (P8.BAK.02)
+      x-permission: backup.view+ (company master — company scope for reads too; + = any backup code; usable during maintenance — API-AUTH-06)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /backups/{id}/restore:
+    post:
+      tags:
+      - backups
+      operationId: backupRestoreAuthorize
+      summary: Authorise a restore (P8.BAK.03) — 🔒 D-DAT-04, owner F9
+      x-permission: backup.restore (company master — company scope; usable during maintenance — API-AUTH-06)
+      description: P8-RULE-10. 422 backup_not_restorable { reason } · confirm_mismatch (typed date ≠ the run's MMT date); 409 restore_pending { run_id }; 400 reason_required. Notification
+        backup.restore_authorized; audit backup.restore_authorize.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The DAILY / WEEKLY SUCCESS run to restore
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreAuthorize'
+      responses:
+        '202':
+          description: Authorised — kind 4 RESTORE row created, maintenance ON; the developer runs the restore script
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreAuthorizeResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /backups/{id}/cancel:
+    post:
+      tags:
+      - backups
+      operationId: backupRestoreCancel
+      summary: Cancel a restore authorisation (P8.BAK.04)
+      x-permission: backup.restore (company master — company scope; usable during maintenance — API-AUTH-06)
+      description: 'RUNNING kind 4 → FAILED "cancelled: <reason>"; other rows → 409 invalid_transition; 400 reason_required. Audit backup.restore_cancel.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: The kind-4 RESTORE run
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /internal/backup-runs:
+    post:
+      tags:
+      - internal
+      operationId: internalBackupRunStart
+      summary: Sidecar — run started, kinds 1–3 (P8.INT.01) — ADR-002
+      x-permission: internal (X-Internal-Key = INTERNAL_OPS_KEY, Docker network only — ADR-009)
+      description: 'Kinds 1–3 only (review fix 02/Oct): automatic runs have performed_by null (kind 3 allowed by DB v1.1); performed_by_user_id / reason only with a kind-3 test started
+        by hand. Kind 4 → 400 validation — a RESTORE row is created only by P8.BAK.03 (D-DAT-04) and re-appended by the restore script in SQL (P8-RULE-10). 400 validation also for DB
+        backup_runs_restore_chk.'
+      parameters:
+      - $ref: '#/components/parameters/InternalKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BackupRunStart'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '200':
+          description: Same id already recorded — idempotent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+      security:
+      - internalKey: []
+  /internal/backup-runs/{id}:
+    patch:
+      tags:
+      - internal
+      operationId: internalBackupRunFinish
+      summary: Sidecar / restore script — run finished (P8.INT.02)
+      x-permission: internal (X-Internal-Key = INTERNAL_OPS_KEY)
+      description: FAILED needs error_message (400); FAILED → notification backup.failed + notified_at; repeat with the same values → 200.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/InternalKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BackupRunFinish'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - internalKey: []
+    get:
+      tags:
+      - internal
+      operationId: internalBackupRunGet
+      summary: Read a run (P8.INT.03) — the restore script checks its authorisation
+      x-permission: internal (X-Internal-Key = INTERNAL_OPS_KEY)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/InternalKey'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - internalKey: []
+  /website:
+    get:
+      tags:
+      - website
+      operationId: websiteOverview
+      summary: Website overview (P8.WEB.01) — AD-WEB-02
+      x-permission: website.view+ (mixed — content readable at any scope; branches = the grant's)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebsiteOverview'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /website/content:
+    put:
+      tags:
+      - website
+      operationId: websiteContentPut
+      summary: Save site content (P8.WEB.02) — 🔒 D-WEB-01, owner F7
+      x-permission: website.update (company master — company scope)
+      description: One transaction over the site.* keys (settings_history by trigger), images via Attachments.replace, site.content_changed → site.revalidate (ADR-006). 400 validation;
+        409 conflict; 422 attachment_invalid; branch scope → 403 company_scope_required.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteContentWrite'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SiteContent'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /website/branches/{branch_id}/hours:
+    get:
+      tags:
+      - website
+      operationId: websiteHoursGet
+      summary: Opening hours of a branch (P8.WEB.03)
+      x-permission: website.view+ (branch data)
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch (branch data — ADR-012)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BranchHoursWeek'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+      - website
+      operationId: websiteHoursPut
+      summary: Save the opening-hours week (P8.WEB.04) — 🔒 D-WEB-04
+      x-permission: website.update (branch data — the branch)
+      description: Exactly 7 days; only a weekday whose values change is written (its updated_at moves — Part 7 P7-RULE-03 reads it); 400 validation with errors[] per day (closes_before_opens,
+        times_required, times_not_allowed, overnight_not_allowed); 409 conflict. Audit website.hours_update.
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch (branch data — ADR-012)
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BranchHoursWrite'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BranchHoursWeek'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /website/closures:
+    get:
+      tags:
+      - website
+      operationId: websiteClosureList
+      summary: Temporary closures (P8.WEB.05)
+      x-permission: website.view+ (branch data — scope-filtered)
+      description: Default = current and future closures.
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BranchClosure'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - website
+      operationId: websiteClosureCreate
+      summary: Add a closure (P8.WEB.06) — 🔒 D-WEB-04, owner F8
+      x-permission: website.update (branch data — body.branch_id)
+      description: Saved even when bookings exist — affected_bookings[] listed, never cancelled (owner F8). 422 date_in_past · range_too_long; 409 closure_overlap { closure_id }; 400
+        validation.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClosureCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClosureResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /website/closures/{id}:
+    patch:
+      tags:
+      - website
+      operationId: websiteClosureUpdate
+      summary: Edit a closure (P8.WEB.07)
+      x-permission: website.update (branch data)
+      description: A new start_date must be ≥ today (422 date_in_past). Started → only end_date (≥ today — this is how a started closure is ended) / notices (422 closure_started); ended
+        → 422 closure_past; 409 closure_overlap · conflict; archived → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClosureUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClosureResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /website/closures/{id}/archive:
+    post:
+      tags:
+      - website
+      operationId: websiteClosureArchive
+      summary: Delete (archive) a closure (P8.WEB.08)
+      x-permission: website.update (branch data)
+      description: 'A closure whose start_date ≥ today (review fix + reconcile 02/Oct — a closure created today by mistake can still be removed; no past day changes): start_date < today
+        → 422 closure_started (end it with PATCH end_date), an ended one → 422 closure_past; repeat → 200; the dates become bookable again.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArchiveRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BranchClosure'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /website/team:
+    get:
+      tags:
+      - website
+      operationId: websiteTeam
+      summary: Team public profiles overview (P8.WEB.09)
+      x-permission: website.view+ (company master read — any scope)
+      description: Edits go to Part 1 P1.EMP.04 (employee.update) / P1.EMP.12 (employee.rating_update). Order employee_code.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TeamProfile'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /website/share-preview:
+    get:
+      tags:
+      - website
+      operationId: websiteSharePreview
+      summary: Link-preview preview (P8.WEB.10) — AD-WEB-04
+      x-permission: website.view+ (company master read)
+      parameters:
+      - name: locale
+        in: query
+        schema:
+          type: string
+          enum:
+          - my
+          - en
+        description: Default my
+      - name: path
+        in: query
+        schema:
+          type: string
+        description: / or /branches/<code>
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharePreview'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /website/booking-qr/{branch_id}:
+    get:
+      tags:
+      - website
+      operationId: websiteBookingQr
+      summary: Booking QR data (P8.WEB.11) — AD-QR-01, 🔒 D-WEB-02
+      x-permission: website.view+ (branch data)
+      description: Poster PDF = POST /v1/exports kind booking_qr_poster.
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch (branch data — ADR-012)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingQr'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /website/revalidate:
+    post:
+      tags:
+      - website
+      operationId: websiteRevalidate
+      summary: Refresh the public site now (P8.WEB.12) — ADR-006
+      x-permission: website.update (company master — company scope)
+      description: Queues site.revalidate (default every site tag). Audit website.revalidate.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevalidateRequest'
+      responses:
+        '202':
+          description: Accepted — background job queued (API-SHAPE-04)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued_tags:
+                    type: array
+                    items:
+                      type: string
+                required:
+                - queued_tags
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /public/site:
+    get:
+      tags:
+      - public-site
+      operationId: publicSite
+      summary: Site data for home + layout (P8.PUB.01) — API-PUB-01
+      x-permission: public (no session; 60 / min / IP — API-LIM-01)
+      description: Company public info, site content (announcement only while active), toggles, public branches with hours + closures (≤ 60 days), site_origin, server_time. Open now
+        is computed by the browser. Cache-Control public, max-age=10 (≤ the ADR-006 ~10 s freshness target; the Next.js server cache follows tags site / home + site.revalidate, not this
+        header).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicSite'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      security: []
+  /public/branches:
+    get:
+      tags:
+      - public-site
+      operationId: publicBranches
+      summary: Public branches (P8.PUB.02)
+      x-permission: public (no session; 60 / min / IP — API-LIM-01)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PublicBranchSummary'
+                  server_time:
+                    type: string
+                    format: date-time
+                required:
+                - items
+                - server_time
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      security: []
+  /public/branches/{code}:
+    get:
+      tags:
+      - public-site
+      operationId: publicBranch
+      summary: Branch page data (P8.PUB.03) — FE-BR-01..06
+      x-permission: public (no session; 60 / min / IP — API-LIM-01)
+      description: Prices only with site.show_prices; barbers only with site.show_barbers. Unknown / inactive / non-public → 404. Tag branch:<code>.
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Branch code, case-insensitive
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBranch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      security: []
+  /public/barbers:
+    get:
+      tags:
+      - public-site
+      operationId: publicBarbers
+      summary: Our barbers (P8.PUB.04) — FE-HOME-05
+      x-permission: public (no session; 60 / min / IP — API-LIM-01)
+      description: '[] unless site.show_barbers; today_branches[] from today''s shifts (several on a split day); order employee_code. Tag barbers (revalidated nightly after shifts.generate).'
+      parameters:
+      - name: branch
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Filter to this branch's barbers (adds today_here)
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 12
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PublicBarber'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      security: []
+  /public/media/{attachment_id}/{variant}:
+    get:
+      tags:
+      - public-site
+      operationId: publicMedia
+      summary: Website image (P8.PUB.05) — contract 11
+      x-permission: public (no session; own limit 600 / min / IP — API-LIM-01) — or a staff session for non-public staff images (not IP-limited)
+      description: Served publicly only while referenced by a public field (logo, site images, service with show_on_website, employee with public_profile); otherwise 404 (same body as
+        unknown).
+      parameters:
+      - name: attachment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: variant
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - original
+          - w400
+          - w800
+          - w1600
+          description: Image variant — WebP widths 400 / 800 / 1600 (contract 11)
+      responses:
+        '200':
+          description: 'Image bytes — public: Cache-Control public, max-age=86400 + ETag (review fix 02/Oct — not one-year immutable); staff session: private, max-age=3600'
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: Not modified (If-None-Match = the ETag) — answered only while the image is still public (the reference check runs first)
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /reports:
+    get:
+      tags:
+      - reports
+      operationId: reportCatalog
+      summary: Report catalogue (P8.RPT.01) — AD-RPT-04
+      x-permission: any staff (read scope) — lists only the reports the caller holds a code for
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ReportCatalogItem'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /reports/sales:
+    get:
+      tags:
+      - reports
+      operationId: reportSales
+      summary: ① Sales summary (P8.RPT.02) — 🔒 D-RPT-01
+      x-permission: report_sales.view (branch data)
+      description: FINISHED sales by business_date; lines net of discount; refunds on the refund date (owner F6); EffectiveSale (contract 8). 422 range_too_long · date_in_future · report_timeout
+        (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: compare
+        in: query
+        schema:
+          type: boolean
+        description: true = add the previous period of the same length to the summary
+      - name: category_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: service_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: product_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: line_type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            description: 1 SERVICE · 2 PRODUCT · 3 TRANSPORT_FEE
+        style: form
+        explode: true
+      - name: group_by
+        in: query
+        schema:
+          type: string
+          enum:
+          - day
+          - week
+          - month
+          - branch
+          - category
+          - service
+          - product
+        description: Default day
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - sales
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/barber-performance:
+    get:
+      tags:
+      - reports
+      operationId: reportBarberPerformance
+      summary: ② Barber performance (P8.RPT.03) — 🔒 D-RPT-01
+      x-permission: report_barber_performance.view (branch data)
+      description: Effective performer (D-KPI-01); phone capture %, late entries, proxy recorded / collected, discount requests; no commission amounts (owner C1). 422 range_too_long
+        · date_in_future · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: compare
+        in: query
+        schema:
+          type: boolean
+        description: true = add the previous period of the same length to the summary
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - visits
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/payments:
+    get:
+      tags:
+      - reports
+      operationId: reportPayments
+      summary: ③ Payments & KBZPay (P8.RPT.04) — 🔒 D-RPT-01
+      x-permission: report_payments.view (branch data)
+      description: Effective method / collector; verified after close (owner E3). 422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ
+        ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: compare
+        in: query
+        schema:
+          type: boolean
+        description: true = add the previous period of the same length to the summary
+      - name: payment_method_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: verified
+        in: query
+        schema:
+          type: boolean
+      - name: collected_by_employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - payments
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/discounts-refunds:
+    get:
+      tags:
+      - reports
+      operationId: reportDiscountsRefunds
+      summary: ④ Discounts & refunds (P8.RPT.05) — 🔒 D-RPT-01
+      x-permission: report_discounts_refunds.view (branch data)
+      description: Refunds on the refund date (owner F6). 422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at
+        (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: compare
+        in: query
+        schema:
+          type: boolean
+        description: true = add the previous period of the same length to the summary
+      - name: discount_code_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - refunds
+          - requests
+          - adjustments
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/closing-cash:
+    get:
+      tags:
+      - reports
+      operationId: reportClosingCash
+      summary: ⑤ Daily closing & cash (P8.RPT.06) — 🔒 D-RPT-01
+      x-permission: report_closing_cash.view (branch data)
+      description: Snapshots for CLOSED days, DailyClosings.components live otherwise (Part 7). Staff advances (EMPLOYEE_BALANCE cash outs) keep amount + reason; the taker is returned
+        only to company-scope payroll.view or receivable.issue holders (else employee null + employee_hidden true — P7-RULE-01, owner C1 + D-FIN-06). 422 range_too_long · date_in_future
+        · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            description: 1 OPEN / not closed · 2 CLOSED
+        style: form
+        explode: true
+      - name: difference_state
+        in: query
+        schema:
+          type: string
+          enum:
+          - balanced
+          - within_tolerance
+          - beyond_tolerance
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - days
+          - cash_outs
+          - outstanding
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/expenses-pnl:
+    get:
+      tags:
+      - reports
+      operationId: reportExpensesPnl
+      summary: ⑥ Expenses & P&L (P8.RPT.07) — 🔒 D-RPT-01
+      x-permission: pnl.view (mixed — branches covered, else 403 out_of_scope; no branch_id = company P&L → company scope)
+      description: Whole months ≤ 12 (Pnl.compute per month); salary one line unless company-scope payroll.view (owner E6); detail=expenses also needs expense.view+ (403 forbidden).
+        422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: category_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: paid_via
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 BANK · 2 OWNER_PERSONAL · 3 OTHER
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - expenses
+        description: Which detail table (P8-RULE-15)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/commission-payroll:
+    get:
+      tags:
+      - reports
+      operationId: reportCommissionPayroll
+      summary: ⑦ Commission & payroll (P8.RPT.08) — 🔒 D-RPT-01
+      x-permission: report_commission_payroll.view (private — company scope)
+      description: Whole months ≤ 12; provisional months flagged; branch scope → 403 company_scope_required. 422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope.
+        REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - by_employee_month
+          - receivables
+        description: Which detail table (P8-RULE-15)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/attendance-leave:
+    get:
+      tags:
+      - reports
+      operationId: reportAttendanceLeave
+      summary: ⑧ Attendance & leave (P8.RPT.09) — 🔒 D-RPT-01
+      x-permission: report_attendance_leave.view (branch data)
+      description: Whole months ≤ 12; attendance by the record's branch; leave for employees assigned to a covered branch. 422 range_too_long · date_in_future · report_timeout (15 s);
+        403 out_of_scope. REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - exceptions
+        description: Which detail table (P8-RULE-15)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/bookings-customers:
+    get:
+      tags:
+      - reports
+      operationId: reportBookingsCustomers
+      summary: ⑨ Bookings & customers (P8.RPT.10) — 🔒 D-RPT-01
+      x-permission: report_bookings_customers.view (branch data)
+      description: to may reach today + booking.advance_window_days; returning rate (owner F6); no phones in rows. 422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope.
+        REPEATABLE READ READ ONLY snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: compare
+        in: query
+        schema:
+          type: boolean
+        description: true = add the previous period of the same length to the summary
+      - name: channel
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ONLINE · 2 STAFF
+      - name: booked_employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH · 2 HOME
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - bookings
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /reports/stock:
+    get:
+      tags:
+      - reports
+      operationId: reportStock
+      summary: ⑩ Stock (P8.RPT.11) — 🔒 D-RPT-01
+      x-permission: report_stock.view (branch data)
+      description: Levels as of now; movements in the range (Part 6 ledger). 422 range_too_long · date_in_future · report_timeout (15 s); 403 out_of_scope. REPEATABLE READ READ ONLY
+        snapshot, generated_at (ADR-015).
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date (default = the report preset / last 7 days for audit)
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: MMT business date; range ≤ 366 days (422 range_too_long)
+      - name: branch_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable; default every branch of the grant; a branch outside → 403 out_of_scope
+        style: form
+        explode: true
+      - name: product_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: category_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: true
+      - name: movement_type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            - 6
+            - 7
+            - 8
+            description: 1 PURCHASE_IN · 2 TRANSFER_OUT · 3 TRANSFER_IN · 4 SALE_OUT · 5 SALE_RETURN_IN · 6 USAGE_OUT · 7 COUNT_ADJUST · 8 MANUAL_ADJUST
+        style: form
+        explode: true
+      - name: detail
+        in: query
+        schema:
+          type: string
+          enum:
+          - movements
+        description: Which detail table (P8-RULE-15)
+      - name: sort
+        in: query
+        schema:
+          type: string
+        description: Detail-table sort key (prefix - = descending)
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /dashboard/overview:
+    get:
+      tags:
+      - dashboards
+      operationId: dashboardOverview
+      summary: Dashboard tiles (P8.DSH.01) — 🔒 D-DSH-01/02
+      x-permission: any staff (read scope) — each tile gated by its report code (contract 13)
+      description: Tiles the caller can't see are absent; live values with as_of.
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Optional; none = every branch the tile's code reaches
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today (MMT)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardOverview'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /dashboard/attention:
+    get:
+      tags:
+      - dashboards
+      operationId: dashboardAttention
+      summary: Needs attention (P8.DSH.02) — AD-DSH-04
+      x-permission: any staff (read scope) — each card gated by its action code
+      description: 'Cards (each gated by its code — P8-RULE-16): open visits / sales, discount requests, expenses / incomes, leave, attendance exceptions, unverified KBZPay today, days
+        not closed (Part 7 DailyClosings.openDays), transfers in transit, low stock, negative stock, stock counts in progress (Part 6), outstanding must-return cash, payroll runs not
+        paid (private), purchases awaiting post, backups, jobs.'
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttentionItem'
+                  generated_at:
+                    type: string
+                    format: date-time
+                required:
+                - items
+                - generated_at
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /dashboard/me:
+    get:
+      tags:
+      - dashboards
+      operationId: dashboardMe
+      summary: My day — barber home (P8.DSH.03) — 🔒 D-DSH-03
+      x-permission: self
+      description: Earnings only when the effective own-earnings flag is ON (COALESCE(employees.show_own_earnings, dashboard.show_own_earnings_all)); never colleagues' figures.
+      parameters:
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today (MMT)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyDashboard'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /approvals/counts:
+    get:
+      tags:
+      - dashboards
+      operationId: approvalCounts
+      summary: Approval counts (P8.DSH.04) — AD-NTF-04/05
+      x-permission: any staff (read scope) — per type the items the caller may decide
+      description: Own requests are never counted (no self-approval).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalCounts'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+    internalKey:
+      type: apiKey
+      in: header
+      name: X-Internal-Key
+      description: INTERNAL_OPS_KEY from .env (API, backup sidecar, restore script only — the web container holds a different secret, INTERNAL_SSR_KEY, which only lifts the per-IP limit
+        on /public/* and is refused here); /api/v1/internal/* is reachable only over the Docker network (Caddy 404s it and strips the inbound header — ADR-009)
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+    InternalKey:
+      name: X-Internal-Key
+      in: header
+      required: true
+      schema:
+        type: string
+      description: INTERNAL_OPS_KEY (ADR-009 — never the SSR key)
+  responses:
+    ValidationError:
+      description: 400 validation (errors[].field) · reason_required
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked · internal key missing
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden (context.required) · out_of_scope · company_scope_required (company master / private codes at branch scope) · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (also hidden audit rows, other users' notifications / exports, non-public media or branches)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 invalid_transition · conflict (expected_updated_at) · notification_mandatory · attachment_in_use · closure_overlap · restore_pending
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/08-platform.md §16 (file_too_large, file_type_not_allowed, attachment_invalid, range_too_long, date_in_future, date_in_past,
+        closure_started, closure_past, report_timeout, export_too_large, import_file_unreadable, import_mapping_incomplete, import_no_valid_rows, backup_not_restorable, confirm_mismatch)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: 429 rate_limited { retry_after } (API-LIM-01 — JSON 60 / min / IP, media 600 / min / IP; SSR calls with INTERNAL_SSR_KEY and staff sessions are exempt)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: 503 maintenance { until, message_mm, message_en } (D-PLT-08; company-scope settings.update holders pass, and /backups/* also for company-scope backup.restore holders
+        — API-AUTH-06)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data (API-ERR-01 v1.4): file_too_large → { max_mb } · file_type_not_allowed → { allowed[] } · attachment_invalid → { attachment_id, reason } · attachment_in_use
+            → { field } · closure_overlap → { closure_id } · restore_pending → { run_id } · backup_not_restorable → { reason } · export_too_large → { row_count, max_rows } · import_mapping_incomplete
+            → { missing[] } · range_too_long → { max_days } · invalid_transition → { status } · forbidden → { required } · rate_limited → { retry_after } · maintenance → { until, message_mm,
+            message_en }'
+      required:
+      - type
+      - title
+      - status
+      - code
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: bookings_in_closure { count } · share_image_missing · title_too_long · description_too_long · truncated { shown, total }
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    SignedUrl:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        expires_at:
+          type: string
+          format: date-time
+      required:
+      - url
+      - expires_at
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        type_code:
+          type: string
+        category:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          description: 1 BOOKING · 2 STAFF · 3 MONEY · 4 STOCK · 5 PAYROLL · 6 SECURITY (D-NTF-03)
+        template_key:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        link_path:
+          type:
+          - string
+          - 'null'
+        entity_type:
+          type:
+          - string
+          - 'null'
+        entity_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        read_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - type_code
+      - category
+      - template_key
+      - payload
+      - created_at
+      - read_at
+    ReadAllRequest:
+      type: object
+      properties:
+        up_to:
+          type: string
+          format: date-time
+          description: Default now
+    NotificationType:
+      type: object
+      properties:
+        code:
+          type: string
+        category:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          description: 1 BOOKING · 2 STAFF · 3 MONEY · 4 STOCK · 5 PAYROLL · 6 SECURITY (D-NTF-03)
+        is_mandatory:
+          type: boolean
+        enabled:
+          type: boolean
+        default_recipient_rule:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 ADMINS · 2 BRANCH_MANAGERS · 3 TARGET_USER · 4 BRANCH_STAFF (contract 14)
+        related_code:
+          type:
+          - string
+          - 'null'
+          description: From notifications.json — the code whose company-scope holders are "admins" (owner F12)
+        emitted_by:
+          type: string
+          description: Part that emits it
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - code
+      - category
+      - is_mandatory
+      - enabled
+      - default_recipient_rule
+      - emitted_by
+      - updated_at
+    NotificationTypeUpdate:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - enabled
+    AttachmentUpload:
+      type: object
+      properties:
+        file:
+          type: string
+          format: binary
+          description: ≤ system.upload_max_mb MB
+        purpose:
+          type: string
+          enum:
+          - image
+          - document
+          - import
+          description: image → kind 2 · document → kind 1 · import → kind 3
+      required:
+      - file
+      - purpose
+    Attachment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        entity_type:
+          type: string
+          description: uploads (staging) · companies · employees · services · site · expenses · manual_incomes · sales · refunds · import_jobs · exports
+        entity_id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 DOCUMENT · 2 IMAGE · 3 IMPORT_FILE
+        file_name:
+          type: string
+        mime_type:
+          type: string
+          description: Detected type (= attachments.mime_type — API-SHAPE-03)
+        size_bytes:
+          type: integer
+        image:
+          oneOf:
+          - type: object
+            properties:
+              width:
+                type: integer
+              height:
+                type: integer
+              variants:
+                type: array
+                items:
+                  type: string
+                  enum:
+                  - original
+                  - w400
+                  - w800
+                  - w1600
+                  description: Image variant — WebP widths 400 / 800 / 1600 (contract 11)
+            required:
+            - width
+            - height
+            - variants
+          - type: 'null'
+        staging:
+          type: boolean
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Staging rows only (+24 h)
+        uploaded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        uploaded_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - entity_type
+      - entity_id
+      - kind
+      - file_name
+      - mime_type
+      - size_bytes
+      - staging
+      - uploaded_by
+      - uploaded_at
+    RemoveRequest:
+      type: object
+      properties:
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      description: reason required except for one's own staging row
+    DocumentAttach:
+      type: object
+      properties:
+        attachment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 20
+          description: Staging uploads, purpose document
+      required:
+      - attachment_ids
+    AuditEventListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 APP · 2 DB_TRIGGER · 3 SYSTEM_JOB (D-AUD-02)
+        action:
+          type: string
+        entity_type:
+          type: string
+        entity_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        actor:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        device_label:
+          type:
+          - string
+          - 'null'
+        reason:
+          type:
+          - string
+          - 'null'
+        has_changes:
+          type: boolean
+        request_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        link_path:
+          type:
+          - string
+          - 'null'
+      required:
+      - id
+      - occurred_at
+      - source
+      - action
+      - entity_type
+      - has_changes
+    AuditEvent:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 APP · 2 DB_TRIGGER · 3 SYSTEM_JOB (D-AUD-02)
+        action:
+          type: string
+        entity_type:
+          type: string
+        entity_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        actor:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        device_label:
+          type:
+          - string
+          - 'null'
+        reason:
+          type:
+          - string
+          - 'null'
+        has_changes:
+          type: boolean
+        request_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        link_path:
+          type:
+          - string
+          - 'null'
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              label_key:
+                type: string
+              before: {}
+              after: {}
+            required:
+            - field
+            - label_key
+        before_data:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: Secrets redacted
+        after_data:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        related:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEventListItem'
+      required:
+      - id
+      - occurred_at
+      - source
+      - action
+      - entity_type
+      - has_changes
+      - changes
+      - related
+    ImportCreate:
+      type: object
+      properties:
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 FRESHA_EXPORT · 2 TEMPLATE
+        entity_type:
+          type: string
+          enum:
+          - customers
+          - service_categories
+          - services
+          - product_categories
+          - products
+          - suppliers
+          - employees
+          description: Master data only — owner F5 (P8-RULE-07)
+        file_attachment_id:
+          type: string
+          format: uuid
+          description: Staging upload, purpose import
+        options:
+          $ref: '#/components/schemas/ImportOptions'
+      required:
+      - source
+      - entity_type
+      - file_attachment_id
+    ImportOptions:
+      type: object
+      properties:
+        sheet_name:
+          type:
+          - string
+          - 'null'
+        effective_from:
+          type:
+          - string
+          - 'null'
+          format: date
+          description: services — price start (default the import date)
+        create_missing_categories:
+          type: boolean
+          default: true
+    ImportMapping:
+      type: object
+      properties:
+        mapping:
+          type: object
+          additionalProperties:
+            type: string
+          description: '{ target_field: column header }'
+        options:
+          $ref: '#/components/schemas/ImportOptions'
+      required:
+      - mapping
+    ImportJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 FRESHA_EXPORT · 2 TEMPLATE
+        entity_type:
+          type: string
+          enum:
+          - customers
+          - service_categories
+          - services
+          - product_categories
+          - products
+          - suppliers
+          - employees
+          description: Master data only — owner F5 (P8-RULE-07)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 0 CANCELLED · 1 UPLOADED · 2 VALIDATED (preview) · 3 CONFIRMED · 4 FAILED (D-DAT-01)
+        processing:
+          type:
+          - string
+          - 'null'
+          enum:
+          - validating
+          - confirming
+          - null
+          description: Background phase in progress
+        file:
+          $ref: '#/components/schemas/Attachment'
+        headers:
+          type: array
+          items:
+            type: string
+          description: Stored in import_jobs.options (jsonb)
+        mapping:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+          description: Stored in import_jobs.options (jsonb)
+        suggested_mapping:
+          type: object
+          additionalProperties:
+            type: string
+          description: Stored in import_jobs.options (jsonb)
+        options:
+          oneOf:
+          - $ref: '#/components/schemas/ImportOptions'
+          - type: 'null'
+        total_rows:
+          type: integer
+        valid_rows:
+          type: integer
+        error_rows:
+          type: integer
+        imported_rows:
+          type: integer
+        skipped_rows:
+          type: integer
+          description: Computed — rows with status 5 SKIPPED (0 before confirm)
+        error_message:
+          type:
+          - string
+          - 'null'
+          description: 'FAILED (status 4): a language key — import_too_many_rows, import_file_unreadable or the confirm error'
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+        validated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        confirmed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        confirmed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - source
+      - entity_type
+      - status
+      - processing
+      - file
+      - headers
+      - total_rows
+      - valid_rows
+      - error_rows
+      - imported_rows
+      - skipped_rows
+      - created_by
+      - created_at
+      - updated_at
+    ImportRow:
+      type: object
+      properties:
+        row_number:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 1 PENDING · 2 VALID · 3 ERROR · 4 IMPORTED · 5 SKIPPED
+        raw_data:
+          type: object
+          additionalProperties: true
+        mapped_data:
+          type: object
+          additionalProperties: true
+          description: Computed on read — raw_data after the stored mapping and normalisation (not a DB column)
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              column:
+                type: string
+              message_key:
+                type: string
+            required:
+            - column
+            - message_key
+        outcome:
+          oneOf:
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - create
+                - reuse_existing
+                - duplicate_in_file
+              entity_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              first_row:
+                type:
+                - integer
+                - 'null'
+            required:
+            - kind
+            description: Computed on read for VALID rows (a VALID row has entity_id NULL in the DB — import_job_rows_status_fields_chk)
+          - type: 'null'
+        entity_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Stored for IMPORTED / SKIPPED rows only
+      required:
+      - row_number
+      - status
+      - raw_data
+      - errors
+    ExportCreate:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - report
+          - list
+          - booking_qr_poster
+          - attendance_qr_poster
+        key:
+          type: string
+          description: 'report: sales · barber_performance · payments · discounts_refunds · closing_cash · expenses_pnl · commission_payroll · attendance_leave · bookings_customers ·
+            stock — list: customers · bookings · sales · payments · refunds · attendance_records · stock_levels · stock_movements · purchases · daily_closings · cash_outs · expenses
+            · manual_incomes · employees · audit_events'
+        format:
+          type: string
+          enum:
+          - csv
+          - xlsx
+          - pdf
+        query:
+          type: object
+          additionalProperties: true
+          description: The source screen's query parameters (filters, sort, report detail)
+        branch_id:
+          type: string
+          format: uuid
+          description: Posters
+        size:
+          type: string
+          enum:
+          - A5
+          - A6
+          description: Posters
+        language:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 MY · 2 EN (default the caller's ui_language)
+      required:
+      - kind
+      - format
+    Export:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        key:
+          type:
+          - string
+          - 'null'
+        format:
+          type: string
+          enum:
+          - csv
+          - xlsx
+          - pdf
+        status:
+          type: string
+          enum:
+          - queued
+          - running
+          - completed
+          - failed
+        row_count:
+          type:
+          - integer
+          - 'null'
+        truncated:
+          type: boolean
+        file_name:
+          type:
+          - string
+          - 'null'
+        size_bytes:
+          type:
+          - integer
+          - 'null'
+        error_code:
+          type:
+          - string
+          - 'null'
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - kind
+      - format
+      - status
+      - truncated
+      - created_at
+    BackupRun:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 DAILY (30 days) · 2 WEEKLY (1 year) · 3 RESTORE_TEST (monthly, automatic) · 4 RESTORE (D-DAT-03/04)
+        status:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: '1 RUNNING (kind 4: authorised, waiting for the script) · 2 SUCCESS · 3 FAILED'
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        size_bytes:
+          type:
+          - integer
+          - 'null'
+        location:
+          type:
+          - string
+          - 'null'
+        checksum:
+          type:
+          - string
+          - 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+        performed_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        reason:
+          type:
+          - string
+          - 'null'
+        notified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        restorable:
+          type: boolean
+        restorable_reason:
+          type:
+          - string
+          - 'null'
+          enum:
+          - not_success
+          - kind
+          - retention_expired
+          - null
+      required:
+      - id
+      - kind
+      - status
+      - started_at
+      - restorable
+    BackupSummary:
+      type: object
+      properties:
+        last_daily_success_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_weekly_success_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_restore_test:
+          oneOf:
+          - type: object
+            properties:
+              at:
+                type: string
+                format: date-time
+              status:
+                type: integer
+                enum:
+                - 1
+                - 2
+                - 3
+                description: '1 RUNNING (kind 4: authorised, waiting for the script) · 2 SUCCESS · 3 FAILED'
+            required:
+            - at
+            - status
+          - type: 'null'
+        pending_restore_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+      required:
+      - last_daily_success_at
+      - last_weekly_success_at
+      - last_restore_test
+      - pending_restore_id
+    RestoreAuthorize:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        confirm_backup_date:
+          type: string
+          format: date
+          description: Typed MMT date of the chosen backup (AD-BAK-01) — mismatch → 422 confirm_mismatch
+        maintenance_message_mm:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+        maintenance_message_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+      required:
+      - reason
+      - confirm_backup_date
+    RestoreAuthorizeResult:
+      type: object
+      properties:
+        restore_run:
+          $ref: '#/components/schemas/BackupRun'
+        source_run:
+          $ref: '#/components/schemas/BackupRun'
+        runbook:
+          type: string
+          enum:
+          - RB-RESTORE
+      required:
+      - restore_run
+      - source_run
+      - runbook
+    ReasonRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+      required:
+      - reason
+    BackupRunStart:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Generated by the sidecar — idempotency key
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 DAILY · 2 WEEKLY · 3 RESTORE_TEST — kind 4 RESTORE is never accepted here (P8.BAK.03 only — D-DAT-04)
+        started_at:
+          type: string
+          format: date-time
+        location:
+          type:
+          - string
+          - 'null'
+        performed_by_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Only with kind 3 (a restore test started by hand); null / absent for kinds 1 and 2 (DB backup_runs_restore_chk)
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Only with kind 3
+      required:
+      - id
+      - kind
+      - started_at
+    BackupRunFinish:
+      type: object
+      properties:
+        status:
+          type: integer
+          enum:
+          - 2
+          - 3
+          description: 2 SUCCESS · 3 FAILED
+        finished_at:
+          type: string
+          format: date-time
+        size_bytes:
+          type:
+          - integer
+          - 'null'
+        location:
+          type:
+          - string
+          - 'null'
+        checksum:
+          type:
+          - string
+          - 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+          description: Required with status 3
+      required:
+      - status
+      - finished_at
+    SiteContent:
+      type: object
+      properties:
+        hero_title:
+          type: object
+          properties:
+            mm:
+              type: string
+              maxLength: 80
+            en:
+              type:
+              - string
+              - 'null'
+              maxLength: 80
+          required:
+          - mm
+          - en
+        hero_subtitle:
+          type: object
+          properties:
+            mm:
+              type: string
+              maxLength: 160
+            en:
+              type:
+              - string
+              - 'null'
+              maxLength: 160
+          required:
+          - mm
+          - en
+        cover_image:
+          oneOf:
+          - type: object
+            properties:
+              attachment_id:
+                type: string
+                format: uuid
+              url:
+                type: string
+                description: Stable media path /api/v1/public/media/<id>/original (P8-RULE-04)
+            required:
+            - attachment_id
+            - url
+          - type: 'null'
+        share_image:
+          oneOf:
+          - type: object
+            properties:
+              attachment_id:
+                type: string
+                format: uuid
+              url:
+                type: string
+                description: Stable media path /api/v1/public/media/<id>/original (P8-RULE-04)
+            required:
+            - attachment_id
+            - url
+          - type: 'null'
+        seo_title:
+          oneOf:
+          - type: object
+            properties:
+              mm:
+                type: string
+                maxLength: 70
+              en:
+                type:
+                - string
+                - 'null'
+                maxLength: 70
+            required:
+            - mm
+            - en
+          - type: 'null'
+        seo_description:
+          oneOf:
+          - type: object
+            properties:
+              mm:
+                type: string
+                maxLength: 160
+              en:
+                type:
+                - string
+                - 'null'
+                maxLength: 160
+            required:
+            - mm
+            - en
+          - type: 'null'
+        announcement:
+          oneOf:
+          - type: object
+            properties:
+              text_mm:
+                type: string
+                minLength: 1
+                maxLength: 200
+              text_en:
+                type:
+                - string
+                - 'null'
+                maxLength: 200
+              start_date:
+                type: string
+                format: date
+              end_date:
+                type: string
+                format: date
+            required:
+            - text_mm
+            - start_date
+            - end_date
+          - type: 'null'
+        show_prices:
+          type: boolean
+        show_barbers:
+          type: boolean
+        site_origin:
+          type: string
+          description: .env SITE_ORIGIN — read-only (research E5; site.domain dropped)
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        live_within_seconds:
+          type: integer
+          description: For "Saved — live on the website within a few seconds" (AD-WEB-01)
+      required:
+      - hero_title
+      - hero_subtitle
+      - cover_image
+      - share_image
+      - seo_title
+      - seo_description
+      - announcement
+      - show_prices
+      - show_barbers
+      - site_origin
+      - live_within_seconds
+    SiteContentWrite:
+      type: object
+      properties:
+        hero_title:
+          type: object
+          properties:
+            mm:
+              type: string
+              maxLength: 80
+            en:
+              type:
+              - string
+              - 'null'
+              maxLength: 80
+          required:
+          - mm
+          - en
+        hero_subtitle:
+          type: object
+          properties:
+            mm:
+              type: string
+              maxLength: 160
+            en:
+              type:
+              - string
+              - 'null'
+              maxLength: 160
+          required:
+          - mm
+          - en
+        cover_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Staging upload or the current image id; null = none
+        share_image_attachment_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        seo_title:
+          oneOf:
+          - type: object
+            properties:
+              mm:
+                type: string
+                maxLength: 70
+              en:
+                type:
+                - string
+                - 'null'
+                maxLength: 70
+            required:
+            - mm
+            - en
+          - type: 'null'
+        seo_description:
+          oneOf:
+          - type: object
+            properties:
+              mm:
+                type: string
+                maxLength: 160
+              en:
+                type:
+                - string
+                - 'null'
+                maxLength: 160
+            required:
+            - mm
+            - en
+          - type: 'null'
+        announcement:
+          oneOf:
+          - type: object
+            properties:
+              text_mm:
+                type: string
+                minLength: 1
+                maxLength: 200
+              text_en:
+                type:
+                - string
+                - 'null'
+                maxLength: 200
+              start_date:
+                type: string
+                format: date
+              end_date:
+                type: string
+                format: date
+            required:
+            - text_mm
+            - start_date
+            - end_date
+          - type: 'null'
+        show_prices:
+          type: boolean
+        show_barbers:
+          type: boolean
+        expected_updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: updated_at the client last read (newest row) — mismatch → 409 conflict
+      required:
+      - hero_title
+      - hero_subtitle
+      - cover_attachment_id
+      - share_image_attachment_id
+      - seo_title
+      - seo_description
+      - announcement
+      - show_prices
+      - show_barbers
+    WebsiteOverview:
+      type: object
+      properties:
+        site_origin:
+          type: string
+        content:
+          $ref: '#/components/schemas/SiteContent'
+        branches:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              is_public:
+                type: boolean
+              map_url:
+                type:
+                - string
+                - 'null'
+              hours_configured:
+                type: boolean
+              next_closure:
+                oneOf:
+                - type: object
+                  properties:
+                    start_date:
+                      type: string
+                      format: date
+                    end_date:
+                      type: string
+                      format: date
+                    notice_mm:
+                      type: string
+                    notice_en:
+                      type:
+                      - string
+                      - 'null'
+                  required:
+                  - start_date
+                  - end_date
+                  - notice_mm
+                  - notice_en
+                - type: 'null'
+              editable:
+                type: boolean
+            required:
+            - id
+            - code
+            - name_mm
+            - is_public
+            - hours_configured
+            - next_closure
+            - editable
+        counts:
+          type: object
+          properties:
+            public_branches:
+              type: integer
+            services_on_website:
+              type: integer
+            public_team:
+              type: integer
+          required:
+          - public_branches
+          - services_on_website
+          - public_team
+        actions:
+          type: object
+          properties:
+            can_edit_content:
+              type: boolean
+            can_revalidate:
+              type: boolean
+          required:
+          - can_edit_content
+          - can_revalidate
+      required:
+      - site_origin
+      - content
+      - branches
+      - counts
+      - actions
+    BranchHoursWeek:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        configured:
+          type: boolean
+        days:
+          type: array
+          items:
+            type: object
+            properties:
+              day_of_week:
+                type: integer
+                minimum: 1
+                maximum: 7
+                description: 1 Mon … 7 Sun (ISO)
+              is_closed:
+                type: boolean
+              opens_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+              closes_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+            required:
+            - day_of_week
+            - is_closed
+            - opens_at
+            - closes_at
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+      required:
+      - branch_id
+      - configured
+      - days
+    BranchHoursWrite:
+      type: object
+      properties:
+        days:
+          type: array
+          items:
+            type: object
+            properties:
+              day_of_week:
+                type: integer
+                minimum: 1
+                maximum: 7
+                description: 1 Mon … 7 Sun (ISO)
+              is_closed:
+                type: boolean
+              opens_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+              closes_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+            required:
+            - day_of_week
+            - is_closed
+            - opens_at
+            - closes_at
+          minItems: 7
+          maxItems: 7
+          description: Each day_of_week 1–7 once
+        expected_updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: updated_at the client last read (newest row) — mismatch → 409 conflict
+      required:
+      - days
+    BranchClosure:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        notice_mm:
+          type: string
+        notice_en:
+          type:
+          - string
+          - 'null'
+        state:
+          type: string
+          enum:
+          - upcoming
+          - current
+          - ended
+          - archived
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - start_date
+      - end_date
+      - notice_mm
+      - state
+      - created_by
+      - created_at
+      - updated_at
+    ClosureCreate:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        start_date:
+          type: string
+          format: date
+          description: ≥ today (MMT) — 422 date_in_past
+        end_date:
+          type: string
+          format: date
+        notice_mm:
+          type: string
+          minLength: 1
+          maxLength: 300
+        notice_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+      required:
+      - branch_id
+      - start_date
+      - end_date
+      - notice_mm
+    ClosureUpdate:
+      type: object
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        notice_mm:
+          type: string
+          minLength: 1
+          maxLength: 300
+        notice_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ArchiveRequest:
+      type: object
+      properties:
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+    AffectedBooking:
+      type: object
+      properties:
+        booking_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        booked_employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        customer_name:
+          type:
+          - string
+          - 'null'
+          description: Only for callers with booking.view+ for the branch
+        customer_phone:
+          type:
+          - string
+          - 'null'
+          description: Only for callers with booking.view+ for the branch
+      required:
+      - booking_id
+      - starts_at
+      - booked_employee
+    ClosureResult:
+      type: object
+      properties:
+        closure:
+          $ref: '#/components/schemas/BranchClosure'
+        affected_bookings:
+          type: array
+          items:
+            $ref: '#/components/schemas/AffectedBooking'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+      required:
+      - closure
+      - affected_bookings
+      - warnings
+      description: Owner F8 — bookings listed, never cancelled
+    TeamProfile:
+      type: object
+      properties:
+        employee_id:
+          type: string
+          format: uuid
+        employee_code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        photo_url:
+          type:
+          - string
+          - 'null'
+        public_profile:
+          type: boolean
+        public_specialty_mm:
+          type:
+          - string
+          - 'null'
+        public_specialty_en:
+          type:
+          - string
+          - 'null'
+        public_rating:
+          type:
+          - number
+          - 'null'
+        branches:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - code
+            - name_mm
+        today_branches:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - code
+            - name_mm
+            - starts_at
+            - ends_at
+        shown_on_site:
+          type: boolean
+        actions:
+          type: object
+          properties:
+            can_edit_profile:
+              type: boolean
+            can_rate:
+              type: boolean
+          required:
+          - can_edit_profile
+          - can_rate
+      required:
+      - employee_id
+      - employee_code
+      - name_mm
+      - public_profile
+      - branches
+      - today_branches
+      - shown_on_site
+      - actions
+    SharePreview:
+      type: object
+      properties:
+        url:
+          type: string
+        locale:
+          type: string
+          enum:
+          - my
+          - en
+        title:
+          type: string
+        description:
+          type:
+          - string
+          - 'null'
+        image:
+          oneOf:
+          - type: object
+            properties:
+              url:
+                type: string
+              width:
+                type: integer
+              height:
+                type: integer
+            required:
+            - url
+            - width
+            - height
+          - type: 'null'
+        site_name:
+          type: string
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+      required:
+      - url
+      - locale
+      - title
+      - image
+      - site_name
+      - warnings
+    BookingQr:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        url:
+          type: string
+          description: SITE_ORIGIN/book?branch=<code>
+        display_url:
+          type: string
+        logo_url:
+          type:
+          - string
+          - 'null'
+        is_public:
+          type: boolean
+      required:
+      - branch_id
+      - code
+      - name_mm
+      - url
+      - display_url
+      - is_public
+    RevalidateRequest:
+      type: object
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+          description: site · home · branch:<code> · barbers · services — default all
+    PublicBranchSummary:
+      type: object
+      properties:
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        address_mm:
+          type:
+          - string
+          - 'null'
+        address_en:
+          type:
+          - string
+          - 'null'
+        phone:
+          type:
+          - string
+          - 'null'
+        map_url:
+          type:
+          - string
+          - 'null'
+        latitude:
+          type:
+          - number
+          - 'null'
+        longitude:
+          type:
+          - number
+          - 'null'
+        hours:
+          type: array
+          items:
+            type: object
+            properties:
+              day_of_week:
+                type: integer
+                minimum: 1
+                maximum: 7
+                description: 1 Mon … 7 Sun (ISO)
+              is_closed:
+                type: boolean
+              opens_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+              closes_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+            required:
+            - day_of_week
+            - is_closed
+            - opens_at
+            - closes_at
+          description: Empty when not set
+        closures:
+          type: array
+          items:
+            type: object
+            properties:
+              start_date:
+                type: string
+                format: date
+              end_date:
+                type: string
+                format: date
+              notice_mm:
+                type: string
+              notice_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - start_date
+            - end_date
+            - notice_mm
+            - notice_en
+          description: Current + starting within 60 days
+        booking_url:
+          type: string
+      required:
+      - code
+      - name_mm
+      - hours
+      - closures
+      - booking_url
+    PublicSite:
+      type: object
+      properties:
+        company:
+          type: object
+          properties:
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            logo_url:
+              type:
+              - string
+              - 'null'
+            phone:
+              type:
+              - string
+              - 'null'
+            email:
+              type:
+              - string
+              - 'null'
+            address_mm:
+              type:
+              - string
+              - 'null'
+            address_en:
+              type:
+              - string
+              - 'null'
+            website_url:
+              type:
+              - string
+              - 'null'
+            social_links:
+              type: object
+              additionalProperties: true
+          required:
+          - name_mm
+        content:
+          type: object
+          properties:
+            hero_title:
+              type: object
+              properties:
+                mm:
+                  type: string
+                  maxLength: 80
+                en:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 80
+              required:
+              - mm
+              - en
+            hero_subtitle:
+              type: object
+              properties:
+                mm:
+                  type: string
+                  maxLength: 160
+                en:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 160
+              required:
+              - mm
+              - en
+            cover_image_url:
+              type:
+              - string
+              - 'null'
+            share_image_url:
+              type:
+              - string
+              - 'null'
+            seo_title:
+              oneOf:
+              - type: object
+                properties:
+                  mm:
+                    type: string
+                    maxLength: 70
+                  en:
+                    type:
+                    - string
+                    - 'null'
+                    maxLength: 70
+                required:
+                - mm
+                - en
+              - type: 'null'
+            seo_description:
+              oneOf:
+              - type: object
+                properties:
+                  mm:
+                    type: string
+                    maxLength: 160
+                  en:
+                    type:
+                    - string
+                    - 'null'
+                    maxLength: 160
+                required:
+                - mm
+                - en
+              - type: 'null'
+            announcement:
+              oneOf:
+              - type: object
+                properties:
+                  text_mm:
+                    type: string
+                    minLength: 1
+                    maxLength: 200
+                  text_en:
+                    type:
+                    - string
+                    - 'null'
+                    maxLength: 200
+                  start_date:
+                    type: string
+                    format: date
+                  end_date:
+                    type: string
+                    format: date
+                required:
+                - text_mm
+                - start_date
+                - end_date
+              - type: 'null'
+              description: Only while today (MMT) is within its dates
+          required:
+          - hero_title
+          - hero_subtitle
+          - announcement
+        toggles:
+          type: object
+          properties:
+            show_prices:
+              type: boolean
+            show_barbers:
+              type: boolean
+          required:
+          - show_prices
+          - show_barbers
+        branches:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicBranchSummary'
+        site_origin:
+          type: string
+        server_time:
+          type: string
+          format: date-time
+      required:
+      - company
+      - content
+      - toggles
+      - branches
+      - site_origin
+      - server_time
+    PublicService:
+      type: object
+      properties:
+        service_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        public_description_mm:
+          type:
+          - string
+          - 'null'
+        public_description_en:
+          type:
+          - string
+          - 'null'
+        image_url:
+          type:
+          - string
+          - 'null'
+        pricing_mode:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SIMPLE · 2 OPTIONS
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+        duration_range:
+          oneOf:
+          - type: object
+            properties:
+              min:
+                type: integer
+              max:
+                type: integer
+            required:
+            - min
+            - max
+          - type: 'null'
+        price_amount:
+          type:
+          - integer
+          - 'null'
+          description: Only with site.show_prices
+        price_varies_by_barber:
+          type:
+          - boolean
+          - 'null'
+        home_price_amount:
+          type:
+          - integer
+          - 'null'
+        option_grid:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: Sold cells (price + duration) — only with site.show_prices
+      required:
+      - service_id
+      - name_mm
+      - pricing_mode
+    PublicBranch:
+      type: object
+      properties:
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        address_mm:
+          type:
+          - string
+          - 'null'
+        address_en:
+          type:
+          - string
+          - 'null'
+        phone:
+          type:
+          - string
+          - 'null'
+        email:
+          type:
+          - string
+          - 'null'
+        map_url:
+          type:
+          - string
+          - 'null'
+        latitude:
+          type:
+          - number
+          - 'null'
+        longitude:
+          type:
+          - number
+          - 'null'
+        social_links:
+          type: object
+          additionalProperties: true
+        hours:
+          type: array
+          items:
+            type: object
+            properties:
+              day_of_week:
+                type: integer
+                minimum: 1
+                maximum: 7
+                description: 1 Mon … 7 Sun (ISO)
+              is_closed:
+                type: boolean
+              opens_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+              closes_at:
+                type:
+                - string
+                - 'null'
+                pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                description: HH:mm, MMT (API-DATA-03)
+            required:
+            - day_of_week
+            - is_closed
+            - opens_at
+            - closes_at
+        closures:
+          type: array
+          items:
+            type: object
+            properties:
+              start_date:
+                type: string
+                format: date
+              end_date:
+                type: string
+                format: date
+              notice_mm:
+                type: string
+              notice_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - start_date
+            - end_date
+            - notice_mm
+            - notice_en
+        booking_url:
+          type: string
+        services:
+          type: array
+          items:
+            type: object
+            properties:
+              category:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  name_mm:
+                    type: string
+                  name_en:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - id
+                - name_mm
+              items:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PublicService'
+            required:
+            - category
+            - items
+        home_service:
+          type: object
+          properties:
+            available:
+              type: boolean
+            transport_fee_amount:
+              type:
+              - integer
+              - 'null'
+          required:
+          - available
+        prices_shown:
+          type: boolean
+        barbers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicBarber'
+        server_time:
+          type: string
+          format: date-time
+      required:
+      - code
+      - name_mm
+      - hours
+      - closures
+      - booking_url
+      - services
+      - home_service
+      - prices_shown
+      - barbers
+      - server_time
+    PublicBarber:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        photo_url:
+          type:
+          - string
+          - 'null'
+        specialty_mm:
+          type:
+          - string
+          - 'null'
+        specialty_en:
+          type:
+          - string
+          - 'null'
+        public_rating:
+          type:
+          - number
+          - 'null'
+          description: 1.0–5.0 half steps; null = not shown ("Point rating" caption — OPEN-37)
+        today_branches:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - code
+            - name_mm
+            - starts_at
+            - ends_at
+        branches:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - code
+            - name_mm
+        today_here:
+          type:
+          - boolean
+          - 'null'
+        book_url:
+          type: string
+      required:
+      - id
+      - name_mm
+      - today_branches
+      - branches
+      - book_url
+    ReportCatalogItem:
+      type: object
+      properties:
+        key:
+          type: string
+        number:
+          type: integer
+          minimum: 1
+          maximum: 10
+        path:
+          type: string
+        code:
+          type: string
+        level:
+          type: string
+          enum:
+          - branch
+          - mixed
+          - private
+        default_preset:
+          type: string
+          enum:
+          - today
+          - this_month
+        filters:
+          type: array
+          items:
+            type: string
+        details:
+          type: array
+          items:
+            type: string
+        export_allowed:
+          type: boolean
+      required:
+      - key
+      - number
+      - path
+      - code
+      - level
+      - default_preset
+      - filters
+      - details
+      - export_allowed
+    Metric:
+      type: object
+      properties:
+        key:
+          type: string
+        value:
+          type:
+          - number
+          - 'null'
+        unit:
+          type: string
+          enum:
+          - money
+          - count
+          - percent
+          - minutes
+          - days
+          - quantity
+        comparison:
+          oneOf:
+          - type: object
+            properties:
+              previous_value:
+                type:
+                - number
+                - 'null'
+              change_percent:
+                type:
+                - number
+                - 'null'
+              previous_from:
+                type: string
+                format: date
+              previous_to:
+                type: string
+                format: date
+            required:
+            - previous_value
+            - change_percent
+            - previous_from
+            - previous_to
+          - type: 'null'
+      required:
+      - key
+      - value
+      - unit
+      - comparison
+    ReportTable:
+      type: object
+      properties:
+        key:
+          type: string
+        columns:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+              type:
+                type: string
+                enum:
+                - string
+                - money
+                - count
+                - percent
+                - date
+                - datetime
+                - minutes
+                - quantity
+                - employee
+                - branch
+                - boolean
+              label_key:
+                type: string
+            required:
+            - key
+            - type
+            - label_key
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        totals:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        total_rows:
+          type:
+          - integer
+          - 'null'
+      required:
+      - key
+      - columns
+      - rows
+      - totals
+      - next_cursor
+    ReportResult:
+      type: object
+      properties:
+        report_key:
+          type: string
+        period:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date
+            to:
+              type: string
+              format: date
+          required:
+          - from
+          - to
+        scope:
+          type: object
+          properties:
+            level:
+              type: string
+              enum:
+              - company
+              - branches
+            branch_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+          required:
+          - level
+          - branch_ids
+        filters:
+          type: object
+          additionalProperties: true
+        summary:
+          type: array
+          items:
+            $ref: '#/components/schemas/Metric'
+        breakdowns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportTable'
+        detail:
+          oneOf:
+          - $ref: '#/components/schemas/ReportTable'
+          - type: 'null'
+        flags:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              count:
+                type: integer
+              amount:
+                type:
+                - integer
+                - 'null'
+            required:
+            - code
+            - count
+        notes:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+            required:
+            - code
+        generated_at:
+          type: string
+          format: date-time
+      required:
+      - report_key
+      - period
+      - scope
+      - filters
+      - summary
+      - breakdowns
+      - detail
+      - flags
+      - notes
+      - generated_at
+    DashboardOverview:
+      type: object
+      properties:
+        scope:
+          type: object
+          properties:
+            branch_id:
+              type:
+              - string
+              - 'null'
+              format: uuid
+            branch_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+          required:
+          - branch_id
+          - branch_ids
+        date:
+          type: string
+          format: date
+        tiles:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+                enum:
+                - revenue_today
+                - revenue_month
+                - service_visits_today
+                - avg_per_visit_month
+                - branch_comparison_month
+                - top_barbers_month
+                - bookings_today
+                - online_bookings_month
+                - returning_rate_month
+                - attendance_today
+                - low_stock_count
+                - expenses_month
+                - net_profit_month
+                description: The fixed tile set (P8-RULE-16 table)
+              report_key:
+                type: string
+              value:
+                oneOf:
+                - type:
+                  - number
+                  - 'null'
+                - type: object
+                  additionalProperties: true
+                - type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+                description: 'By key (P8-RULE-16 tile table): integer (null where the table says so) for the scalar tiles; branch_comparison_month = [{ branch_id, net_sales_amount, service_visits_count
+                  }]; top_barbers_month = [{ employee_id, display_name, service_revenue_amount, service_visits_count }] (≤ 5); bookings_today = { bookings_count, online_count, completed_count,
+                  cancelled_count, no_show_count }; attendance_today = { scheduled_count, present_count, late_count, absent_count, on_leave_count }'
+              unit:
+                type: string
+                enum:
+                - money
+                - count
+                - percent
+              comparison:
+                oneOf:
+                - type: object
+                  properties:
+                    previous_value:
+                      type:
+                      - number
+                      - 'null'
+                    change_percent:
+                      type:
+                      - number
+                      - 'null'
+                    previous_from:
+                      type: string
+                      format: date
+                    previous_to:
+                      type: string
+                      format: date
+                  required:
+                  - previous_value
+                  - change_percent
+                  - previous_from
+                  - previous_to
+                - type: 'null'
+              as_of:
+                type: string
+                format: date-time
+              link:
+                type: object
+                properties:
+                  report_key:
+                    type: string
+                  query:
+                    type: object
+                    additionalProperties: true
+                required:
+                - report_key
+                - query
+            required:
+            - key
+            - report_key
+            - value
+            - unit
+            - comparison
+            - as_of
+            - link
+        generated_at:
+          type: string
+          format: date-time
+      required:
+      - scope
+      - date
+      - tiles
+      - generated_at
+    AttentionItem:
+      type: object
+      properties:
+        key:
+          type: string
+        count:
+          type: integer
+        amount:
+          type:
+          - integer
+          - 'null'
+        link:
+          type: object
+          properties:
+            path:
+              type: string
+            query:
+              type: object
+              additionalProperties: true
+          required:
+          - path
+          - query
+      required:
+      - key
+      - count
+      - link
+    MyDashboard:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        clock:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: Part 5 clock status
+        shifts_today:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        current_visit:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        next_booking:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        upcoming_bookings:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          maxItems: 5
+        completed_today_count:
+          type: integer
+        unread_notifications:
+          type: integer
+        pending:
+          type: object
+          properties:
+            leave_requests:
+              type: integer
+            discount_requests:
+              type: integer
+          required:
+          - leave_requests
+          - discount_requests
+        earnings_visible:
+          type: boolean
+        earnings:
+          oneOf:
+          - type: object
+            properties:
+              today_sales_amount:
+                type: integer
+                description: Whole MMK (D-PLT-04)
+              month_sales_amount:
+                type: integer
+                description: Whole MMK (D-PLT-04)
+              commission_estimate_amount:
+                type:
+                - integer
+                - 'null'
+              note:
+                type: string
+                enum:
+                - final_at_month_end
+                - final
+                - no_plan
+            required:
+            - today_sales_amount
+            - month_sales_amount
+            - note
+          - type: 'null'
+        generated_at:
+          type: string
+          format: date-time
+      required:
+      - date
+      - shifts_today
+      - upcoming_bookings
+      - completed_today_count
+      - unread_notifications
+      - pending
+      - earnings_visible
+      - earnings
+      - generated_at
+    ApprovalCounts:
+      type: object
+      properties:
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum:
+                - discount_requests
+                - leave
+                - expenses
+                - incomes
+                - attendance_exceptions
+                - purchase_posts
+              count:
+                type: integer
+              link:
+                type: object
+                properties:
+                  path:
+                    type: string
+                  query:
+                    type: object
+                    additionalProperties: true
+                required:
+                - path
+                - query
+            required:
+            - type
+            - count
+            - link
+      required:
+      - total
+      - items

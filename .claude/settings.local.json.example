@@ -1,7 +1,7 @@
 {
   "permissions": {
     "additionalDirectories": [
-      "D:/point_flow/<app-repo-folder>"
+      "../point-barber"
     ]
   }
 }

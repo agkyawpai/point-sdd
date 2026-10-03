@@ -466,6 +466,8 @@ function promptHidden(label, { input = process.stdin, output = process.stdout } 
   });
 }
 
+// Password sign-in (kept for systems that have passwords - the Point staff app
+// has none: use getLoginEmail + fetchLoginCode below).
 // Resolves credentials for a profile from POINT_TEST_<PROFILE>_USER (or _USERNAME)
 // and POINT_TEST_<PROFILE>_PASSWORD, prompting with hidden input for anything
 // missing when a terminal is attached. Throws code CREDENTIALS_UNAVAILABLE
@@ -479,6 +481,114 @@ async function getCredentials(profile = 'default', { env = process.env, run = nu
   return Object.freeze({ username, password });
 }
 
+// ---------------------------------------------------------------------------
+// Passwordless sign-in (Point Barbershop: e-mail code — D-AUTH-01)
+//
+// The system has no passwords. In development and test environments the 8-digit
+// sign-in code is delivered to Mailpit (ADR-007); a runner asks the app for a
+// code, then reads it here. There is no test-only login endpoint.
+
+const LOGIN_CODE_PATTERN = /(?<![0-9])[0-9]{8}(?![0-9])/;
+const LOGIN_CODE_MAX_REQUEST_AGE_MS = 10 * 60 * 1000;
+
+// Resolves the sign-in e-mail of a profile from POINT_TEST_<PROFILE>_EMAIL
+// (or _USER / _USERNAME), prompting when a terminal is attached. No password.
+async function getLoginEmail(profile = 'default', { env = process.env, run = null, prompt = promptHidden } = {}) {
+  const prefix = profilePrefix(profile);
+  const email = env[`${prefix}_EMAIL`] || env[`${prefix}_USER`] || env[`${prefix}_USERNAME`] || await prompt(`${profile} e-mail`);
+  if (!email || !/^[^@\s]+@[^@\s]+$/.test(email)) throw new HarnessError(`Sign-in e-mail for profile "${profile}" is missing or not an address`, 'CREDENTIALS_UNAVAILABLE');
+  registerSecret(run, email);
+  return email;
+}
+
+// Reads the newest sign-in code sent to `email` after `after` from Mailpit's
+// HTTP API (GET /api/v1/search?query=to:<email>, then GET /api/v1/message/<ID>).
+//
+// `after` (the moment just before the runner asked the app for a code) and
+// `run` are REQUIRED:
+//   - without `after` an older code could be returned while the new mail is
+//     still on its way, and a wrong code counts toward the 5-failure lock
+//     (D-AUTH-04);
+//   - without `run` the code could not be registered as a secret, so it could
+//     reach results, diagnostics or the summary.
+// `after` is compared with Mailpit's own `Created` time, so the runner and
+// Mailpit must share a clock (same machine / Docker host). If Mailpit's clock
+// is behind, the new mail is not accepted and the call ends as
+// CREDENTIALS_UNAVAILABLE (case BLOCKED) - never with an older code.
+// Only messages whose recipient list contains exactly `email` are read (a
+// Mailpit `to:` search can match a longer address that contains it). The text
+// part is read first; an HTML-only message is read with its tags removed.
+// Throws CREDENTIALS_UNAVAILABLE when Mailpit is not configured, cannot be
+// reached, or no code arrives in time; record affected cases as BLOCKED.
+async function fetchLoginCode({
+  email,
+  after,
+  run,
+  mailpitUrl = process.env[`${ENV_PREFIX}MAILPIT_URL`],
+  timeoutMs = 30000,
+  intervalMs = 1000,
+  requestTimeoutMs = 5000,
+  fetchImpl = globalThis.fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+} = {}) {
+  if (!email) throw new HarnessError('fetchLoginCode needs the sign-in e-mail', 'CREDENTIALS_UNAVAILABLE');
+  const afterIsTime = after instanceof Date || typeof after === 'number' || (typeof after === 'string' && after.trim() !== '');
+  const notBefore = afterIsTime ? new Date(after).getTime() : Number.NaN;
+  // `after` must be a real, recent moment: 0, true, '2026' or a time taken long ago would let an older code through.
+  if (Number.isNaN(notBefore) || notBefore < now() - LOGIN_CODE_MAX_REQUEST_AGE_MS) {
+    throw new HarnessError('fetchLoginCode needs `after` - the time taken just before the code was requested, at most 10 minutes ago (an older code must never be typed)', 'BAD_ARGUMENT');
+  }
+  if (!run || !Array.isArray(run.secretValues)) throw new HarnessError('fetchLoginCode needs `run` - the code must be registered as a secret', 'BAD_ARGUMENT');
+  if (!mailpitUrl) throw new HarnessError(`${ENV_PREFIX}MAILPIT_URL is not set - sign-in codes are read from Mailpit in test environments`, 'CREDENTIALS_UNAVAILABLE');
+  if (typeof fetchImpl !== 'function') throw new HarnessError('No fetch implementation available (Node.js 20.19+ required)', 'CREDENTIALS_UNAVAILABLE');
+  const base = String(mailpitUrl).replace(/\/+$/, '');
+  const wanted = String(email).trim().toLowerCase();
+  const deadline = now() + timeoutMs;
+  const getJson = async (url) => {
+    let response;
+    try {
+      const options = { headers: { accept: 'application/json' } };
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') options.signal = AbortSignal.timeout(requestTimeoutMs);
+      response = await fetchImpl(url, options);
+    } catch (error) {
+      throw new HarnessError(`Mailpit could not be reached (${(error && error.name) || 'error'})`, 'CREDENTIALS_UNAVAILABLE');
+    }
+    if (!response || !response.ok) throw new HarnessError(`Mailpit answered ${response ? response.status : 'nothing'}`, 'CREDENTIALS_UNAVAILABLE');
+    try {
+      return await response.json();
+    } catch {
+      throw new HarnessError('Mailpit answered with something that is not JSON', 'CREDENTIALS_UNAVAILABLE');
+    }
+  };
+  const isForAddress = (message) => {
+    const recipients = Array.isArray(message && message.To) ? message.To : null;
+    if (!recipients) return false;
+    return recipients.some((entry) => String((entry && entry.Address) || '').trim().toLowerCase() === wanted);
+  };
+  const bodyText = (message) => {
+    const text = (message && message.Text) || '';
+    const html = String((message && message.HTML) || '').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ');
+    return `${text}\n${html}\n${(message && message.Subject) || ''}`;
+  };
+  for (;;) {
+    const list = await getJson(`${base}/api/v1/search?query=${encodeURIComponent(`to:${email}`)}&limit=10`);
+    const candidates = (Array.isArray(list && list.messages) ? list.messages : [])
+      .filter((message) => message && message.ID && isForAddress(message) && new Date(message.Created).getTime() >= notBefore)
+      .sort((a, b) => new Date(b.Created).getTime() - new Date(a.Created).getTime());
+    for (const candidate of candidates) {
+      const message = await getJson(`${base}/api/v1/message/${encodeURIComponent(candidate.ID)}`);
+      const match = LOGIN_CODE_PATTERN.exec(bodyText(message));
+      if (match) {
+        registerSecret(run, match[0]);
+        return match[0];
+      }
+    }
+    if (now() + intervalMs > deadline) throw new HarnessError(`No sign-in code reached Mailpit for the requested address within ${timeoutMs} ms`, 'CREDENTIALS_UNAVAILABLE');
+    await sleep(intervalMs);
+  }
+}
+
 module.exports = {
   SCHEMA_VERSION,
   STATUSES,
@@ -489,8 +599,10 @@ module.exports = {
   assertMutationApproved,
   attachPageListeners,
   createRun,
+  fetchLoginCode,
   finalizeRun,
   getCredentials,
+  getLoginEmail,
   hasCaseResult,
   normalizeMutation,
   parseCaseList,

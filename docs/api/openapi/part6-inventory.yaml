@@ -1,0 +1,4827 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 6 · Inventory
+  version: 1.1.0
+  summary: Products, suppliers, stock levels and ledger, barber usage, adjustments, purchases, two-step transfers, stock counts
+  description: 'Design document for Part 6 (docs/api/06-inventory.md). Conventions: docs/api/00-conventions.md (v1.5 — incl. the idempotency wording of contract 15).
+
+    v1.1 (02/Oct/2026) — OPEN-40 locked (owner "OPEN-40 OK"): (c) lines removed when the lines of a DRAFT purchase / DRAFT transfer are replaced are deleted with a full audit diff
+    (the reading of owner answer A2 for booking items); no DB change. No endpoint, DTO or code changed — description strings only.
+
+    v1.0 (02/Oct, batch consistency pass — no version bump): Expenses.createAuto signature = Part 7, D3 correction = P7.EXP.07 + P7.EXP.03, usage double tap findable through Part 4 P4.REQ.01
+    (stock_movement); research items written "research E…".
+
+    Decisions served: D-STK-01..06 (REC-14), D-PAY-03/05, D-FIN-02/03/05/07/08, D-DAT-05, D-NTF-01..03, D-AUD-01/02, D-ROLE-02/03/07/09 (ADR-011, ADR-012), D-DB-10 (F-P6-01..09) / D-DB-11
+    (F-P7-05), D-PLT-15/16.
+
+    Review fixes 02/Oct (independent review — no version bump): whole-branch count = every ACTIVE product (no level row → expected 0); interceptor audit only (no DB audit trigger on
+    Part 6 tables); draft / count child writes lock the header row; post_requested derived from the audit row; POSTED purchase writes = 409 invalid_transition (no 423); empty items =
+    400 validation (items_required dropped); previous_month_pnl { date }; balance_after in (occurred_at, id) order; TransferReceive.note dropped; lock order = day lock → payroll lock
+    → sale → visit → booking → payments → receipt counter → cash-out / closing rows → purchase / transfer / count row → stock level rows last; removed draft lines raised as OPEN-40 (c) (answered in v1.1 — deleted with a full audit diff).
+
+    Reconcile 02/Oct (cross-part reconcile — no version bump): edits / line writes on a SENT / RECEIVED / CANCELLED transfer = 409 invalid_transition like a POSTED purchase — this part
+    answers no 423.
+
+    Status: 🔒 LOCKED v1.1 — D-API-07 (owner one-sheet "အကုန်လုံး OK", 02/Oct/2026 00:06 — D1–D9, B8 a, G (c), H; v1.1 = owner "OPEN-40 OK", 02/Oct/2026 — (c)). DB Part 6 v1.2 (stock_movements.client_request_id).
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "any staff (read scope)" = operational read, no code; "self" = own rows; levels
+    per ADR-012: categories / products / suppliers / adjustment reasons = company master; levels, movements, usage, adjustments, counts = branch data; purchases = branch data per line
+    (read: any line in scope · write: every line); transfers = branch data on two branches (read: either · draft / send / cancel: sending · receive: receiving, or the receiver — owner
+    D4).
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating operations need X-Requested-With: point-app (API-AUTH-02). Idempotency-Key is required only on stock usage
+    and manual adjustment (stock_movements.client_request_id — sheet G (c)); post / send / receive / count post are idempotent by state.
+
+    Conventions reminders: money = integer MMK; quantities = integer pcs; timestamps ISO 8601 with +06:30; business dates MMT; status / type = smallint codes (D-DB-03); errors = RFC
+    9457 problem+json with code = language key.'
+servers:
+- url: /api/v1
+  description: Same origin as the app — Caddy routes /api/* to NestJS (ADR-009)
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: product-categories
+  description: Product categories — F-P6-01 (company master)
+- name: products
+  description: Products — F-P6-02, D-PAY-03 (company master) + operational picker
+- name: suppliers
+  description: Suppliers — D-STK-02 (company master)
+- name: adjustment-reasons
+  description: Stock adjustment reasons — D-STK-05 (company master, disable only)
+- name: stock
+  description: Stock levels, movement ledger, barber usage, manual adjustments — D-STK-01/04/05/06 (branch data)
+- name: purchases
+  description: Purchases — D-STK-02, owner D1–D3 (branch data per line)
+- name: transfers
+  description: Two-step transfers — D-STK-03 / REC-14, owner D4 / D5 (two branches)
+- name: counts
+  description: Stock counts — D-STK-05, owner D8 / D9 (branch data)
+security:
+- sessionCookie: []
+paths:
+  /product-categories:
+    get:
+      tags:
+      - product-categories
+      operationId: productCategoryList
+      summary: Product categories (P6.CAT.01) — F-P6-01
+      x-permission: any staff (read scope) — operational for ACTIVE rows; status=0 or include_archived=true -> product.view+ (company master, read-only at branch scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductCategory'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - product-categories
+      operationId: productCategoryCreate
+      summary: Add a product category (P6.CAT.02)
+      x-permission: product.create (company master — company scope)
+      description: Name unique among non-archived (409 already_exists).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /product-categories/order:
+    put:
+      tags:
+      - product-categories
+      operationId: productCategoryReorder
+      summary: Reorder categories (P6.CAT.06)
+      x-permission: product.update (company master — company scope)
+      description: Must contain every non-archived id (400 validation).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductCategory'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /product-categories/{id}:
+    patch:
+      tags:
+      - product-categories
+      operationId: productCategoryUpdate
+      summary: Edit a category (P6.CAT.03)
+      x-permission: product.update (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCategoryUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /product-categories/{id}/archive:
+    post:
+      tags:
+      - product-categories
+      operationId: productCategoryArchive
+      summary: Archive a category (P6.CAT.04)
+      x-permission: product.delete (company master — company scope)
+      description: 409 category_in_use { count } while non-archived products belong to it.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /product-categories/{id}/restore:
+    post:
+      tags:
+      - product-categories
+      operationId: productCategoryRestore
+      summary: Restore a category (P6.CAT.05)
+      x-permission: product.delete (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /products:
+    get:
+      tags:
+      - products
+      operationId: productList
+      summary: Products list (P6.PRD.01) — AD-STK-01
+      x-permission: product.view+ (company master — any scope, read-only at branch scope)
+      parameters:
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Name (MM / EN) or SKU
+      - name: category_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: sellable
+        in: query
+        schema:
+          type: boolean
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Adds the stock at this branch to each row (branch must be in the caller read scope, else the stock part is null)
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - name
+          - category
+          - -updated_at
+          default: category
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - products
+      operationId: productCreate
+      summary: Add a product (P6.PRD.03) — F-P6-02
+      x-permission: product.create (company master — company scope)
+      description: Sellable ⇒ sell_price_amount required; shop-use ⇒ no price (400 validation — DB products_sell_price_chk). 409 already_exists (name / SKU among non-archived). 422 category_inactive.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /products/picker:
+    get:
+      tags:
+      - products
+      operationId: productPicker
+      summary: Product picker with stock at one branch (P6.PRD.02) — AD-POS-04, AD-STK-05
+      x-permission: any staff (read scope) — operational
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Branch in the caller read scope (else empty list)
+        required: true
+      - name: purpose
+        in: query
+        schema:
+          type: string
+          enum:
+          - sale
+          - usage
+          - purchase
+          - transfer
+          - adjust
+          - count
+        description: sale = ACTIVE sellable only · usage = ACTIVE, shop-use first, the caller's 5 most recent usages on top (owner D7) · others = ACTIVE (transfer / adjust / count also
+          list INACTIVE products with stock ≠ 0)
+        required: true
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Name or SKU (exact SKU match first — barcode)
+      - name: category_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 100
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductPick'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /products/{id}:
+    get:
+      tags:
+      - products
+      operationId: productGet
+      summary: Product detail + stock per branch (P6.PRD.04)
+      x-permission: product.view+ (company master — any scope)
+      description: branches[] = the branches in the caller read scope; last_unit_cost_amount only for purchase.view+ holders (else null).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - products
+      operationId: productUpdate
+      summary: Edit a product (P6.PRD.05)
+      x-permission: product.update (company master — company scope)
+      description: 'is_sellable false ⇒ the price is cleared; true ⇒ sell_price_amount required. New price applies to lines added from now (sale lines keep their snapshot). status 0
+        = INACTIVE: no new sales / purchases; stock can still be moved, counted, adjusted.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /products/{id}/archive:
+    post:
+      tags:
+      - products
+      operationId: productArchive
+      summary: Archive a product (P6.PRD.06) — D-DAT-05, AD-STK-01
+      x-permission: product.delete (company master — company scope)
+      description: '409 product_has_stock { branches: [{ branch_id, quantity }], in_transit_quantity } while any branch quantity ≠ 0 or a SENT transfer carries it (research E8) · 409
+        product_in_open_documents { purchases, transfers, counts, sales } while a DRAFT purchase / DRAFT transfer / IN_PROGRESS count / OPEN sale line has it.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /products/{id}/restore:
+    post:
+      tags:
+      - products
+      operationId: productRestore
+      summary: Restore a product (P6.PRD.07)
+      x-permission: product.delete (company master — company scope)
+      description: 409 already_exists when the name / SKU is now taken.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /suppliers:
+    get:
+      tags:
+      - suppliers
+      operationId: supplierList
+      summary: Suppliers list (P6.SUP.01)
+      x-permission: supplier.view+ (company master — any scope, read-only at branch scope)
+      parameters:
+      - name: q
+        in: query
+        schema:
+          type: string
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Supplier'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - suppliers
+      operationId: supplierCreate
+      summary: Add a supplier (P6.SUP.03)
+      x-permission: supplier.create (company master — company scope)
+      description: Name unique among non-archived (409 already_exists).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupplierCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Supplier'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /suppliers/picker:
+    get:
+      tags:
+      - suppliers
+      operationId: supplierPicker
+      summary: Supplier picker for the purchase form (P6.SUP.02)
+      x-permission: any staff (read scope) — operational
+      description: ACTIVE, non-archived suppliers — id + name only.
+      parameters:
+      - name: q
+        in: query
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SupplierPick'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /suppliers/{id}:
+    get:
+      tags:
+      - suppliers
+      operationId: supplierGet
+      summary: Supplier detail (P6.SUP.04)
+      x-permission: supplier.view+ (company master — any scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Supplier'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - suppliers
+      operationId: supplierUpdate
+      summary: Edit a supplier (P6.SUP.05)
+      x-permission: supplier.update (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupplierUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Supplier'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /suppliers/{id}/archive:
+    post:
+      tags:
+      - suppliers
+      operationId: supplierArchive
+      summary: Archive a supplier (P6.SUP.06)
+      x-permission: supplier.delete (company master — company scope)
+      description: Purchases keep the reference; the picker no longer offers it.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Supplier'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /suppliers/{id}/restore:
+    post:
+      tags:
+      - suppliers
+      operationId: supplierRestore
+      summary: Restore a supplier (P6.SUP.07)
+      x-permission: supplier.delete (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Supplier'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-adjustment-reasons:
+    get:
+      tags:
+      - adjustment-reasons
+      operationId: adjustmentReasonList
+      summary: Adjustment reasons (P6.RSN.01) — 🔒 D-STK-05
+      x-permission: any staff (read scope) — operational for ACTIVE rows; status=0 -> stock_adjustment_reason.view+ (company master)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdjustmentReason'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - adjustment-reasons
+      operationId: adjustmentReasonCreate
+      summary: Add a reason (P6.RSN.02)
+      x-permission: stock_adjustment_reason.create (company master — company scope)
+      description: 409 already_exists (name_mm unique — DB, disabled rows included).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustmentReasonCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdjustmentReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-adjustment-reasons/order:
+    put:
+      tags:
+      - adjustment-reasons
+      operationId: adjustmentReasonReorder
+      summary: Reorder reasons (P6.RSN.05)
+      x-permission: stock_adjustment_reason.update (company master — company scope)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdjustmentReason'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /stock-adjustment-reasons/{id}:
+    patch:
+      tags:
+      - adjustment-reasons
+      operationId: adjustmentReasonUpdate
+      summary: Rename a reason (P6.RSN.03)
+      x-permission: stock_adjustment_reason.update (company master — company scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name_mm:
+                  type: string
+                  minLength: 1
+                  maxLength: 150
+                name_en:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 150
+                expected_updated_at:
+                  type: string
+                  format: date-time
+                  description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+              required:
+              - expected_updated_at
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdjustmentReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-adjustment-reasons/{id}/status:
+    post:
+      tags:
+      - adjustment-reasons
+      operationId: adjustmentReasonSetStatus
+      summary: Disable / enable a reason (P6.RSN.04) — 🔒 D-STK-05 "disable only, never delete"
+      x-permission: stock_adjustment_reason.delete (company master — company scope)
+      description: '409 reason_in_use_by_setting { key: "stock.refund_damaged_reason_id" } when disabling the reason the refund write-off uses (research E10).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: integer
+                  enum:
+                  - 0
+                  - 1
+                  description: 0 INACTIVE · 1 ACTIVE
+              required:
+              - status
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdjustmentReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-levels:
+    get:
+      tags:
+      - stock
+      operationId: stockLevelList
+      summary: Stock levels (P6.STK.01) — AD-STK-01, 🔒 D-STK-01/06
+      x-permission: stock.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: 'One branch: every ACTIVE product (no row = 0) unless include_zero=false · omitted: existing rows of every branch in scope'
+      - name: category_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Name or SKU
+      - name: state
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - negative
+            - low
+            - ok
+            description: negative = quantity < 0 (D5 flag) · low = quantity ≤ effective threshold (at or below — research E6) · ok = above, or no threshold set
+        description: Repeatable (negative / low / ok)
+        style: form
+        explode: true
+      - name: sellable
+        in: query
+        schema:
+          type: boolean
+      - name: include_zero
+        in: query
+        schema:
+          type: boolean
+          default: true
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - name
+          - quantity
+          - state
+          default: name
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StockLevel'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /stock-levels/recompute:
+    post:
+      tags:
+      - stock
+      operationId: stockLevelRecompute
+      summary: Recompute the cached quantities from the ledger (P6.STK.08) — F-P6-04
+      x-permission: stock.update (branch data — every branch touched)
+      description: Sets quantity_on_hand = Σ stock_movements for every mismatching (branch, product) under row locks; no movement is written; audit stock.levels_recomputed with before
+        / after. Idempotent.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                branch_id:
+                  type:
+                  - string
+                  - 'null'
+                  format: uuid
+                  description: Omitted = every branch the grant covers
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecomputeResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /stock-levels/{branch_id}/{product_id}:
+    patch:
+      tags:
+      - stock
+      operationId: stockLevelUpdate
+      summary: Branch low-stock threshold override (P6.STK.02) — owner D6
+      x-permission: stock.update (branch data — the branch)
+      description: Upserts the level row; null = use the product default. Re-evaluates the low-stock state at once (P6-RULE-04).
+      parameters:
+      - name: branch_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: product_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockLevelUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockLevel'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-movements:
+    get:
+      tags:
+      - stock
+      operationId: stockMovementList
+      summary: Movement ledger (P6.STK.03) — AD-STK-02, 🔒 D-STK-06
+      x-permission: stock.view+ (branch data — scope-filtered)
+      description: Read-only (append-only ledger — corrections are new movements). balance_after = running Σ for the (branch, product) in (occurred_at, id) order, computed on read —
+        a backdated movement shifts the balances after it; the newest row equals quantity_on_hand.
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: product_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            - 6
+            - 7
+            - 8
+            description: 1 PURCHASE_IN · 2 TRANSFER_OUT · 3 TRANSFER_IN · 4 SALE_OUT · 5 SALE_RETURN_IN · 6 USAGE_OUT · 7 COUNT_ADJUST · 8 MANUAL_ADJUST (DB Part 6 — F-P6-05)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date
+      - name: recorded_by_user_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - -occurred_at
+          - occurred_at
+          default: -occurred_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StockMovement'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /stock-movements/{id}:
+    get:
+      tags:
+      - stock
+      operationId: stockMovementGet
+      summary: One movement with its reference (P6.STK.04)
+      x-permission: stock.view+ (branch data)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockMovement'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /stock-usages:
+    post:
+      tags:
+      - stock
+      operationId: stockUsageCreate
+      summary: '"Used up a bottle / box" (P6.STK.05) — 🔒 D-STK-04, AD-STK-05, owner D7'
+      x-permission: stock.usage (branch data — the usage branch; Barber seed)
+      description: 'USAGE_OUT −quantity. branch_id omitted → open clock-in branch (Part 5 Attendance.openRecordOf(employee_id)), else today''s single shift branch, else the only assigned
+        branch (422 branch_required { branch_ids }). Identifying fields for a replay: branch_id, product_id, quantity — only fields the request sent are compared (an omitted branch_id
+        is not). Never blocked by stock (warnings[] negative_stock — owner D5). No self-undo (owner D7). "Was it saved?" = Part 4 GET /v1/me/requests/{client_request_id} (resource_type
+        stock_movement).'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UsageCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MovementResult'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MovementResult'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /me/stock-usages:
+    get:
+      tags:
+      - stock
+      operationId: myStockUsageList
+      summary: My usage entries (P6.STK.06)
+      x-permission: self (movements recorded by the caller)
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today − 30
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StockMovement'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /stock-adjustments:
+    post:
+      tags:
+      - stock
+      operationId: stockAdjustmentCreate
+      summary: Manual adjustment with a reason (P6.STK.07) — 🔒 D-STK-05, owner D9
+      x-permission: stock.adjust (branch data — the branch)
+      description: 'MANUAL_ADJUST ± quantity, reason from the ACTIVE master list (422 reason_inactive). Identifying fields: branch_id, product_id, quantity_delta, reason_id. Notification
+        stock.adjusted to company-scope stock.adjust holders (owner D9 / F12).'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustmentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MovementResult'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MovementResult'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay of the same Idempotency-Key (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /purchases:
+    get:
+      tags:
+      - purchases
+      operationId: purchaseList
+      summary: Purchases list (P6.PUR.01) — AD-STK-03
+      x-permission: purchase.view+ (branch data — a purchase is listed when any line branch is in scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 DRAFT · 2 POSTED
+        description: Repeatable; default 1, 2
+        style: form
+        explode: true
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: supplier_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date of purchased_at
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Invoice reference or supplier name
+      - name: post_requested
+        in: query
+        schema:
+          type: boolean
+        description: 'DRAFTs sent to the admin for posting (owner D2) — derived: a purchase.request_post audit row with occurred_at ≥ purchases.updated_at (any later edit clears it —
+          P6-RULE-08)'
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - -purchased_at
+          - purchased_at
+          - -created_at
+          default: -purchased_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PurchaseListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - purchases
+      operationId: purchaseCreate
+      summary: Create a DRAFT purchase (P6.PUR.02) — 🔒 D-STK-02, owner D2
+      x-permission: purchase.create (branch data — every line branch)
+      description: No Idempotency-Key (a draft — a duplicate is visible and cancellable). 422 product_inactive · date_in_future · supplier_inactive; 409 duplicate_line (same branch +
+        product twice); 403 out_of_scope (a line branch outside the grant); an empty items list → 400 validation; warnings[] previous_month_pnl { date }.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchaseCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /purchases/{id}:
+    get:
+      tags:
+      - purchases
+      operationId: purchaseGet
+      summary: Purchase detail + per-branch totals (P6.PUR.03) — owner D3 review step
+      x-permission: purchase.view+ (branch data — any line branch in scope)
+      description: Lines outside the caller scope are summarised in other_branches[] (partial_view = true; total_amount null). totals_by_branch[] = the expense each branch will get /
+        got.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - purchases
+      operationId: purchaseUpdate
+      summary: Edit DRAFT header (P6.PUR.04)
+      x-permission: purchase.update (branch data — every line branch)
+      description: The purchase row is locked FOR UPDATE and re-checked DRAFT. POSTED → 409 invalid_transition (context.correction_path "stock_adjustment_and_expense" — owner D3, never
+        423); CANCELLED → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchaseUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /purchases/{id}/items:
+    put:
+      tags:
+      - purchases
+      operationId: purchaseItemsReplace
+      summary: Replace DRAFT lines (P6.PUR.05)
+      x-permission: purchase.update (branch data — every old and new line branch)
+      description: 'The purchase row is locked FOR UPDATE and re-checked DRAFT (POSTED → 409 invalid_transition with context.correction_path; CANCELLED → 409). Lines matched by id: kept
+        / changed in place, new inserted, missing removed = deleted with the full before / after in the audit diff purchase.update_items (the reading of owner A2 for
+        booking items; a DRAFT has no stock or money effect — owner 02/Oct/2026, OPEN-40 OK (c)). ≥ 1 line (400 validation — minItems 1).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchaseItemsReplace'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /purchases/{id}/request-post:
+    post:
+      tags:
+      - purchases
+      operationId: purchaseRequestPost
+      summary: '"Send to admin for posting" (P6.PUR.06) — owner D2'
+      x-permission: purchase.update (branch data — every line branch)
+      description: DRAFT only (409 invalid_transition otherwise); notification stock.purchase_post_requested to company-scope purchase.post holders (owner F12); interceptor audit row
+        purchase.request_post — the purchases row is not written (no updated_at bump); post_requested in the DTO is derived from that audit row and cleared by any later edit (P6-RULE-08).
+        Repeat = re-notify.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /purchases/{id}/post:
+    post:
+      tags:
+      - purchases
+      operationId: purchasePost
+      summary: 'Post: stock in + one expense per branch (P6.PUR.07) — F-P6-03, F-P7-05, owner D1 / D2 / D3'
+      x-permission: purchase.post (branch data — every line branch; Admin seed)
+      description: 'Idempotent by state (no Idempotency-Key — contract 15): already POSTED → 200 current state. 409 total_changed { total_amount } when expected_total_amount ≠ Σ lines
+        (the review step was stale) · 409 conflict · 422 product_inactive · date_in_future · supplier_inactive (archived supplier). Purchase row FOR UPDATE first; then, per branch with
+        subtotal > 0 (research E4), Part 7 Expenses.createAuto({ source: 4, purchase_id, branch_id, amount, expense_date, actor }) = an APPROVED expense in category PRODUCT_PURCHASE
+        (automatic source — APPROVED by DB CHECK, 🔒 F-P7-04; owner E4 governs manual entries only); the status change; and last PURCHASE_IN per line (StockLedger — stock level rows are
+        the last locks). No undo (owner D3): a wrong amount = company-scope expense.delete of that expense (P7.EXP.07) + a MANUAL expense in PRODUCT_PURCHASE (P7.EXP.03).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchasePost'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /purchases/{id}/cancel:
+    post:
+      tags:
+      - purchases
+      operationId: purchaseCancel
+      summary: Cancel a DRAFT (P6.PUR.08)
+      x-permission: purchase.delete (branch data — every line branch)
+      description: 'DRAFT → 0 CANCELLED (row kept — D-DAT-05); already CANCELLED → 200. POSTED → 409 invalid_transition with context.correction_path (owner D3: no undo).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason stored in the audit row (no DB column) — 400 reason_required when empty
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purchase'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-transfers:
+    get:
+      tags:
+      - transfers
+      operationId: transferList
+      summary: Transfers list (P6.TRF.01) — AD-STK-04
+      x-permission: transfer.view+ (branch data — sending or receiving branch in scope)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 CANCELLED · 1 DRAFT · 2 SENT (in transit) · 3 RECEIVED
+        description: Repeatable; default 1, 2, 3
+        style: form
+        explode: true
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Either side
+      - name: direction
+        in: query
+        schema:
+          type: string
+          enum:
+          - in
+          - out
+          - any
+          default: any
+        description: Relative to branch_id
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date of created / sent / received
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: flag
+        in: query
+        schema:
+          type: string
+          enum:
+          - short
+          - over
+          - in_transit
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TransferListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - transfers
+      operationId: transferCreate
+      summary: Create a DRAFT transfer (P6.TRF.03) — 🔒 D-STK-03
+      x-permission: transfer.create (branch data — the sending branch)
+      description: 422 same_branch · receiver_not_at_branch (named receiver must be ACTIVE and assigned to the receiving branch) · product_archived; 409 duplicate_line. Quantities start
+        empty in the UI (AD-STK-04).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransfer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /me/stock-transfers:
+    get:
+      tags:
+      - transfers
+      operationId: myTransferList
+      summary: Transfers I may receive (P6.TRF.02) — owner D4
+      x-permission: self (named receiver, or staff of the receiving branch for BRANCH_STAFF transfers)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 CANCELLED · 1 DRAFT · 2 SENT (in transit) · 3 RECEIVED
+        description: Repeatable; default 2 (in transit)
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TransferListItem'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /stock-transfers/{id}:
+    get:
+      tags:
+      - transfers
+      operationId: transferGet
+      summary: Transfer detail (P6.TRF.04)
+      x-permission: transfer.view+ (branch data — either branch) | self (receiver — owner D4)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransfer'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - transfers
+      operationId: transferUpdate
+      summary: Edit a DRAFT (P6.TRF.05)
+      x-permission: transfer.update (branch data — the sending branch)
+      description: 'The transfer row is locked FOR UPDATE and re-checked DRAFT. SENT / RECEIVED / CANCELLED → 409 invalid_transition { status, correction_path? } (SENT: correction_path
+        "receive_zero_with_reason"; the same answer as a POSTED purchase — never 423). The sending branch never changes (cancel + new).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransfer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-transfers/{id}/items:
+    put:
+      tags:
+      - transfers
+      operationId: transferItemsReplace
+      summary: Replace DRAFT lines (P6.TRF.06)
+      x-permission: transfer.update (branch data — the sending branch)
+      description: 'The transfer row is locked FOR UPDATE and re-checked DRAFT. Matched by id (kept / changed in place, new inserted, missing removed = deleted
+        with the full audit diff transfer.update_items, as purchases — owner 02/Oct/2026, OPEN-40 OK (c)). ≥ 1 line (400 validation — minItems 1). SENT / RECEIVED / CANCELLED → 409 invalid_transition (as the header edit — never 423).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferItemsReplace'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransfer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-transfers/{id}/send:
+    post:
+      tags:
+      - transfers
+      operationId: transferSend
+      summary: Send — stock leaves the branch (P6.TRF.07) — 🔒 D-STK-03 / REC-14
+      x-permission: transfer.send (branch data — the sending branch)
+      description: 'Idempotent by state: already SENT / RECEIVED → 200 current state. TRANSFER_OUT −quantity_sent per line at the sending branch; below zero allowed (warnings[] negative_stock
+        — owner D5). Receiver re-checked (422 receiver_not_at_branch). Notification stock.transfer_sent + realtime to the receiver(s).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_updated_at:
+                  type: string
+                  format: date-time
+                  description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+              required:
+              - expected_updated_at
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransferWithWarnings'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-transfers/{id}/receive:
+    post:
+      tags:
+      - transfers
+      operationId: transferReceive
+      summary: Receive with actual quantities (P6.TRF.08) — 🔒 D-STK-03, owner D4, research E7
+      x-permission: transfer.receive (branch data — the receiving branch) | self (named receiver, or staff of the receiving branch for BRANCH_STAFF — owner D4)
+      description: 'Transfer row FOR UPDATE, re-checked SENT. Every line once. received ≠ sent ⇒ difference_reason (400 reason_required — DB stock_transfer_items_difference_chk); over-receipt
+        allowed (flag over, admin notification — research E7). TRANSFER_IN +quantity_received per line with quantity > 0. Idempotent by state: RECEIVED with the same quantities → 200;
+        different → 409 invalid_transition. DRAFT → 409 invalid_transition.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferReceive'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransferWithWarnings'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-transfers/{id}/cancel:
+    post:
+      tags:
+      - transfers
+      operationId: transferCancel
+      summary: Cancel a DRAFT (P6.TRF.09)
+      x-permission: transfer.delete (branch data — the sending branch)
+      description: DRAFT only; SENT → 409 invalid_transition with context.correction_path "receive_zero_with_reason" (🔒 F-P6-06 — stock already left).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason stored in the audit row (no DB column) — 400 reason_required when empty
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockTransfer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /stock-counts:
+    get:
+      tags:
+      - counts
+      operationId: countList
+      summary: Stock counts (P6.CNT.01)
+      x-permission: stock.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 IN_PROGRESS · 2 POSTED
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StockCountListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - counts
+      operationId: countStart
+      summary: Start a count — whole branch or categories (P6.CNT.02) — 🔒 D-STK-05, F-P6-07, owner D8
+      x-permission: stock.count (branch data — the branch)
+      description: 'Whole branch = every ACTIVE non-archived product — also those without a stock level row at the branch (expected 0) — plus INACTIVE products with quantity ≠ 0; category_ids
+        = the same rule within those categories (P6-RULE-10). Snapshots expected_quantity per product (blind: not returned while IN_PROGRESS). 409 count_in_progress { count_id } (one
+        per branch — DB partial unique) · 422 nothing_to_count.'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CountCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCount'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-counts/{id}:
+    get:
+      tags:
+      - counts
+      operationId: countGet
+      summary: Count detail — blind while in progress (P6.CNT.03) — owner D8
+      x-permission: stock.view+ (branch data)
+      description: 'IN_PROGRESS: expected_quantity and difference_quantity are null (blind entry). POSTED / CANCELLED: full values.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCount'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /stock-counts/{id}/items:
+    patch:
+      tags:
+      - counts
+      operationId: countItemsUpdate
+      summary: Enter counted quantities (P6.CNT.04)
+      x-permission: stock.count (branch data)
+      description: Bulk; counted_quantity null = uncount. The count row is locked FOR UPDATE per request and re-checked IN_PROGRESS (409 invalid_transition); last write wins per item;
+        realtime stock.count_updated keeps several phones in step. The optional reason / note stay on the count line (never copied to the COUNT_ADJUST movement — DB CHECK).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CountItemsUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCount'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags:
+      - counts
+      operationId: countItemAdd
+      summary: Add a product found on the shelf (P6.CNT.05)
+      x-permission: stock.count (branch data)
+      description: expected_quantity = the branch quantity now. 409 already_in_count · 422 product_archived.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CountItemAdd'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCount'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-counts/{id}/review:
+    get:
+      tags:
+      - counts
+      operationId: countReview
+      summary: Review differences before posting (P6.CNT.06) — owner D8
+      x-permission: stock.count (branch data)
+      description: Expected, counted and difference per item + summary (uncounted / different / short / over, approximate cost from the last purchase unit cost — display only, F-P6-03).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: filter
+        in: query
+        schema:
+          type: string
+          enum:
+          - all
+          - uncounted
+          - different
+          default: all
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountReview'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /stock-counts/{id}/post:
+    post:
+      tags:
+      - counts
+      operationId: countPost
+      summary: Post — COUNT_ADJUST per difference (P6.CNT.07) — owner D9
+      x-permission: stock.count (branch data)
+      description: 'Idempotent by state: POSTED → 200 current state. 422 count_incomplete { uncounted } until every item is counted. COUNT_ADJUST per difference with occurred_at = posted_at
+        and no reason / note on the movement. Notification stock.count_posted to company-scope stock.count holders when any difference ≠ 0 (owner D9 / F12).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_updated_at:
+                  type: string
+                  format: date-time
+                  description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCountWithWarnings'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /stock-counts/{id}/cancel:
+    post:
+      tags:
+      - counts
+      operationId: countCancel
+      summary: Cancel a count (P6.CNT.08)
+      x-permission: stock.count (branch data)
+      description: IN_PROGRESS → 0 CANCELLED; nothing is posted. POSTED → 409 invalid_transition.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+              required:
+              - reason
+              description: Reason stored in the audit row (no DB column) — 400 reason_required when empty
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockCount'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: client_request_id — one UUID per logical submit, kept across retries (API-IDEM-01 v1.5, sheet G (c), 🔒 D-VIS-10); stored on stock_movements.client_request_id; missing
+        → 400 idempotency_key_required
+  responses:
+    ValidationError:
+      description: 400 validation (incl. an empty items list) · reason_required · idempotency_key_required (errors[] per field)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden (context.required names the missing code) · out_of_scope (a line / branch outside the grant) · company_scope_required (ADR-012) · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (unknown id, out-of-scope single read)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 invalid_transition (every write on a POSTED purchase and every edit / line write / cancel on a SENT, RECEIVED or CANCELLED transfer — context.correction_path for
+        a POSTED purchase and a SENT transfer) · conflict (expected_updated_at) · already_exists · duplicate_line · already_in_count · category_in_use · product_has_stock · product_in_open_documents
+        · count_in_progress · total_changed · reason_in_use_by_setting · idempotency_in_progress
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/06-inventory.md §12 (product_inactive, product_archived, category_inactive, supplier_inactive, reason_inactive, date_in_future,
+        same_branch, receiver_not_at_branch, branch_required, nothing_to_count, count_incomplete, idempotency_mismatch)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data (API-ERR-01 v1.4): product_has_stock → { branches[], in_transit_quantity } · product_in_open_documents → { purchases, transfers, counts, sales }
+            · count_in_progress → { count_id } · count_incomplete → { uncounted } · total_changed → { total_amount } · branch_required → { branch_ids } · reason_in_use_by_setting → {
+            key } · category_in_use → { count } · invalid_transition → { status, correction_path? }'
+      required:
+      - type
+      - title
+      - status
+      - code
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: negative_stock { branch_id, product_id, quantity_on_hand } · low_stock { branch_id, product_id, quantity_on_hand, threshold } · previous_month_pnl { date } (same
+            code and context as Part 7) · over_received { item_id, over } · short_received { item_id, short } · inactive_product { product_id }
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    ProductCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        product_count:
+          type: integer
+          description: Non-archived products
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - sort_order
+      - status
+      - product_count
+      - updated_at
+    ProductCategoryCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        sort_order:
+          type: integer
+      required:
+      - name_mm
+    ProductCategoryUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    BranchStockSummary:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        quantity_on_hand:
+          type: integer
+        low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+        effective_threshold:
+          type:
+          - integer
+          - 'null'
+        state:
+          type: string
+          enum:
+          - negative
+          - low
+          - ok
+          description: negative = quantity < 0 (D5 flag) · low = quantity ≤ effective threshold (at or below — research E6) · ok = above, or no threshold set
+        incoming_quantity:
+          type: integer
+          description: On SENT transfers to this branch (in transit — research E8)
+        outgoing_in_transit_quantity:
+          type: integer
+          description: On SENT transfers from this branch
+      required:
+      - branch_id
+      - quantity_on_hand
+      - effective_threshold
+      - state
+      - incoming_quantity
+      - outgoing_in_transit_quantity
+    ProductListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        sku:
+          type:
+          - string
+          - 'null'
+        is_sellable:
+          type: boolean
+        sell_price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Company price (F-P6-02 — branch override ⏭); null for shop-use products
+        default_low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        stock:
+          oneOf:
+          - $ref: '#/components/schemas/BranchStockSummary'
+          - type: 'null'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - category_id
+      - name_mm
+      - is_sellable
+      - status
+      - updated_at
+    Product:
+      allOf:
+      - $ref: '#/components/schemas/ProductListItem'
+      - type: object
+        properties:
+          category:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - id
+            - name_mm
+          branches:
+            type: array
+            items:
+              $ref: '#/components/schemas/BranchStockSummary'
+            description: Branches in the caller read scope
+          in_transit_quantity:
+            type: integer
+          last_unit_cost_amount:
+            type:
+            - integer
+            - 'null'
+            minimum: 0
+            description: Latest POSTED purchase line cost (display only — F-P6-03); null without purchase.view+
+          created_at:
+            type: string
+            format: date-time
+        required:
+        - category
+        - branches
+        - in_transit_quantity
+        - created_at
+    ProductCreate:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 200
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        sku:
+          type:
+          - string
+          - 'null'
+          maxLength: 50
+        is_sellable:
+          type: boolean
+          default: true
+        sell_price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Required when is_sellable; must be absent / null otherwise
+        default_low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+      required:
+      - category_id
+      - name_mm
+      - is_sellable
+    ProductUpdate:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 200
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 200
+        sku:
+          type:
+          - string
+          - 'null'
+          maxLength: 50
+        is_sellable:
+          type: boolean
+        sell_price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        default_low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    ProductPick:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        sku:
+          type:
+          - string
+          - 'null'
+        is_sellable:
+          type: boolean
+        sell_price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        quantity_on_hand:
+          type: integer
+        state:
+          type: string
+          enum:
+          - negative
+          - low
+          - ok
+          description: negative = quantity < 0 (D5 flag) · low = quantity ≤ effective threshold (at or below — research E6) · ok = above, or no threshold set
+        recent:
+          type: boolean
+          description: 'purpose=usage: one of the caller''s 5 most recent usages (listed first)'
+      required:
+      - id
+      - category_id
+      - name_mm
+      - is_sellable
+      - status
+      - quantity_on_hand
+      - state
+    Supplier:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        phone:
+          type:
+          - string
+          - 'null'
+        address:
+          type:
+          - string
+          - 'null'
+        notes:
+          type:
+          - string
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name
+      - status
+      - created_at
+      - updated_at
+    SupplierCreate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        phone:
+          type:
+          - string
+          - 'null'
+          maxLength: 50
+        address:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+      required:
+      - name
+    SupplierUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        phone:
+          type:
+          - string
+          - 'null'
+          maxLength: 50
+        address:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    SupplierPick:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+      required:
+      - id
+      - name
+    AdjustmentReason:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        used_by_setting:
+          type:
+          - string
+          - 'null'
+          description: '"stock.refund_damaged_reason_id" when the refund write-off uses it (cannot be disabled — research E10)'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - sort_order
+      - status
+      - updated_at
+    AdjustmentReasonCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        sort_order:
+          type: integer
+      required:
+      - name_mm
+    StockLevel:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        product:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            sku:
+              type:
+              - string
+              - 'null'
+            is_sellable:
+              type: boolean
+            category_id:
+              type: string
+              format: uuid
+          required:
+          - id
+          - name_mm
+          - is_sellable
+        quantity_on_hand:
+          type: integer
+        low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+          description: Branch override (null = product default)
+        effective_threshold:
+          type:
+          - integer
+          - 'null'
+        state:
+          type: string
+          enum:
+          - negative
+          - low
+          - ok
+          description: negative = quantity < 0 (D5 flag) · low = quantity ≤ effective threshold (at or below — research E6) · ok = above, or no threshold set
+        incoming_quantity:
+          type: integer
+        low_stock_notified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - branch_id
+      - product
+      - quantity_on_hand
+      - effective_threshold
+      - state
+      - incoming_quantity
+    StockLevelUpdate:
+      type: object
+      properties:
+        low_stock_threshold:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        expected_updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Level updated_at (null when no row existed yet)
+      required:
+      - low_stock_threshold
+    MovementReference:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - purchase
+          - transfer
+          - sale
+          - refund
+          - count
+        id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        label:
+          type:
+          - string
+          - 'null'
+          description: Receipt / RF number, invoice reference, transfer route
+      required:
+      - type
+      - id
+      - item_id
+    StockMovement:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        product:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            sku:
+              type:
+              - string
+              - 'null'
+            is_sellable:
+              type: boolean
+            category_id:
+              type: string
+              format: uuid
+          required:
+          - id
+          - name_mm
+          - is_sellable
+        movement_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          description: 1 PURCHASE_IN · 2 TRANSFER_OUT · 3 TRANSFER_IN · 4 SALE_OUT · 5 SALE_RETURN_IN · 6 USAGE_OUT · 7 COUNT_ADJUST · 8 MANUAL_ADJUST (DB Part 6 — F-P6-05)
+        quantity_delta:
+          type: integer
+          description: ≠ 0 · IN + · OUT −
+        balance_after:
+          type: integer
+          description: Running Σ of quantity_delta for (branch, product) in (occurred_at, id) order — computed on read, not stored
+        reference:
+          oneOf:
+          - $ref: '#/components/schemas/MovementReference'
+          - type: 'null'
+        adjustment_reason:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - id
+            - name_mm
+          - type: 'null'
+          description: 'MANUAL_ADJUST (required) / USAGE_OUT (optional): stored on the movement. COUNT_ADJUST: read from the count line (the DB allows no reason on a type-7 movement)'
+        note:
+          type:
+          - string
+          - 'null'
+        occurred_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        recorded_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - product
+      - movement_type
+      - quantity_delta
+      - balance_after
+      - occurred_at
+      - business_date
+      - recorded_by
+      - created_at
+    UsageCreate:
+      type: object
+      properties:
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Omitted → open clock-in branch (Part 5 Attendance.openRecordOf), else today's single shift branch, else the only assigned branch; when omitted it is not compared
+            on a replay
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 99
+          default: 1
+          description: Bottles / boxes used up (🔒 D-STK-04)
+        adjustment_reason_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Optional (DB allows a reason on USAGE_OUT)
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 500
+      required:
+      - product_id
+    AdjustmentCreate:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        quantity_delta:
+          type: integer
+          minimum: -100000
+          maximum: 100000
+          not:
+            const: 0
+          description: ≠ 0; + found / − damaged, lost …
+        reason_id:
+          type: string
+          format: uuid
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      required:
+      - branch_id
+      - product_id
+      - quantity_delta
+      - reason_id
+    MovementResult:
+      type: object
+      properties:
+        movement:
+          $ref: '#/components/schemas/StockMovement'
+        level:
+          $ref: '#/components/schemas/StockLevel'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+      required:
+      - movement
+      - level
+      - warnings
+    RecomputeResult:
+      type: object
+      properties:
+        checked:
+          type: integer
+        mismatches:
+          type: array
+          items:
+            type: object
+            properties:
+              branch_id:
+                type: string
+                format: uuid
+              product_id:
+                type: string
+                format: uuid
+              cached_quantity:
+                type: integer
+              ledger_quantity:
+                type: integer
+            required:
+            - branch_id
+            - product_id
+            - cached_quantity
+            - ledger_quantity
+        fixed:
+          type: integer
+      required:
+      - checked
+      - mismatches
+      - fixed
+    PurchaseItemInput:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Existing line id (PUT replace) — omit for a new line
+        branch_id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: pcs (🔒 D-STK-01)
+        unit_cost_amount:
+          type: integer
+          minimum: 0
+          description: MMK per pc, ≥ 0 (0 = free sample — no expense, research E4)
+      required:
+      - branch_id
+      - product_id
+      - quantity
+      - unit_cost_amount
+    PurchaseCreate:
+      type: object
+      properties:
+        supplier_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Optional (🔒 D-STK-02)
+        invoice_reference:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        purchased_at:
+          type: string
+          format: date-time
+          description: ≤ now (422 date_in_future); business_date = its MMT date
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PurchaseItemInput'
+          minItems: 1
+      required:
+      - purchased_at
+      - items
+    PurchaseUpdate:
+      type: object
+      properties:
+        supplier_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        invoice_reference:
+          type:
+          - string
+          - 'null'
+          maxLength: 100
+        purchased_at:
+          type: string
+          format: date-time
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    PurchaseItemsReplace:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PurchaseItemInput'
+          minItems: 1
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - items
+      - expected_updated_at
+    PurchasePost:
+      type: object
+      properties:
+        expected_total_amount:
+          type: integer
+          minimum: 0
+          description: Σ line totals shown on the review step (owner D3)
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_total_amount
+      - expected_updated_at
+    PurchaseItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        product:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            sku:
+              type:
+              - string
+              - 'null'
+            is_sellable:
+              type: boolean
+            category_id:
+              type: string
+              format: uuid
+          required:
+          - id
+          - name_mm
+          - is_sellable
+        quantity:
+          type: integer
+        unit_cost_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        line_total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+      required:
+      - id
+      - branch_id
+      - product
+      - quantity
+      - unit_cost_amount
+      - line_total_amount
+    PurchaseBranchTotal:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        line_count:
+          type: integer
+        quantity:
+          type: integer
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        expense_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: 'POSTED: the source-4 expense of this branch (null when the subtotal is 0 — research E4)'
+      required:
+      - branch_id
+      - line_count
+      - quantity
+      - amount
+    Purchase:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 DRAFT · 2 POSTED
+        supplier:
+          oneOf:
+          - $ref: '#/components/schemas/SupplierPick'
+          - type: 'null'
+        invoice_reference:
+          type:
+          - string
+          - 'null'
+        purchased_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        notes:
+          type:
+          - string
+          - 'null'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PurchaseItem'
+        totals_by_branch:
+          type: array
+          items:
+            $ref: '#/components/schemas/PurchaseBranchTotal'
+        other_branches:
+          type: array
+          items:
+            type: object
+            properties:
+              branch_id:
+                type: string
+                format: uuid
+              line_count:
+                type: integer
+            required:
+            - branch_id
+            - line_count
+          description: Lines outside the caller scope (hidden)
+        partial_view:
+          type: boolean
+        total_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Σ all lines; null when partial_view
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+        post_requested:
+          oneOf:
+          - type: object
+            properties:
+              at:
+                type: string
+                format: date-time
+              by:
+                type: object
+                properties:
+                  user_id:
+                    type: string
+                    format: uuid
+                  display_name:
+                    type: string
+                required:
+                - user_id
+                - display_name
+            required:
+            - at
+            - by
+          - type: 'null'
+          description: 'DRAFT only — derived (no column): the latest purchase.request_post audit row with occurred_at ≥ updated_at; null after any later edit (P6-RULE-08)'
+        posted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        posted_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        actions:
+          type: object
+          properties:
+            can_edit:
+              type: boolean
+            can_request_post:
+              type: boolean
+            can_post:
+              type: boolean
+            can_cancel:
+              type: boolean
+          required:
+          - can_edit
+          - can_request_post
+          - can_post
+          - can_cancel
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - status
+      - purchased_at
+      - business_date
+      - items
+      - totals_by_branch
+      - other_branches
+      - partial_view
+      - created_by
+      - created_at
+      - actions
+      - warnings
+      - updated_at
+    PurchaseListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 DRAFT · 2 POSTED
+        supplier:
+          oneOf:
+          - $ref: '#/components/schemas/SupplierPick'
+          - type: 'null'
+        invoice_reference:
+          type:
+          - string
+          - 'null'
+        purchased_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        branch_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        line_count:
+          type: integer
+        total_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        partial_view:
+          type: boolean
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        post_requested_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Derived as Purchase.post_requested.at
+        posted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - status
+      - purchased_at
+      - business_date
+      - branch_ids
+      - line_count
+      - partial_view
+      - created_by
+    TransferItemInput:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Existing line id (PUT replace) — omit for a new line
+        product_id:
+          type: string
+          format: uuid
+        quantity_sent:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: pcs (🔒 D-STK-01)
+      required:
+      - product_id
+      - quantity_sent
+    TransferCreate:
+      type: object
+      properties:
+        from_branch_id:
+          type: string
+          format: uuid
+        to_branch_id:
+          type: string
+          format: uuid
+        receiver_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EMPLOYEE (one named receiver) · 2 BRANCH_STAFF (every active staff member of the receiving branch)
+        receiver_employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Required when receiver_type = 1 (DB CHECK)
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferItemInput'
+          minItems: 1
+      required:
+      - from_branch_id
+      - to_branch_id
+      - receiver_type
+      - items
+    TransferUpdate:
+      type: object
+      properties:
+        to_branch_id:
+          type: string
+          format: uuid
+        receiver_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EMPLOYEE (one named receiver) · 2 BRANCH_STAFF (every active staff member of the receiving branch)
+        receiver_employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - expected_updated_at
+    TransferItemsReplace:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferItemInput'
+          minItems: 1
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: updated_at the client last read — mismatch → 409 conflict (API-IDEM-04)
+      required:
+      - items
+      - expected_updated_at
+    TransferReceive:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: string
+                format: uuid
+              quantity_received:
+                type: integer
+                minimum: 0
+                maximum: 100000
+              difference_reason:
+                type:
+                - string
+                - 'null'
+                maxLength: 500
+                description: Required when quantity_received ≠ quantity_sent
+            required:
+            - item_id
+            - quantity_received
+          minItems: 1
+          description: Every line of the transfer exactly once
+      required:
+      - items
+      description: No receive note — stock_transfers has only the draft notes column; a difference is explained per line (difference_reason)
+    TransferItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        product:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            sku:
+              type:
+              - string
+              - 'null'
+            is_sellable:
+              type: boolean
+            category_id:
+              type: string
+              format: uuid
+          required:
+          - id
+          - name_mm
+          - is_sellable
+        quantity_sent:
+          type: integer
+        quantity_received:
+          type:
+          - integer
+          - 'null'
+        difference:
+          type:
+          - integer
+          - 'null'
+          description: received − sent (negative = short, charged to the sending branch — F-P6-06)
+        difference_reason:
+          type:
+          - string
+          - 'null'
+        flag:
+          type:
+          - string
+          - 'null'
+          enum:
+          - short
+          - over
+          - null
+      required:
+      - id
+      - product
+      - quantity_sent
+    StockTransfer:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 DRAFT · 2 SENT (in transit) · 3 RECEIVED
+        from_branch_id:
+          type: string
+          format: uuid
+        to_branch_id:
+          type: string
+          format: uuid
+        receiver_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EMPLOYEE (one named receiver) · 2 BRANCH_STAFF (every active staff member of the receiving branch)
+        receiver_employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        notes:
+          type:
+          - string
+          - 'null'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferItem'
+        totals:
+          type: object
+          properties:
+            sent:
+              type: integer
+            received:
+              type:
+              - integer
+              - 'null'
+            short:
+              type: integer
+            over:
+              type: integer
+          required:
+          - sent
+          - short
+          - over
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        created_at:
+          type: string
+          format: date-time
+        sent_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        sent_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        received_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        received_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        can_receive:
+          type: boolean
+          description: SENT and the caller may receive (owner D4)
+        actions:
+          type: object
+          properties:
+            can_edit:
+              type: boolean
+            can_send:
+              type: boolean
+            can_cancel:
+              type: boolean
+          required:
+          - can_edit
+          - can_send
+          - can_cancel
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - status
+      - from_branch_id
+      - to_branch_id
+      - receiver_type
+      - items
+      - totals
+      - created_by
+      - created_at
+      - can_receive
+      - actions
+      - updated_at
+    StockTransferWithWarnings:
+      allOf:
+      - $ref: '#/components/schemas/StockTransfer'
+      - type: object
+        properties:
+          warnings:
+            type: array
+            items:
+              $ref: '#/components/schemas/Warning'
+        required:
+        - warnings
+    TransferListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 DRAFT · 2 SENT (in transit) · 3 RECEIVED
+        from_branch_id:
+          type: string
+          format: uuid
+        to_branch_id:
+          type: string
+          format: uuid
+        receiver_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EMPLOYEE (one named receiver) · 2 BRANCH_STAFF (every active staff member of the receiving branch)
+        receiver_employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+        line_count:
+          type: integer
+        quantity_sent:
+          type: integer
+        quantity_received:
+          type:
+          - integer
+          - 'null'
+        flags:
+          type: array
+          items:
+            type: string
+            enum:
+            - short
+            - over
+            - in_transit
+        created_at:
+          type: string
+          format: date-time
+        sent_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        received_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - status
+      - from_branch_id
+      - to_branch_id
+      - receiver_type
+      - line_count
+      - quantity_sent
+      - flags
+      - created_at
+    CountCreate:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        category_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Empty / omitted = whole branch = every ACTIVE product, with or without a level row (owner D8 — P6-RULE-10)
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+      required:
+      - branch_id
+    CountItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        product:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            sku:
+              type:
+              - string
+              - 'null'
+            is_sellable:
+              type: boolean
+            category_id:
+              type: string
+              format: uuid
+          required:
+          - id
+          - name_mm
+          - is_sellable
+        counted_quantity:
+          type:
+          - integer
+          - 'null'
+        expected_quantity:
+          type:
+          - integer
+          - 'null'
+          description: null while IN_PROGRESS (blind — owner D8)
+        difference_quantity:
+          type:
+          - integer
+          - 'null'
+          description: counted − expected; null while IN_PROGRESS
+        adjustment_reason:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - id
+            - name_mm
+          - type: 'null'
+        note:
+          type:
+          - string
+          - 'null'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - product
+      - counted_quantity
+      - expected_quantity
+      - difference_quantity
+    StockCount:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 IN_PROGRESS · 2 POSTED
+        category_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Computed — the distinct category ids of the products in this count (stock_counts has no scope column; the requested scope is in the audit row stock_count.start)
+        started_at:
+          type: string
+          format: date-time
+        started_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        posted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        posted_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        notes:
+          type:
+          - string
+          - 'null'
+        progress:
+          type: object
+          properties:
+            counted:
+              type: integer
+            total:
+              type: integer
+          required:
+          - counted
+          - total
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CountItem'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - status
+      - started_at
+      - started_by
+      - progress
+      - items
+      - updated_at
+    StockCountWithWarnings:
+      allOf:
+      - $ref: '#/components/schemas/StockCount'
+      - type: object
+        properties:
+          warnings:
+            type: array
+            items:
+              $ref: '#/components/schemas/Warning'
+        required:
+        - warnings
+    StockCountListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 IN_PROGRESS · 2 POSTED
+        started_at:
+          type: string
+          format: date-time
+        started_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        posted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        progress:
+          type: object
+          properties:
+            counted:
+              type: integer
+            total:
+              type: integer
+          required:
+          - counted
+          - total
+        different_count:
+          type:
+          - integer
+          - 'null'
+          description: POSTED only
+      required:
+      - id
+      - branch_id
+      - status
+      - started_at
+      - started_by
+      - progress
+    CountItemsUpdate:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: string
+                format: uuid
+              counted_quantity:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                maximum: 100000
+              adjustment_reason_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              note:
+                type:
+                - string
+                - 'null'
+                maxLength: 500
+            required:
+            - item_id
+            - counted_quantity
+          minItems: 1
+      required:
+      - items
+    CountItemAdd:
+      type: object
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        counted_quantity:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          maximum: 100000
+      required:
+      - product_id
+    CountReview:
+      type: object
+      properties:
+        count_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 IN_PROGRESS · 2 POSTED
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: string
+                format: uuid
+              product:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  name_mm:
+                    type: string
+                  name_en:
+                    type:
+                    - string
+                    - 'null'
+                  sku:
+                    type:
+                    - string
+                    - 'null'
+                  is_sellable:
+                    type: boolean
+                  category_id:
+                    type: string
+                    format: uuid
+                required:
+                - id
+                - name_mm
+                - is_sellable
+              expected_quantity:
+                type: integer
+              counted_quantity:
+                type:
+                - integer
+                - 'null'
+              difference_quantity:
+                type:
+                - integer
+                - 'null'
+              adjustment_reason:
+                oneOf:
+                - type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                    name_mm:
+                      type: string
+                    name_en:
+                      type:
+                      - string
+                      - 'null'
+                  required:
+                  - id
+                  - name_mm
+                - type: 'null'
+              note:
+                type:
+                - string
+                - 'null'
+              last_unit_cost_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                description: Display only (F-P6-03 — no valuation)
+            required:
+            - item_id
+            - product
+            - expected_quantity
+            - counted_quantity
+            - difference_quantity
+        summary:
+          type: object
+          properties:
+            total:
+              type: integer
+            counted:
+              type: integer
+            uncounted:
+              type: integer
+            different:
+              type: integer
+            short_quantity:
+              type: integer
+            over_quantity:
+              type: integer
+            approx_cost_amount:
+              type:
+              - integer
+              - 'null'
+              minimum: 0
+              description: Σ |difference| × last unit cost where known — display only
+          required:
+          - total
+          - counted
+          - uncounted
+          - different
+          - short_quantity
+          - over_quantity
+      required:
+      - count_id
+      - status
+      - items
+      - summary

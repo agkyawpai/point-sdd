@@ -1,0 +1,4119 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 3 · Customers & Booking (+ public booking)
+  version: 1.1.0
+  summary: Customers (shared), cancel reasons, staff bookings, calendar feed, no-show, public booking modal and manage link
+  description: 'Design document for Part 3 (docs/api/03-customers-booking.md). Conventions: docs/api/00-conventions.md (v1.5).
+
+    Decisions served: D-CUS-01..09, D-BKG-01..23, D-SVC-04..08, D-SCH-03, D-ROLE-02/03/07/09 (ADR-011, ADR-012), D-NTF-01..03, D-AUD-01, D-DAT-05, D-DB-03/07, ADR-002/004/006/009.
+
+    Status: 🔒 LOCKED v1.1 = D-API-04 (owner one-sheet "အကုန်လုံး OK", 02/Oct/2026 00:06 — A1 lock; A2 a service removed by a reschedule deletes its booking_items row with the full before-image in the audit; A3 Manager seed kept). v1.1 also: booked ≠ actual barber at START -> the lower price and FINISH / INCOMPLETE emit booking.updated status 3 (Part 4); timeline sale entries cover difference sales; public barber photo_url = stable media path (Part 8); booking QR = Part 8 P8.WEB.11 + export kind booking_qr_poster. Review fixes 02/Oct (no version bump): public booking endpoints accept any ACTIVE branch (is_public only hides it from the website listing); the no-show jobs skip bookings whose date is inside an active branch closure (owner F8). v1.0 was written after the owner answered the Part 3 sheet "အကုန် OK". DB Part 3 v3 unchanged.
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "any staff (read scope)" = operational read, no code; "self" = the caller
+    is the booked barber (own bookings need no code — owner #9); levels per ADR-012: customers = shared, bookings = branch data, cancel reasons = company master.
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating staff operations need X-Requested-With: point-app (API-AUTH-02). Public operations (security: []) have no
+    session and are rate-limited (API-LIM-01); token paths are redacted in logs.
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; business dates MMT; status/type = smallint codes (D-DB-03); errors = RFC 9457 problem+json with code
+    = language key.'
+servers:
+- url: /api/v1
+  description: Same origin as the app / site — Caddy routes /api/* to NestJS (ADR-009); on <domain> only /api/v1/public/* is forwarded
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: customers
+  description: Shared company customers — D-CUS-01..09 (ADR-012 shared level)
+- name: cancel-reasons
+  description: Booking cancel reasons master list — D-BKG-14/17 (company master)
+- name: bookings
+  description: Staff bookings, calendar feed, reschedule, cancel, no-show — D-BKG-01..23
+- name: public-booking
+  description: Website booking modal — FE-BK-*, D-BKG-21
+- name: public-manage
+  description: Manage-link page — FE-CONF-*, FE-MNG-*, D-BKG-11/12/16
+security:
+- sessionCookie: []
+paths:
+  /customers:
+    get:
+      tags:
+      - customers
+      operationId: customerList
+      summary: List / search customers (P3.CUS.01) — D-CUS-06/07, AD-CUS-01
+      x-permission: customer.view+ (shared — any scope; statistics in the caller read scope)
+      parameters:
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Name or phone in any format (≥ 6 digits = phone search)
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+        description: 'Repeatable; default 1 (owner #7 — Inactive hidden until filtered)'
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - name
+          - -last_visit_at
+          - -created_at
+          default: -last_visit_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CustomerListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - customers
+      operationId: customerCreate
+      summary: Add a customer (P3.CUS.03)
+      x-permission: customer.create (shared)
+      description: Existing phone → 409 already_exists { customer_id, status, archived }. Automatic creation by a booking / walk-in needs no code (P3-RULE-01).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /customers/lookup:
+    get:
+      tags:
+      - customers
+      operationId: customerLookup
+      summary: Exact phone lookup for the booking drawer and FINISH (P3.CUS.02) — AD-FORM-10
+      x-permission: any staff (read scope) — operational
+      parameters:
+      - name: phone
+        in: query
+        schema:
+          type: string
+          maxLength: 50
+          description: Any format — normalised to E.164 (API-DATA-06)
+        description: Any format; normalised to E.164
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customer:
+                    oneOf:
+                    - $ref: '#/components/schemas/CustomerLookup'
+                    - type: 'null'
+                  archived:
+                    type: boolean
+                    description: true when the phone belongs to an archived customer (a booking restores it — P3-RULE-01)
+                required:
+                - customer
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /customers/{id}:
+    get:
+      tags:
+      - customers
+      operationId: customerGet
+      summary: Customer detail + statistics (P3.CUS.04) — AD-CUS-02, D-CUS-07/08/09
+      x-permission: customer.view+ (shared; stats / upcoming in the caller read scope)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - customers
+      operationId: customerUpdate
+      summary: Edit name / phone / notes (P3.CUS.05)
+      x-permission: customer.update (shared)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /customers/{id}/status:
+    post:
+      tags:
+      - customers
+      operationId: customerSetStatus
+      summary: Inactive / Active (P3.CUS.06)
+      x-permission: customer.delete (shared)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: integer
+                  enum:
+                  - 0
+                  - 1
+              required:
+              - status
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /customers/{id}/archive:
+    post:
+      tags:
+      - customers
+      operationId: customerArchive
+      summary: Archive (soft delete) (P3.CUS.07)
+      x-permission: customer.delete (shared)
+      description: 409 customer_has_active_bookings { count } while BOOKED / STARTED bookings exist (P3-RULE-02).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type:
+                  - string
+                  - 'null'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /customers/{id}/restore:
+    post:
+      tags:
+      - customers
+      operationId: customerRestore
+      summary: Restore an archived customer (P3.CUS.08)
+      x-permission: customer.delete (shared)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /customers/{id}/timeline:
+    get:
+      tags:
+      - customers
+      operationId: customerTimeline
+      summary: Bookings and visits, newest first (P3.CUS.09) — read scope only
+      x-permission: customer.view+ (shared)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TimelineEntry'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /booking-cancel-reasons:
+    get:
+      tags:
+      - cancel-reasons
+      operationId: cancelReasonList
+      summary: Cancel reasons for the cancel dialog (P3.CRS.01) — D-BKG-14
+      x-permission: any staff (read scope) — operational; include_archived=true -> booking_cancel_reason.view+
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CancelReason'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - cancel-reasons
+      operationId: cancelReasonCreate
+      summary: Add a cancel reason (P3.CRS.02)
+      x-permission: 'booking_cancel_reason.create (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name_mm:
+                  type: string
+                  minLength: 1
+                  maxLength: 150
+                name_en:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 150
+                requires_note:
+                  type: boolean
+                  default: false
+                sort_order:
+                  type: integer
+              required:
+              - name_mm
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /booking-cancel-reasons/order:
+    put:
+      tags:
+      - cancel-reasons
+      operationId: cancelReasonReorder
+      summary: Reorder (P3.CRS.05)
+      x-permission: 'booking_cancel_reason.update (company master: company scope)'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+              required:
+              - ids
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CancelReason'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /booking-cancel-reasons/{id}:
+    patch:
+      tags:
+      - cancel-reasons
+      operationId: cancelReasonUpdate
+      summary: Edit a cancel reason (P3.CRS.03)
+      x-permission: 'booking_cancel_reason.update (company master: company scope)'
+      description: 'System row (system_code 1): only the names may change — 409 system_row.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name_mm:
+                  type: string
+                  minLength: 1
+                  maxLength: 150
+                name_en:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 150
+                requires_note:
+                  type: boolean
+                status:
+                  type: integer
+                  enum:
+                  - 0
+                  - 1
+                expected_updated_at:
+                  type: string
+                  format: date-time
+              required:
+              - expected_updated_at
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelReason'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /booking-cancel-reasons/{id}/archive:
+    post:
+      tags:
+      - cancel-reasons
+      operationId: cancelReasonArchive
+      summary: Archive a cancel reason (P3.CRS.04)
+      x-permission: 'booking_cancel_reason.delete (company master: company scope)'
+      description: System row → 409 system_row.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelReason'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /bookings:
+    get:
+      tags:
+      - bookings
+      operationId: bookingList
+      summary: Bookings list (P3.BKG.01) — AD-BKG-08
+      x-permission: booking.view+ (branch scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: customer_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18, D-DB-03)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: channel
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            description: 1 ONLINE · 2 STAFF
+        description: Repeatable
+        style: form
+        explode: true
+      - name: location_type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date; default today
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date; default today + window
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Customer name or phone
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - starts_at
+          - -starts_at
+          default: starts_at
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BookingListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - bookings
+      operationId: bookingCreate
+      summary: Create a staff booking (P3.BKG.04) — P3-RULE-04, AD-BKG-01/02
+      x-permission: 'booking.create (branch of branch_id) | self (booked_employee_id = caller, assigned to the branch on the date — owner #9)'
+      description: 'Errors: 400 validation (address fields with location_type 1) · 409 slot_taken (errors[].params.next_free) · 409 price_changed (context.quote) · 422 outside_window
+        / date_closed / not_eligible / not_assigned_to_branch / item codes / home_address_required / idempotency_mismatch.'
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingCreated'
+        '200':
+          description: Idempotent replay (same manage_token and identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingCreated'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /calendar/bookings:
+    get:
+      tags:
+      - bookings
+      operationId: calendarBookings
+      summary: Calendar feed (P3.BKG.02) — AD-CAL-01..07; no phone / address
+      x-permission: any staff (read scope) — operational
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: branch_id or employee_id required
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Without branch_id = barber view across branches (out-of-scope bookings redacted)
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        required: true
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: ≤ 42 days after from
+        required: true
+      - name: include_cancelled
+        in: query
+        schema:
+          type: boolean
+          default: false
+        description: Adds cancelled bookings (AD-TODAY-04)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CalendarBooking'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /me/bookings:
+    get:
+      tags:
+      - bookings
+      operationId: myBookings
+      summary: My bookings (P3.BKG.03) — AD-TODAY-01
+      x-permission: self
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            description: 0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18, D-DB-03)
+        description: Repeatable; default 1, 2
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Booking'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /bookings/{id}:
+    get:
+      tags:
+      - bookings
+      operationId: bookingGet
+      summary: Booking detail (P3.BKG.05) — AD-BKG-03
+      x-permission: booking.view+ (branch) | self (booked barber)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - bookings
+      operationId: bookingUpdateDetails
+      summary: 'Edit the name for this booking / home address text (P3.BKG.06) — owner #10'
+      x-permission: booking.update (branch) | self
+      description: BOOKED only (409 invalid_transition). Address fields on a BRANCH booking → 422 not_home_booking. Phone / customer / branch are never editable.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customer_name:
+                  type: string
+                  minLength: 1
+                  maxLength: 255
+                home_address:
+                  type: string
+                  minLength: 1
+                home_address_note:
+                  type:
+                  - string
+                  - 'null'
+                expected_updated_at:
+                  type: string
+                  format: date-time
+              required:
+              - expected_updated_at
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /bookings/{id}/reschedule/preview:
+    post:
+      tags:
+      - bookings
+      operationId: bookingReschedulePreview
+      summary: Reschedule dry run — old → new prices (P3.BKG.07) — D-BKG-12, AD-BKG-04
+      x-permission: booking.update (branch) | self (a new booked_employee_id needs booking.update)
+      description: Nothing is written or locked; available=false with unavailable_reason instead of 409 / 422 for slot problems.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RescheduleRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReschedulePreview'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /bookings/{id}/reschedule:
+    post:
+      tags:
+      - bookings
+      operationId: bookingReschedule
+      summary: Reschedule = full edit (P3.BKG.08) — P3-RULE-06
+      x-permission: booking.update (branch) | self (a new booked_employee_id needs booking.update)
+      description: 409 slot_taken / price_changed / conflict / invalid_transition · 422 item / window / eligibility codes (kept items skip the active / sold / price checks). The branch
+        never changes (no branch field). Removed items are deleted with the full before-image in the audit diff (owner A2 — v1.1).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RescheduleRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingWithWarnings'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /bookings/{id}/cancel:
+    post:
+      tags:
+      - bookings
+      operationId: bookingCancel
+      summary: 'Cancel (final) — incl. "Cancel as no-show" (P3.BKG.09) — D-BKG-14/16, owner #3'
+      x-permission: booking.delete (branch) | self
+      description: 'NO_SHOW reason (system_code 1) = staff only, any time while BOOKED (owner #3); inactive / archived reason → 422 reason_not_allowed. 409 invalid_transition when not
+        BOOKED.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /bookings/{id}/noshow/snooze:
+    post:
+      tags:
+      - bookings
+      operationId: bookingNoshowSnooze
+      summary: 'Snooze the no-show alarm 10 minutes (P3.BKG.10) — D-BKG-17, owner #2'
+      x-permission: booking.update (branch) | self
+      description: Only while BOOKED and now ≥ starts_at (422 noshow_too_early); at most 4 snoozes (422 snooze_limit). A booking whose date is inside an active closure of its branch has no alarm (P3-RULE-08 — review fix 02/Oct) -> 422 noshow_too_early.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  booking_id:
+                    type: string
+                    format: uuid
+                  snoozes_left:
+                    type: integer
+                    minimum: 0
+                    maximum: 3
+                  next_alarm_at:
+                    type:
+                    - string
+                    - 'null'
+                    format: date-time
+                  auto_cancel_at:
+                    type: string
+                    format: date-time
+                required:
+                - booking_id
+                - snoozes_left
+                - auto_cancel_at
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /bookings/{id}/availability/dates:
+    get:
+      tags:
+      - bookings
+      operationId: bookingRescheduleDates
+      summary: Reschedule date strip for this booking (P3.BKG.11) — P3-RULE-06
+      x-permission: booking.update (branch) | self (a different employee_id needs booking.update)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: keep
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable booking_item_id of a kept item (snapshot duration — P3-RULE-06). Neither keep nor item sent = all current items kept; otherwise exactly the listed items
+        style: form
+        explode: true
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Default = the booked barber; a different barber reprices and re-times every item (P3-RULE-06)
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+        description: Default = the booking location (P3-RULE-06)
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityDates'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /bookings/{id}/availability/slots:
+    get:
+      tags:
+      - bookings
+      operationId: bookingRescheduleSlots
+      summary: Reschedule time slots for this booking (P3.BKG.12) — P3-RULE-06
+      x-permission: booking.update (branch) | self (a different employee_id needs booking.update)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: keep
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable booking_item_id of a kept item (snapshot duration — P3-RULE-06). Neither keep nor item sent = all current items kept; otherwise exactly the listed items
+        style: form
+        explode: true
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Default = the booked barber; a different barber reprices and re-times every item (P3-RULE-06)
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+        description: Default = the booking location (P3-RULE-06)
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilitySlots'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /public/booking/options:
+    get:
+      tags:
+      - public-booking
+      operationId: publicBookingOptions
+      summary: Booking modal catalogue for a branch (P3.PUB.01) — FE-BK-02..07, API-PUB-01
+      x-permission: public (no session; rate limit API-LIM-01); cached 60 s per branch + location
+      parameters:
+      - name: branch
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Branch code (D-BKG-01), matched case-insensitively — any ACTIVE branch (unknown / inactive -> 404); is_public = false only hides a branch from the website listing, its booking link still works (review fix 02/Oct — P3-RULE-10)
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBookingOptions'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/booking/availability/dates:
+    get:
+      tags:
+      - public-booking
+      operationId: publicAvailabilityDates
+      summary: Date strip (P3.PUB.02) — P2.AVL.01 public DTO, no-store
+      x-permission: public (no session; rate limit API-LIM-01) (120 / min / IP)
+      parameters:
+      - name: branch
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Branch code (D-BKG-01), matched case-insensitively — any ACTIVE branch (unknown / inactive -> 404); is_public = false only hides a branch from the website listing, its booking link still works (review fix 02/Oct — P3-RULE-10)
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+        required: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: omit = any barber
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicAvailabilityDates'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/booking/availability/slots:
+    get:
+      tags:
+      - public-booking
+      operationId: publicAvailabilitySlots
+      summary: Free start times for one date (P3.PUB.03) — P2.AVL.02 public DTO
+      x-permission: public (no session; rate limit API-LIM-01) (120 / min / IP)
+      parameters:
+      - name: branch
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Branch code (D-BKG-01), matched case-insensitively — any ACTIVE branch (unknown / inactive -> 404); is_public = false only hides a branch from the website listing, its booking link still works (review fix 02/Oct — P3-RULE-10)
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+        required: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicAvailabilitySlots'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/booking/availability/next:
+    get:
+      tags:
+      - public-booking
+      operationId: publicAvailabilityNext
+      summary: '"Next available" per barber (P3.PUB.04) — FE-BK-07'
+      x-permission: public (no session; rate limit API-LIM-01) (120 / min / IP)
+      parameters:
+      - name: branch
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        description: Branch code (D-BKG-01), matched case-insensitively — any ACTIVE branch (unknown / inactive -> 404); is_public = false only hides a branch from the website listing, its booking link still works (review fix 02/Oct — P3-RULE-10)
+        required: true
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          default: 1
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+        required: true
+      - name: employee_id
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        employee_id:
+                          type: string
+                          format: uuid
+                        next_available_at:
+                          type:
+                          - string
+                          - 'null'
+                          format: date-time
+                      required:
+                      - employee_id
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/booking/quote:
+    post:
+      tags:
+      - public-booking
+      operationId: publicQuote
+      summary: Price summary incl. barber override and transport fee (P3.PUB.05) — FE-BK-10/15
+      x-permission: public (no session; rate limit API-LIM-01)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicQuoteRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicQuote'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings:
+    post:
+      tags:
+      - public-booking
+      operationId: publicBookingCreate
+      summary: Create a website booking (P3.PUB.06) — P3-RULE-04/10, FE-BK-11
+      x-permission: public (no session; rate limit API-LIM-01); Turnstile + 10 / h / IP + 3 / h / phone
+      description: 403 captcha_failed (also a filled honeypot) · 409 slot_taken / price_changed · 422 active_booking_exists (no details — D-BKG-09) / too_many_services / outside_window
+        / date_closed / item codes / idempotency_mismatch · 429 rate_limited · 503 captcha_unavailable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicBookingCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBookingCreated'
+        '200':
+          description: Idempotent replay (same manage_token) — no captcha needed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBookingCreated'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      security: []
+  /public/bookings/{token}:
+    get:
+      tags:
+      - public-manage
+      operationId: publicBookingGet
+      summary: Manage / confirmation page data (P3.PUB.07) — FE-CONF-01, FE-MNG-02
+      x-permission: public (no session; rate limit API-LIM-01); no-store
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBooking'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings/{token}/availability/dates:
+    get:
+      tags:
+      - public-manage
+      operationId: publicRescheduleDates
+      summary: Reschedule date strip (P3.PUB.08)
+      x-permission: public (no session; rate limit API-LIM-01)
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      - name: keep
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable booking_item_id of a kept item (snapshot duration — P3-RULE-06). Neither keep nor item sent = all current items kept; otherwise exactly the listed items
+        style: form
+        explode: true
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Default = the booked barber; a different barber reprices and re-times every item (P3-RULE-06)
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+        description: Default = the booking location (P3-RULE-06)
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicAvailabilityDates'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings/{token}/availability/slots:
+    get:
+      tags:
+      - public-manage
+      operationId: publicRescheduleSlots
+      summary: Reschedule time slots (P3.PUB.09)
+      x-permission: public (no session; rate limit API-LIM-01)
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      - name: keep
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Repeatable booking_item_id of a kept item (snapshot duration — P3-RULE-06). Neither keep nor item sent = all current items kept; otherwise exactly the listed items
+        style: form
+        explode: true
+      - name: item
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9a-f-]{36}(:[0-9a-f-]{36})?$
+        description: 'Repeatable: service_id or service_id:service_variant_id (OPTIONS services need the variant)'
+        style: form
+        explode: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Default = the booked barber; a different barber reprices and re-times every item (P3-RULE-06)
+      - name: location_type
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+        description: Default = the booking location (P3-RULE-06)
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicAvailabilitySlots'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings/{token}/reschedule/preview:
+    post:
+      tags:
+      - public-manage
+      operationId: publicReschedulePreview
+      summary: Old → new with the price reason (P3.PUB.10) — FE-MNG-03
+      x-permission: public (no session; rate limit API-LIM-01)
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicRescheduleRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicReschedulePreview'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings/{token}/reschedule:
+    post:
+      tags:
+      - public-manage
+      operationId: publicReschedule
+      summary: Reschedule through the link (P3.PUB.11) — cutoff, ≤ 5 services
+      x-permission: public (no session; rate limit API-LIM-01)
+      description: '422 change_cutoff_passed (owner #1 — 120 min) / too_many_services · 409 slot_taken / price_changed / invalid_transition / conflict (expected_updated_at).'
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicRescheduleRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBooking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+  /public/bookings/{token}/cancel:
+    post:
+      tags:
+      - public-manage
+      operationId: publicCancel
+      summary: Cancel through the link (P3.PUB.12) — FE-MNG-04
+      x-permission: public (no session; rate limit API-LIM-01)
+      description: 422 change_cutoff_passed · 422 reason_not_allowed (system no-show reason) · 409 invalid_transition.
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        description: Manage token (FE-MNG-01). Redacted in logs (/public/bookings/***). Malformed or unknown → 404 not_found (identical body)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBooking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      security: []
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+  responses:
+    ValidationError:
+      description: 400 validation · phone_invalid · reason_required (errors[] per field)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden · out_of_scope · company_scope_required (ADR-012) · csrf · captcha_failed (public create, also a filled honeypot)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (unknown id, out-of-scope single read, unknown or malformed manage token — identical body)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 slot_taken (errors[].params.next_free) · price_changed · already_exists · invalid_transition · customer_has_active_bookings · system_row · conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/03-customers-booking.md §9 (active_booking_exists, too_many_services, change_cutoff_passed, outside_window, date_closed, not_eligible,
+        …)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: 429 rate_limited (retry_after seconds)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: 503 captcha_unavailable (Turnstile unreachable) · maintenance (FE-BK-16)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data for some codes (API-ERR-01 v1.4): price_changed → quote / preview; already_exists → customer_id, status, archived; customer_has_active_bookings →
+            count'
+      required:
+      - type
+      - title
+      - status
+      - code
+    CustomerCreate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        phone:
+          type: string
+          maxLength: 50
+          description: Any format — normalised to E.164 (API-DATA-06)
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+      required:
+      - name
+      - phone
+    CustomerUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        phone:
+          type: string
+          maxLength: 50
+          description: Any format — normalised to E.164 (API-DATA-06)
+        notes:
+          type:
+          - string
+          - 'null'
+          maxLength: 2000
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    CustomerListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        phone:
+          type: string
+        phone_normalized:
+          type: string
+          pattern: ^\+[1-9][0-9]{6,14}$
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_visit_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        visit_count:
+          type: integer
+      required:
+      - id
+      - name
+      - phone
+      - phone_normalized
+      - status
+      - visit_count
+    CustomerStats:
+      type: object
+      properties:
+        visit_count:
+          type: integer
+        total_spent_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        last_visit_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        no_show_count:
+          type: integer
+        cancelled_count:
+          type: integer
+        preferred_employee:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+          - type: 'null'
+          description: '≥ preferred_barber_min_visits (3) of the last preferred_barber_window (5) FINISHED visits — owner #6'
+        scope_note:
+          type: string
+          enum:
+          - read_scope
+          - company
+          description: read_scope = counted at the caller branches only (P3-RULE-03)
+      required:
+      - visit_count
+      - total_spent_amount
+      - no_show_count
+      - cancelled_count
+      - preferred_employee
+      - scope_note
+    UpcomingBooking:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        branch_id:
+          type: string
+          format: uuid
+        booked_employee_id:
+          type: string
+          format: uuid
+      required:
+      - id
+      - starts_at
+      - branch_id
+    Customer:
+      allOf:
+      - $ref: '#/components/schemas/CustomerListItem'
+      - type: object
+        properties:
+          notes:
+            type:
+            - string
+            - 'null'
+          stats:
+            $ref: '#/components/schemas/CustomerStats'
+          upcoming_bookings:
+            type: array
+            items:
+              $ref: '#/components/schemas/UpcomingBooking'
+          created_at:
+            type: string
+            format: date-time
+          updated_at:
+            type: string
+            format: date-time
+        required:
+        - stats
+        - upcoming_bookings
+        - created_at
+        - updated_at
+    CustomerLookup:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        phone:
+          type: string
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        notes:
+          type:
+          - string
+          - 'null'
+        last_visit_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        upcoming_bookings:
+          type: array
+          items:
+            $ref: '#/components/schemas/UpcomingBooking'
+      required:
+      - id
+      - name
+      - phone
+      - status
+      - upcoming_bookings
+    TimelineEntry:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - booking
+          - visit
+          - sale
+          description: 'sale = a visit-less sale — product-only (D-PAY-03) or a difference sale (Part 4 P4-RULE-12, owner B10 — v1.1)'
+        id:
+          type: string
+          format: uuid
+        at:
+          type: string
+          format: date-time
+        branch_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          description: 'Booking status (0–3) or visit status (Part 4: 0 INCOMPLETE · 1 STARTED · 2 COMPLETED · 3 FINISHED)'
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        services_label_mm:
+          type:
+          - string
+          - 'null'
+        services_label_en:
+          type:
+          - string
+          - 'null'
+        total_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        receipt_number:
+          type:
+          - string
+          - 'null'
+        cancel_reason:
+          oneOf:
+          - type: object
+            properties:
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              system_code:
+                type:
+                - integer
+                - 'null'
+          - type: 'null'
+      required:
+      - type
+      - id
+      - at
+      - branch_id
+      - status
+    CancelReason:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        requires_note:
+          type: boolean
+        system_code:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - null
+          description: 1 NO_SHOW (locked row) · null = admin-made
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - requires_note
+      - system_code
+      - sort_order
+      - status
+    ItemRef:
+      type: object
+      properties:
+        service_id:
+          type: string
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Required for OPTIONS services (variant_required)
+      required:
+      - service_id
+    BookingCreate:
+      type: object
+      properties:
+        manage_token:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        branch_id:
+          type: string
+          format: uuid
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+          description: Required when location_type = 2
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        booked_employee_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemRef'
+          minItems: 1
+        phone:
+          type: string
+          maxLength: 50
+          description: Any format — normalised to E.164 (API-DATA-06)
+        customer_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Name for this booking (F-BK-19)
+        expected_total_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Optional for staff — 409 price_changed when the computed total differs
+      required:
+      - manage_token
+      - branch_id
+      - location_type
+      - booked_employee_id
+      - starts_at
+      - items
+      - phone
+      - customer_name
+    BookingItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sort_order:
+          type: integer
+        service:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        variant_label_mm:
+          type:
+          - string
+          - 'null'
+        variant_label_en:
+          type:
+          - string
+          - 'null'
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+          minimum: 1
+        buffer_minutes:
+          type: integer
+          minimum: 0
+          maximum: 120
+      required:
+      - id
+      - sort_order
+      - service
+      - unit_price_amount
+      - duration_minutes
+      - buffer_minutes
+    BookingCancelInfo:
+      type: object
+      properties:
+        cancelled_at:
+          type: string
+          format: date-time
+        reason:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            system_code:
+              type:
+              - integer
+              - 'null'
+          required:
+          - id
+          - name_mm
+        note:
+          type:
+          - string
+          - 'null'
+        actor:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          description: 1 CUSTOMER · 2 STAFF · 3 SYSTEM (no-show timer)
+        by_user:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+          - type: 'null'
+      required:
+      - cancelled_at
+      - reason
+      - actor
+    NoshowState:
+      type: object
+      description: No-show timer of a BOOKED booking (P3-RULE-08); the Booking.noshow field is null when the booking date is inside an active closure of the branch — the jobs skip it (owner F8, review fix 02/Oct)
+      properties:
+        alarm_at:
+          type: string
+          format: date-time
+        auto_cancel_at:
+          type: string
+          format: date-time
+        snoozes_left:
+          type: integer
+          minimum: 0
+          maximum: 4
+        next_alarm_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - alarm_at
+      - auto_cancel_at
+      - snoozes_left
+    Booking:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18, D-DB-03)
+        channel:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ONLINE · 2 STAFF
+        created_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+          - type: 'null'
+        customer:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            phone:
+              type: string
+            status:
+              type: integer
+              enum:
+              - 0
+              - 1
+              description: 0 INACTIVE · 1 ACTIVE
+          required:
+          - id
+          - name
+          - phone
+          - status
+        customer_name:
+          type: string
+        booked_employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        transport_fee_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: HOME snapshot; null for BRANCH
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        block_starts_at:
+          type: string
+          format: date-time
+        block_ends_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookingItem'
+        subtotal_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+        cancel:
+          oneOf:
+          - $ref: '#/components/schemas/BookingCancelInfo'
+          - type: 'null'
+        visit_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Part 4, once STARTED
+        noshow:
+          oneOf:
+          - $ref: '#/components/schemas/NoshowState'
+          - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - branch_id
+      - business_date
+      - status
+      - channel
+      - customer
+      - customer_name
+      - booked_employee
+      - location_type
+      - starts_at
+      - ends_at
+      - block_starts_at
+      - block_ends_at
+      - items
+      - subtotal_amount
+      - total_amount
+      - duration_minutes
+      - created_at
+      - updated_at
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: customer_restored · customer_reactivated · customer_has_upcoming_booking
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    BookingCreated:
+      allOf:
+      - $ref: '#/components/schemas/Booking'
+      - type: object
+        properties:
+          manage_url:
+            type: string
+            format: uri
+            description: <site origin>/booking/<token> — shown once (AD-BKG-02); built from the token received, never stored
+          warnings:
+            type: array
+            items:
+              $ref: '#/components/schemas/Warning'
+        required:
+        - manage_url
+        - warnings
+    BookingWithWarnings:
+      allOf:
+      - $ref: '#/components/schemas/Booking'
+      - type: object
+        properties:
+          warnings:
+            type: array
+            items:
+              $ref: '#/components/schemas/Warning'
+        required:
+        - warnings
+    BookingListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        customer_id:
+          type: string
+          format: uuid
+        customer_name:
+          type: string
+        services_label_mm:
+          type: string
+        services_label_en:
+          type:
+          - string
+          - 'null'
+        booked_employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - id
+          - display_name
+        channel:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 ONLINE · 2 STAFF
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18, D-DB-03)
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+      required:
+      - id
+      - branch_id
+      - business_date
+      - starts_at
+      - ends_at
+      - customer_id
+      - customer_name
+      - booked_employee
+      - channel
+      - location_type
+      - status
+      - total_amount
+    CalendarBooking:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        booked_employee_id:
+          type: string
+          format: uuid
+        customer_name:
+          type:
+          - string
+          - 'null'
+        starts_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        ends_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        block_starts_at:
+          type: string
+          format: date-time
+        block_ends_at:
+          type: string
+          format: date-time
+        status:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - null
+        channel:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+        location_type:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - null
+        services_label_mm:
+          type:
+          - string
+          - 'null'
+        services_label_en:
+          type:
+          - string
+          - 'null'
+        redacted:
+          type: boolean
+          description: true = booking at a branch outside the read scope — block times only (AD-CAL-03)
+      required:
+      - branch_id
+      - booked_employee_id
+      - block_starts_at
+      - block_ends_at
+      - redacted
+    RescheduleItem:
+      type: object
+      properties:
+        booking_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Existing item id (kept / changed); omit for a new item
+        service_id:
+          type: string
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+      required:
+      - service_id
+    RescheduleRequest:
+      type: object
+      properties:
+        starts_at:
+          type: string
+          format: date-time
+        booked_employee_id:
+          type: string
+          format: uuid
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RescheduleItem'
+          minItems: 1
+          description: Omit = items unchanged; existing ids not sent are removed (P3-RULE-06)
+        expected_total_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - starts_at
+      - expected_updated_at
+    ProposedItem:
+      type: object
+      properties:
+        booking_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        service_id:
+          type: string
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+        buffer_minutes:
+          type: integer
+        repriced:
+          type: boolean
+        reason:
+          type: string
+          enum:
+          - kept
+          - changed
+          - added
+          - barber_or_location_changed
+      required:
+      - service_id
+      - unit_price_amount
+      - duration_minutes
+      - buffer_minutes
+      - repriced
+      - reason
+    PriceChange:
+      type: object
+      properties:
+        old_total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        new_total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        reason:
+          type: string
+          enum:
+          - time_only
+          - items_changed
+          - barber_or_location_changed
+      required:
+      - old_total_amount
+      - new_total_amount
+      - reason
+    ReschedulePreview:
+      type: object
+      properties:
+        booking_id:
+          type: string
+          format: uuid
+        available:
+          type: boolean
+        unavailable_reason:
+          type:
+          - string
+          - 'null'
+        current:
+          type: object
+          properties:
+            starts_at:
+              type: string
+              format: date-time
+            ends_at:
+              type: string
+              format: date-time
+            booked_employee_id:
+              type: string
+              format: uuid
+            location_type:
+              type: integer
+              enum:
+              - 1
+              - 2
+              description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+            total_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+        proposed:
+          type: object
+          properties:
+            starts_at:
+              type: string
+              format: date-time
+            ends_at:
+              type: string
+              format: date-time
+            block_starts_at:
+              type: string
+              format: date-time
+            block_ends_at:
+              type: string
+              format: date-time
+            booked_employee_id:
+              type: string
+              format: uuid
+            location_type:
+              type: integer
+              enum:
+              - 1
+              - 2
+              description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+            transport_fee_amount:
+              type:
+              - integer
+              - 'null'
+              minimum: 0
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/ProposedItem'
+            removed_item_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+            total_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+        price_change:
+          $ref: '#/components/schemas/PriceChange'
+      required:
+      - booking_id
+      - available
+      - current
+      - proposed
+      - price_change
+    CancelRequest:
+      type: object
+      properties:
+        reason_id:
+          type: string
+          format: uuid
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when the reason requires_note (400 reason_required)
+      required:
+      - reason_id
+    AvailabilityDates:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        window:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date
+            to:
+              type: string
+              format: date
+          required:
+          - from
+          - to
+        no_eligible_employee:
+          type: boolean
+        dates:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              state:
+                type: string
+                enum:
+                - available
+                - full
+                - closed
+              first_slot_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              closure_notice_mm:
+                type:
+                - string
+                - 'null'
+              closure_notice_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - date
+            - state
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - window
+      - no_eligible_employee
+      - dates
+      description: Same shape as Part 2 P2.AVL.01
+    AvailabilitySlots:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        slot_interval_minutes:
+          type: integer
+        block_minutes:
+          type: integer
+        duration_minutes:
+          type: integer
+        no_eligible_employee:
+          type: boolean
+        slots:
+          type: array
+          items:
+            type: object
+            properties:
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+              block_starts_at:
+                type: string
+                format: date-time
+              block_ends_at:
+                type: string
+                format: date-time
+              employee_ids:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+            required:
+            - starts_at
+            - ends_at
+            - employee_ids
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - date
+      - slot_interval_minutes
+      - duration_minutes
+      - no_eligible_employee
+      - slots
+      description: Same shape as Part 2 P2.AVL.02
+    PublicBranch:
+      type: object
+      properties:
+        code:
+          type: string
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        address_mm:
+          type:
+          - string
+          - 'null'
+        address_en:
+          type:
+          - string
+          - 'null'
+        phone:
+          type:
+          - string
+          - 'null'
+        map_url:
+          type:
+          - string
+          - 'null'
+      required:
+      - code
+      - name_mm
+    PublicVariantCell:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        value_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        label_mm:
+          type: string
+        label_en:
+          type:
+          - string
+          - 'null'
+        price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+      required:
+      - id
+      - value_ids
+      - label_mm
+      - price_amount
+      - duration_minutes
+    PublicService:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        public_description_mm:
+          type:
+          - string
+          - 'null'
+        public_description_en:
+          type:
+          - string
+          - 'null'
+        image_url:
+          type:
+          - string
+          - 'null'
+        pricing_mode:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SIMPLE · 2 OPTIONS
+        price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: 'SIMPLE: branch-level price for the location (always shown in the modal — OPEN-35); null for OPTIONS'
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+        price_varies_by_barber:
+          type: boolean
+          description: A barber override exists (exact price via P3.PUB.05)
+        option_groups:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              values:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                    name_mm:
+                      type: string
+                    name_en:
+                      type:
+                      - string
+                      - 'null'
+                  required:
+                  - id
+                  - name_mm
+            required:
+            - id
+            - name_mm
+            - values
+        variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicVariantCell'
+          description: Only cells sold at this branch and location (FE-BK-06)
+      required:
+      - id
+      - category_id
+      - name_mm
+      - pricing_mode
+      - price_varies_by_barber
+    PublicBarber:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        photo_url:
+          type:
+          - string
+          - 'null'
+          description: Only when public_profile is on — the stable media path /api/v1/public/media/<attachment_id>/<variant> (v1.1 — Part 8 P8-RULE-04)
+        public_specialty_mm:
+          type:
+          - string
+          - 'null'
+        public_specialty_en:
+          type:
+          - string
+          - 'null'
+        service_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        home_service_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+      required:
+      - id
+      - name_mm
+      - service_ids
+      - home_service_ids
+      description: Assigned + eligible on any date of the advance window; service_ids = union over the window (availability decides per date); photo / specialty only when public_profile
+        is on (FE-BK-07)
+    PublicBookingOptions:
+      type: object
+      properties:
+        branch:
+          $ref: '#/components/schemas/PublicBranch'
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_available:
+          type: boolean
+        categories:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              sort_order:
+                type: integer
+            required:
+            - id
+            - name_mm
+        services:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicService'
+        barbers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicBarber'
+        transport_fee_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        rules:
+          type: object
+          properties:
+            slot_interval_minutes:
+              type: integer
+            advance_window_days:
+              type: integer
+            customer_change_cutoff_minutes:
+              type: integer
+            max_services:
+              type: integer
+          required:
+          - slot_interval_minutes
+          - advance_window_days
+          - customer_change_cutoff_minutes
+          - max_services
+      required:
+      - branch
+      - location_type
+      - home_available
+      - categories
+      - services
+      - barbers
+      - rules
+    PublicAvailabilityDates:
+      type: object
+      properties:
+        window:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date
+            to:
+              type: string
+              format: date
+          required:
+          - from
+          - to
+        no_eligible_employee:
+          type: boolean
+        dates:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              state:
+                type: string
+                enum:
+                - available
+                - full
+                - closed
+              first_slot_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              closure_notice_mm:
+                type:
+                - string
+                - 'null'
+              closure_notice_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - date
+            - state
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - window
+      - no_eligible_employee
+      - dates
+    PublicAvailabilitySlots:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        slot_interval_minutes:
+          type: integer
+        duration_minutes:
+          type: integer
+        no_eligible_employee:
+          type: boolean
+        slots:
+          type: array
+          items:
+            type: object
+            properties:
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+              employee_ids:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+            required:
+            - starts_at
+            - ends_at
+            - employee_ids
+        next_available_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - date
+      - slot_interval_minutes
+      - duration_minutes
+      - no_eligible_employee
+      - slots
+      description: No block / buffer fields (API-PUB-02)
+    PublicQuoteRequest:
+      type: object
+      properties:
+        branch:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        date:
+          type: string
+          format: date
+        employee_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemRef'
+          minItems: 1
+          description: ≤ booking.public_max_services (5) — else 422 too_many_services
+      required:
+      - branch
+      - location_type
+      - date
+      - items
+    PublicQuoteItem:
+      type: object
+      properties:
+        service_id:
+          type: string
+          format: uuid
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        service_name_mm:
+          type: string
+        service_name_en:
+          type:
+          - string
+          - 'null'
+        variant_label_mm:
+          type:
+          - string
+          - 'null'
+        variant_label_en:
+          type:
+          - string
+          - 'null'
+        sold:
+          type: boolean
+        reason:
+          type:
+          - string
+          - 'null'
+          enum:
+          - not_sold_here
+          - variant_required
+          - service_inactive
+          - category_inactive
+          - null
+        unit_price_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        duration_minutes:
+          type:
+          - integer
+          - 'null'
+      required:
+      - service_id
+      - sold
+    PublicQuote:
+      type: object
+      properties:
+        complete:
+          type: boolean
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicQuoteItem'
+        transport_fee_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+      required:
+      - complete
+      - items
+      - total_amount
+      - duration_minutes
+    PublicBookingCreate:
+      type: object
+      properties:
+        captcha_token:
+          type: string
+          description: Cloudflare Turnstile token (D-BKG-21)
+        website:
+          type: string
+          description: Hidden honeypot — must be empty; a filled value answers 403 captcha_failed (same as a failed captcha — P3-RULE-10)
+        manage_token:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43}$
+          description: 32 random bytes, base64url without padding — generated by the client (ADR-004); never logged
+        branch:
+          type: string
+          pattern: ^[A-Za-z0-9]{1,10}$
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        employee_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemRef'
+          minItems: 1
+          description: ≤ booking.public_max_services (5) — else 422 too_many_services
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        phone:
+          type: string
+          maxLength: 50
+          description: Any format — normalised to E.164 (API-DATA-06)
+        expected_total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+      required:
+      - captcha_token
+      - manage_token
+      - branch
+      - location_type
+      - employee_id
+      - starts_at
+      - items
+      - name
+      - phone
+      - expected_total_amount
+    PublicBookingItem:
+      type: object
+      properties:
+        booking_item_id:
+          type: string
+          format: uuid
+        service_id:
+          type: string
+          format: uuid
+        service_name_mm:
+          type: string
+        service_name_en:
+          type:
+          - string
+          - 'null'
+        service_variant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        variant_label_mm:
+          type:
+          - string
+          - 'null'
+        variant_label_en:
+          type:
+          - string
+          - 'null'
+        unit_price_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+      required:
+      - booking_item_id
+      - service_id
+      - service_name_mm
+      - unit_price_amount
+      - duration_minutes
+    PublicBooking:
+      type: object
+      properties:
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          description: 0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18, D-DB-03)
+        branch:
+          $ref: '#/components/schemas/PublicBranch'
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            photo_url:
+              type:
+              - string
+              - 'null'
+              description: Only when the barber public_profile is on — the stable media path /api/v1/public/media/<attachment_id>/<variant> (v1.1 — Part 8 P8-RULE-04)
+          required:
+          - id
+          - name_mm
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        business_date:
+          type: string
+          format: date
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicBookingItem'
+        transport_fee_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        subtotal_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        total_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04)
+        duration_minutes:
+          type: integer
+        phone_masked:
+          type: string
+          example: 09•••••123
+        can_change:
+          type: boolean
+          description: 'BOOKED and now < starts_at − cutoff (owner #1)'
+        change_deadline_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        cancelled:
+          oneOf:
+          - type: object
+            properties:
+              at:
+                type: string
+                format: date-time
+              actor:
+                type: integer
+                enum:
+                - 1
+                - 2
+                - 3
+                description: 1 CUSTOMER · 2 STAFF · 3 SYSTEM (no-show timer)
+              reason_name_mm:
+                type: string
+              reason_name_en:
+                type:
+                - string
+                - 'null'
+            required:
+            - at
+            - actor
+            - reason_name_mm
+          - type: 'null'
+        cancel_reasons:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              requires_note:
+                type: boolean
+            required:
+            - id
+            - name_mm
+            - requires_note
+        updated_at:
+          type: string
+          format: date-time
+          description: Send back as expected_updated_at on reschedule
+      required:
+      - status
+      - branch
+      - location_type
+      - employee
+      - starts_at
+      - ends_at
+      - business_date
+      - items
+      - subtotal_amount
+      - total_amount
+      - duration_minutes
+      - phone_masked
+      - can_change
+      - updated_at
+      description: No customer name or phone (API-PUB-02); cancel_reasons only while can_change (non-system, active)
+    PublicBookingCreated:
+      allOf:
+      - $ref: '#/components/schemas/PublicBooking'
+      - type: object
+        properties:
+          manage_url:
+            type: string
+            format: uri
+        required:
+        - manage_url
+    PublicRescheduleRequest:
+      type: object
+      properties:
+        starts_at:
+          type: string
+          format: date-time
+        employee_id:
+          type: string
+          format: uuid
+        location_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+        home_address:
+          type:
+          - string
+          - 'null'
+        home_address_note:
+          type:
+          - string
+          - 'null'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RescheduleItem'
+          minItems: 1
+          description: ≤ booking.public_max_services (5) — else 422 too_many_services
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: PublicBooking.updated_at — a change in between → 409 conflict
+        expected_total_amount:
+          type: integer
+          minimum: 0
+          description: Required by publicReschedule (400 validation if missing); ignored by the preview
+      required:
+      - starts_at
+    PublicReschedulePreview:
+      type: object
+      properties:
+        available:
+          type: boolean
+        unavailable_reason:
+          type:
+          - string
+          - 'null'
+        current:
+          type: object
+          properties:
+            starts_at:
+              type: string
+              format: date-time
+            ends_at:
+              type: string
+              format: date-time
+            employee_id:
+              type: string
+              format: uuid
+            location_type:
+              type: integer
+              enum:
+              - 1
+              - 2
+              description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+            total_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+        proposed:
+          type: object
+          properties:
+            starts_at:
+              type: string
+              format: date-time
+            ends_at:
+              type: string
+              format: date-time
+            employee_id:
+              type: string
+              format: uuid
+            location_type:
+              type: integer
+              enum:
+              - 1
+              - 2
+              description: 1 BRANCH (shop) · 2 HOME (D-BKG-22)
+            transport_fee_amount:
+              type:
+              - integer
+              - 'null'
+              minimum: 0
+            removed_item_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  booking_item_id:
+                    type:
+                    - string
+                    - 'null'
+                    format: uuid
+                  service_id:
+                    type: string
+                    format: uuid
+                  service_variant_id:
+                    type:
+                    - string
+                    - 'null'
+                    format: uuid
+                  unit_price_amount:
+                    type: integer
+                    minimum: 0
+                    description: Whole MMK (D-PLT-04)
+                  duration_minutes:
+                    type: integer
+                  repriced:
+                    type: boolean
+                  reason:
+                    type: string
+                    enum:
+                    - kept
+                    - changed
+                    - added
+                    - barber_or_location_changed
+                required:
+                - service_id
+                - unit_price_amount
+                - duration_minutes
+                - repriced
+                - reason
+            total_amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04)
+        price_change:
+          $ref: '#/components/schemas/PriceChange'
+      required:
+      - available
+      - current
+      - proposed
+      - price_change

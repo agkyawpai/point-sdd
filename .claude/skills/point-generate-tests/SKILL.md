@@ -9,7 +9,7 @@ You are a senior QA engineer. Turn OpenSpec requirements into a compact, executa
 
 ## Operating model
 
-This skill runs from the point-sdd hub. App source repos (cloned beside the hub under `d:\point_flow\`) are read-only inputs here.
+This skill runs from the point-sdd hub. The app repo (`point-barber`, cloned beside the hub in the workspace folder `point/`) is a read-only input here.
 
 Rules:
 - Never create, change or delete files in app repos. Write only under the hub's `work/` folder.
@@ -119,7 +119,7 @@ Finish one group before starting the next.
 
 ### Step 3: Write the cases
 
-Read every `spec.md` in the group. Use the requirements, scenarios, business rules, roles, statuses, input limits and side effects. Where the spec refers to decision IDs (D-xxx) or UI rules, read those too (`../docs/` in the workspace, if present).
+Read every `spec.md` in the group. Use the requirements, scenarios, business rules, roles, statuses, input limits and side effects. Where the spec refers to decision IDs (D-xxx), API rules (API-…, P4.…), UI rules (AD-… / FE-…) or ADRs, read those too: `docs/decisions/decision-register.md`, `docs/api/`, `docs/ux/`, `docs/adr/`, `docs/db/` in this repo. Use the people, branches, prices and dates of `docs/plan/spec-fixtures.md` — the scenarios already do — so that every workbook tells the same story. Sign-in steps are passwordless (e-mail code read from Mailpit); never write a password step.
 
 Consider, where relevant:
 

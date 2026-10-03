@@ -1,0 +1,6591 @@
+openapi: 3.1.0
+info:
+  title: Point Barbershop API — Part 5 · Commission, Payroll & Attendance
+  version: 1.1.0
+  summary: Commission plans and assignments, own earnings, salaries, payroll runs and payslips, advances / loans, attendance clock-in / out, records, exceptions, branch QR
+  description: 'Design document for Part 5 (docs/api/05-commission-payroll-attendance.md). Conventions: docs/api/00-conventions.md (v1.5).
+
+    v1.1 (02/Oct/2026) — OPEN-40 locked (owner "OPEN-40 OK"): (a) payroll reopen — Part 7 Expenses.removePayroll(run, actor, reason) soft-deletes the run''s salary expenses (DB Part
+    7 v1.2); (b) withdrawing a wrong, unused salary row / plan assignment archives it (DB Part 5 v1.2 — archived_at, archived_by_user_id, `archive_reason`; the overlap constraints
+    ignore archived rows). No endpoint, DTO or code changed — description strings only.
+
+    Review fixes 02/Oct (independent review — no version bump): PayrollLock = shared / exclusive advisory lock, callers incl. Part 2 leave / shift writes and Part 4 late-entry START
+    + FINISH; reversal carry = AUTO lines only; net base ≤ 0 = no EARN line; estimate window = the payroll period; withdraw raised as OPEN-40 (b) (answered in v1.1 — archive); receivable.issue = private; run_stale =
+    inputs_fingerprint, 409 earlier_run_open; reopen keeps MANUAL lines / overrides; LATE / EARLY never inside an ABSENT shift; self clock-in always needs branch coordinates; no write-off
+    in V1; Attendance.openRecordOf, Receivables.updateForCashOut.
+
+    Reconcile 02/Oct (cross-part reconcile — no version bump): PayrollLock.finalizedRunFor(date) owned here (read-only); with attendance.gps_required off neither the radius nor the accuracy
+    limit is enforced (gps_inaccurate / too_far only when it is on); run_stale { changed[], calculated_at }; locked { locked_by, locked_at, correction_path }.
+
+    v1.0 (02/Oct, batch consistency pass — no version bump): reopen salary-expense step raised as OPEN-40 (a) (answered in v1.1 — soft delete; API unchanged), Expenses.postPayroll(run, actor) / removePayroll(run,
+    actor, reason), DailyClosings.openDays per P7-RULE-03, Receivables.cancelForCashOut, QR poster = Part 8 attendance_qr_poster. Fix-up 02/Oct (batch v5.2.15): receivable.changed payload
+    ids-only (ADR-008); leave re-detection = Part 2 P2.LV.03 / 05 / 06 / 07 / 08; research labels gap E7 / E8.
+
+    Decisions served: D-COM-01..04, D-PAYR-01..08, D-ATT-01..06, D-FIN-02/04/07/08, D-DSH-03, D-ROLE-02/03/07/09 (ADR-011, ADR-012 + level private), D-NTF-01..03, D-AUD-01/02, D-DAT-05,
+    D-DB-03/04/09, D-PLT-04/05/15/16, ADR-002/013.
+
+    Status: v1.1 — LOCKED (D-API-06) — owner one-sheet "အကုန်လုံး OK" (02/Oct/2026 00:06): items C1–C12, G (a)(b) (DB Part 5 v1.1), H; v1.1 = owner "OPEN-40 OK" (02/Oct/2026) — DB
+    Part 5 v1.2 (archive columns), DB Part 7 v1.2 (payroll reopen soft delete).
+
+    x-permission on every operation: "<module>.view+" = view or any other code of the module (API-PERM-06); "self" = own data, no code (API-PERM-04); levels: commission, payroll, payroll
+    categories, salaries, receivables (reads and receivable.issue) = private (company-scope grant only — a branch-scope grant reaches nothing, 403 company_scope_required); attendance
+    records / exceptions / QR = branch data.
+
+    Every staff operation may also return 401 and 503 (maintenance); mutating staff operations need X-Requested-With: point-app (API-AUTH-02). Row-creating money operations with a client_request_id
+    column (receivable issue, cash repayment) need Idempotency-Key; state changes (calculate, finalize, publish, mark paid, reopen, cancel) are idempotent by state (contract 15).
+
+    Cross-part functions owned here: PayrollLock.assertNotFinalized(tx, { employee_ids?, dates }) (shared advisory lock; finalize / reopen exclusive — 423 payroll_finalized), the read-only
+    lookup PayrollLock.finalizedRunFor(date) (Part 7 reopen warning payroll_finalized_period { run_id, period }), Commission.estimate(employee_id, business_date, base_amount, branch_id,
+    before?) (marginal tiers on the payroll period), Receivables.issue(…) / cancelForCashOut(cash_out_id, actor, reason) / updateForCashOut(cash_out_id, { reason }, actor), Attendance.openRecordsAt(branch_id),
+    Attendance.openRecordOf(employee_id), AttendanceDetector.
+
+    Conventions reminders: money = integer MMK; timestamps ISO 8601 with +06:30; business dates MMT; status/type = smallint codes (D-DB-03); errors = RFC 9457 problem+json with code
+    = language key.'
+servers:
+- url: /api/v1
+  description: Same origin as the app — Caddy routes /api/* to NestJS (ADR-009); none of these routes is forwarded on the public site host
+- url: http://localhost:3000/api/v1
+  description: Local development through the dev Caddy
+tags:
+- name: commission-plans
+  description: Plans + tiers, versions — D-COM-01 (private)
+- name: plan-assignments
+  description: Employee plan assignments ("qualify") — D-COM-01 (private)
+- name: commission
+  description: Commission preview and My earnings — D-COM-04, D-DSH-03
+- name: salaries
+  description: Salaries, Pay tab, allocation shares — D-PAYR-02/08 (private)
+- name: payroll-categories
+  description: Earning / deduction categories — D-PAYR-03 (private)
+- name: payroll-runs
+  description: Run wizard, review, finalize, publish, mark paid, reopen, cancel, admin payslips — D-PAYR-01..08 (private)
+- name: receivables
+  description: Salary advances and staff loans, repayments, outstanding — D-PAYR-04 (private; own list = self)
+- name: payslips
+  description: Own payslips (PDF / Excel) — D-PAYR-07
+- name: attendance-self
+  description: Own clock-in / clock-out (QR + GPS) — D-ATT-01/02
+- name: attendance
+  description: Records, manual entry, correction, void, evidence, summary, exceptions board — D-ATT-03..06
+- name: attendance-qr
+  description: Branch attendance QR tokens — D-ATT-01, F-P5-07
+security:
+- sessionCookie: []
+paths:
+  /commission-plans:
+    get:
+      tags:
+      - commission-plans
+      operationId: commissionPlanList
+      summary: Commission plans (P5.COM.01) — AD-PAY-04
+      x-permission: commission.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+            x-enum-varnames:
+            - INACTIVE
+            - ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CommissionPlan'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - commission-plans
+      operationId: commissionPlanCreate
+      summary: Create a plan with tiers (P5.COM.02) — D-COM-01
+      x-permission: commission.create (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: Tiers contiguous from 0, last open-ended, rates ≤ 2 decimals (422 tiers_invalid { reason }); name unique among non-archived (409 already_exists).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommissionPlanCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /commission-plans/{id}:
+    get:
+      tags:
+      - commission-plans
+      operationId: commissionPlanGet
+      summary: Plan detail with assignments (P5.COM.03)
+      x-permission: commission.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - commission-plans
+      operationId: commissionPlanUpdate
+      summary: Edit a plan (P5.COM.04)
+      x-permission: commission.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: tiers only while the plan was never assigned (409 plan_in_use — use new-version). 409 conflict on expected_updated_at.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommissionPlanUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /commission-plans/{id}/new-version:
+    post:
+      tags:
+      - commission-plans
+      operationId: commissionPlanNewVersion
+      summary: '"Create a new version" (P5.COM.05) — AD-PAY-04'
+      x-permission: commission.create (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: Copies the plan (name suffixed "v2" unless given) with the new tiers; assignments move by P5.CPA.02 with a new effective_from.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommissionPlanNewVersion'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /commission-plans/{id}/archive:
+    post:
+      tags:
+      - commission-plans
+      operationId: commissionPlanArchive
+      summary: Archive a plan (P5.COM.06)
+      x-permission: commission.delete (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 409 plan_in_use { active_assignment_count } while an assignment is open or future.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /commission-plans/{id}/restore:
+    post:
+      tags:
+      - commission-plans
+      operationId: commissionPlanRestore
+      summary: Restore a plan (P5.COM.07)
+      x-permission: commission.delete (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommissionPlan'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /employee-commission-plans:
+    get:
+      tags:
+      - plan-assignments
+      operationId: planAssignmentList
+      summary: Plan assignments (P5.CPA.01)
+      x-permission: commission.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: commission_plan_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Branch-scope rows of this branch
+      - name: active_on
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Rows effective on this date
+      - name: include_ended
+        in: query
+        schema:
+          type: boolean
+        description: Default false = current and future rows
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PlanAssignment'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - plan-assignments
+      operationId: planAssignmentCreate
+      summary: Assign a plan — "qualify" (P5.CPA.02) — D-COM-01, owner C5
+      x-permission: commission.assign (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: P5-RULE-03 effective-dated algorithm (past dates allowed down to the open payroll period). 409 assignment_overlap / assignment_scope_conflict · 422 plan_inactive /
+        not_assigned_to_branch · 423 payroll_finalized.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanAssignmentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanAssignment'
+        '200':
+          description: Updated in place (a row with the same effective_from existed — P5-RULE-03)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanAssignment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /employee-commission-plans/{id}:
+    patch:
+      tags:
+      - plan-assignments
+      operationId: planAssignmentUpdate
+      summary: End or correct an assignment (P5.CPA.03)
+      x-permission: commission.assign (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: effective_to ≥ the last finalized period end (423 payroll_finalized); plan / branch only while unused (409 assignment_in_use).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanAssignmentUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanAssignment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /employee-commission-plans/{id}/withdraw:
+    post:
+      tags:
+      - plan-assignments
+      operationId: planAssignmentWithdraw
+      summary: Withdraw a wrong assignment (P5.CPA.04)
+      x-permission: commission.assign (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'Unused (no commission result of a FINALIZED / PUBLISHED / PAID run) and after the last finalized period only; previous row re-linked. Mechanism = archive (owner 02/Oct/2026
+        — OPEN-40 OK): DB Part 5 v1.2 archived_at / archived_by_user_id / `archive_reason`, the overlap EXCLUDE ignores archived rows (WHERE archived_at IS NULL) — the row is archived,
+        never deleted (D-DAT-05). Audit commission.assignment_withdraw with the before-image.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  withdrawn_id:
+                    type: string
+                    format: uuid
+                  previous:
+                    oneOf:
+                    - $ref: '#/components/schemas/PlanAssignment'
+                    - type: 'null'
+                required:
+                - withdrawn_id
+                - previous
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /commission/preview:
+    get:
+      tags:
+      - commission
+      operationId: commissionPreview
+      summary: Monthly commission preview — not stored (P5.CMS.01)
+      x-permission: commission.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: P5-RULE-02 engine on live data (REPEATABLE READ READ ONLY snapshot — ADR-015). month = the MONTHLY payroll period (D-PAYR-01); with another payroll.period_type one
+        item per payroll period overlapping the month. Final figures exist only in a payroll run (D-COM-04).
+      parameters:
+      - name: month
+        in: query
+        schema:
+          type: string
+          pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT)
+        required: true
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Branch-scope assignments of this branch / sales of this branch
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  month:
+                    type: string
+                    pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+                    description: YYYY-MM (MMT)
+                  generated_at:
+                    type: string
+                    format: date-time
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CommissionPreviewItem'
+                required:
+                - month
+                - generated_at
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /me/earnings:
+    get:
+      tags:
+      - commission
+      operationId: myEarnings
+      summary: My earnings — own sales and commission estimate (P5.CMS.02) — AD-DSH-01
+      x-permission: self — effective own-earnings flag ON (P1-RULE-06), else 403 earnings_hidden
+      description: Never colleagues' figures (AD-PERM-05). Estimate = tiers on the period-to-date base of the payroll period containing today (the month for MONTHLY periods — owner C12;
+        null for a past month under a non-monthly period type); final figures once the run is published.
+      parameters:
+      - name: month
+        in: query
+        schema:
+          type: string
+          pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT)
+        description: Default = current month (MMT)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyEarnings'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /employees/{id}/pay:
+    get:
+      tags:
+      - salaries
+      operationId: employeePay
+      summary: Employee Pay tab summary (P5.EPY.01) — AD-EMP-02
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: commission_assignments only when the caller also holds commission.view+ (company scope); otherwise omitted.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Employee id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmployeePay'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /employees/{id}/salaries:
+    get:
+      tags:
+      - salaries
+      operationId: salaryHistory
+      summary: Salary history (P5.EPY.02) — D-PAYR-02
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Employee id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Salary'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags:
+      - salaries
+      operationId: salarySet
+      summary: Set a salary from a date (P5.EPY.03) — owner C5
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: Monthly amount (F-P5-12); P5-RULE-03 algorithm; effective_from on or before the last finalized period end → 423 payroll_finalized.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Employee id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SalaryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Salary'
+        '200':
+          description: Updated in place (a row with the same effective_from existed — P5-RULE-03)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Salary'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /employees/{id}/salaries/{salary_id}/withdraw:
+    post:
+      tags:
+      - salaries
+      operationId: salaryWithdraw
+      summary: Withdraw a wrong salary row (P5.EPY.04)
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: Rows after the last finalized period only; previous row re-linked. Mechanism = archive (DB Part 5 v1.2 — owner 02/Oct/2026, OPEN-40 OK) — as P5.CPA.04. Audit payroll.salary_withdraw
+        with the before-image.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Employee id
+      - name: salary_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Salary'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /employees/{id}/allocation-shares:
+    put:
+      tags:
+      - salaries
+      operationId: allocationSharesSet
+      summary: Manual branch-allocation shares (P5.EPY.05) — D-PAYR-08 basis 3, gap E7
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: Writes this employee's entry of the company JSON setting payroll.manual_allocation; null removes it; 422 shares_invalid (Σ ≠ 100, branch not assigned).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Employee id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocationSharesRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationSharesRequest'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /salaries:
+    get:
+      tags:
+      - salaries
+      operationId: salaryOverview
+      summary: Salaries of all employees on a date (P5.EPY.06)
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: active_on
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Name or employee code
+      - name: employee_status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SalaryOverviewItem'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /payroll-categories:
+    get:
+      tags:
+      - payroll-categories
+      operationId: payrollCategoryList
+      summary: Payroll categories (P5.CAT.01) — D-PAYR-03, F-P5-03
+      x-permission: payroll_category.view+ or payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: kind
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EARNING · 2 DEDUCTION
+          x-enum-varnames:
+          - EARNING
+          - DEDUCTION
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            description: 0 INACTIVE · 1 ACTIVE
+            x-enum-varnames:
+            - INACTIVE
+            - ACTIVE
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - name: include_archived
+        in: query
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayrollCategory'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - payroll-categories
+      operationId: payrollCategoryCreate
+      summary: Create a custom category (P5.CAT.02)
+      x-permission: payroll_category.create (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayrollCategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-categories/{id}:
+    patch:
+      tags:
+      - payroll-categories
+      operationId: payrollCategoryUpdate
+      summary: Edit a category (P5.CAT.03)
+      x-permission: payroll_category.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'kind never changes; system rows: names and order only (409 system_row).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayrollCategoryUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollCategory'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-categories/{id}/archive:
+    post:
+      tags:
+      - payroll-categories
+      operationId: payrollCategoryArchive
+      summary: Archive a custom category (P5.CAT.04)
+      x-permission: payroll_category.delete (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-categories/{id}/restore:
+    post:
+      tags:
+      - payroll-categories
+      operationId: payrollCategoryRestore
+      summary: Restore a category (P5.CAT.05)
+      x-permission: payroll_category.delete (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollCategory'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-runs:
+    get:
+      tags:
+      - payroll-runs
+      operationId: payrollRunList
+      summary: Payroll runs (P5.RUN.01)
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            - 4
+            - 5
+            description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+            x-enum-varnames:
+            - CANCELLED
+            - DRAFT
+            - CALCULATED
+            - FINALIZED
+            - PUBLISHED
+            - PAID
+        description: Repeatable
+        style: form
+        explode: true
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: period_end ≥ from
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: period_start ≤ to
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayrollRunListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunCreate
+      summary: Create a run — Set up (P5.RUN.02) — AD-PAY-01
+      x-permission: payroll.create (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 422 period_invalid · 409 period_overlap { run_id } (DB EXCLUDE — the natural replay guard; no Idempotency-Key, contract 15).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayrollRunCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payroll-runs/{id}:
+    get:
+      tags:
+      - payroll-runs
+      operationId: payrollRunGet
+      summary: Run detail with warnings and allowed actions (P5.RUN.03)
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /payroll-runs/{id}/calculate:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunCalculate
+      summary: Calculate / recalculate (P5.RUN.04) — P5-RULE-06
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: DRAFT / CALCULATED → CALCULATED, synchronous; rules_snapshot (incl. inputs_fingerprint) written; MANUAL lines and overrides re-applied — also after a reopen (warnings
+        override_dropped / override_stale). 409 earlier_run_open { run_id } while an earlier period's run is DRAFT / CALCULATED. FINALIZED+ → 423 locked.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /payroll-runs/{id}/entries:
+    get:
+      tags:
+      - payroll-runs
+      operationId: payrollEntryList
+      summary: Review table (P5.RUN.05) — AD-PAY-02
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: q
+        in: query
+        schema:
+          type: string
+        description: Employee name or code
+      - name: warnings_only
+        in: query
+        schema:
+          type: boolean
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - name
+          - -net_amount
+          default: name
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayrollEntryListItem'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /payroll-runs/{id}/entries/{entry_id}:
+    get:
+      tags:
+      - payroll-runs
+      operationId: payrollEntryGet
+      summary: Entry detail — lines, items, commission, receivables, allocation (P5.RUN.06)
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollEntry'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /payroll-runs/{id}/entries/{entry_id}/lines:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollLineAdd
+      summary: Add a MANUAL line (P5.RUN.07) — D-PAYR-03, owner B9
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: CALCULATED only. 422 category_inactive / category_not_allowed (BASIC, ADVANCE_REPAYMENT, LOAN_REPAYMENT) / net_negative. expected_updated_at = the entry's updated_at
+        — double-submit guard (409 conflict on a second tap). A MANUAL COMMISSION_REVERSAL line never reduces the reversal carry (P5-RULE-02).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayrollLineCreate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollEntry'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /payroll-runs/{id}/entries/{entry_id}/lines/{line_id}:
+    patch:
+      tags:
+      - payroll-runs
+      operationId: payrollLineUpdate
+      summary: Override an AUTO line or edit a MANUAL line (P5.RUN.08) — D-PAYR-05
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'AUTO: amount ≠ auto_amount needs override_reason (DB CHECK); back to auto_amount clears it. Caps re-run (P5-RULE-08).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - name: line_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayrollLineUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollEntry'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /payroll-runs/{id}/entries/{entry_id}/lines/{line_id}/remove:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollLineRemove
+      summary: Remove a MANUAL line (P5.RUN.09)
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: AUTO lines → 409 auto_line (set 0 with a reason instead — AD-PAY-02).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - name: line_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollEntry'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /payroll-runs/{id}/entries/{entry_id}/attendance-items/{item_id}:
+    patch:
+      tags:
+      - payroll-runs
+      operationId: payrollItemOverride
+      summary: Override an attendance item (P5.RUN.10) — D-PAYR-05
+      x-permission: payroll.update (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttendanceItemOverride'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollEntry'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /payroll-runs/{id}/finalize:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunFinalize
+      summary: Finalize — lock (P5.RUN.11) — owner C7
+      x-permission: payroll.finalize (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'First statement: the exclusive payroll lock (P5-RULE-10), then the run row; READ COMMITTED. 422 period_not_ended / net_negative · 409 closings_open { items: [{ branch_id,
+        dates[] }] } / run_stale { changed[], calculated_at } (changed = the input groups whose inputs_fingerprint hash moved) / earlier_run_open { run_id } / invalid_transition. Run
+        warning pending_leaves { count }. Gate (b) = Part 7 DailyClosings.openDays (P7-RULE-03 — days with money activity count even on closure days; from each branch''s first active
+        date). Allocation snapshot + Part 7 Expenses.postPayroll(run, actor) (salary = Gross). Idempotent by state.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinalizeRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payroll-runs/{id}/publish:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunPublish
+      summary: Publish payslips (P5.RUN.12)
+      x-permission: payroll.finalize (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: FINALIZED → PUBLISHED; notification payslip.published (mandatory) to every employee with an entry.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-runs/{id}/mark-paid:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunMarkPaid
+      summary: Mark paid (P5.RUN.13) — owner C4
+      x-permission: payroll.pay (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: PUBLISHED → PAID; one paid date per run; repayment rows written for ADVANCE / LOAN lines and receivables settled (G). Idempotent by state (contract 15 — no Idempotency-Key).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarkPaidRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /payroll-runs/{id}/reopen:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunReopen
+      summary: Reopen (P5.RUN.14) — D-PAYR-06
+      x-permission: payroll.finalize (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'FINALIZED / PUBLISHED → DRAFT; latest run only — every later run CANCELLED or a DRAFT without commission result lines (409 later_run_exists); PAID → 409 invalid_transition.
+        Part 7 Expenses.removePayroll(run, actor, reason) takes the run''s salary expenses out by soft delete (deleted_at, deleted_by = the actor, deletion_reason
+        "Payroll reopened — <reason>" — DB Part 7 v1.2; owner 02/Oct/2026, OPEN-40 OK; no hard delete — D-DAT-05). Then: allocations deleted; calculated_at / finalized_at
+        / published_at (+ their users, rules_snapshot) cleared; the entries, lines, items and commission results stay as working rows until the next Calculate rebuilds them, re-applying
+        MANUAL lines and overrides (F-P5-09; warning reopened_not_recalculated). Exclusive payroll lock first. Interceptor audit row payroll.reopen carries the run''s full before-image.
+        payslip.revised when it was published.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-runs/{id}/cancel:
+    post:
+      tags:
+      - payroll-runs
+      operationId: payrollRunCancel
+      summary: Cancel a DRAFT / CALCULATED run (P5.RUN.15)
+      x-permission: payroll.delete (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayrollRun'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll-runs/{id}/entries/{entry_id}/payslip:
+    get:
+      tags:
+      - payroll-runs
+      operationId: payrollEntryPayslipFile
+      summary: Admin payslip file (P5.RUN.16) — D-PAYR-07
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll run id
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - pdf
+          - xlsx
+          default: pdf
+      - name: lang
+        in: query
+        schema:
+          type: string
+          enum:
+          - mm
+          - en
+        description: Default = the employee's ui_language
+      responses:
+        '200':
+          description: Payslip PDF / XLSX, rendered on demand (ADR-013 — "Not final" watermark before FINALIZED)
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="payslip-<employee_code>-<YYYY-MM>.pdf|.xlsx"
+          content:
+            application/pdf:
+              schema:
+                type: string
+                contentMediaType: application/pdf
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                contentMediaType: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /receivables:
+    get:
+      tags:
+      - receivables
+      operationId: receivableList
+      summary: Advances and loans (P5.RCV.01) — AD-PAY-05
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: kind
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (separate balances — D-PAYR-04)
+          x-enum-varnames:
+          - SALARY_ADVANCE
+          - STAFF_LOAN
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            description: 0 CANCELLED · 1 ACTIVE · 2 SETTLED
+            x-enum-varnames:
+            - CANCELLED
+            - ACTIVE
+            - SETTLED
+        description: Repeatable; default 1
+        style: form
+        explode: true
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Receivable'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - receivables
+      operationId: receivableIssue
+      summary: Issue an advance / loan not paid from a drawer (P5.RCV.03) — owner C2
+      x-permission: receivable.issue (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: '422 self_issue (the employee is the caller — never to oneself, owner C2) / employee_inactive. Identifying fields for idempotency_mismatch: employee_id, kind, principal_amount.
+        Drawer advances = Part 7 Cash Out with cashout.create + receivable.issue (private).'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceivableCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /receivables/{id}:
+    get:
+      tags:
+      - receivables
+      operationId: receivableGet
+      summary: Receivable detail with repayments (P5.RCV.02)
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - receivables
+      operationId: receivableUpdate
+      summary: Change instalment / start date (P5.RCV.04)
+      x-permission: receivable.issue (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: ACTIVE only (409 invalid_transition); installment_amount null = whole balance at the next payroll.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceivableUpdate'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /receivables/{id}/repayments:
+    post:
+      tags:
+      - receivables
+      operationId: receivableCashRepayment
+      summary: Record a cash repayment to the owner / admin (P5.RCV.05) — owner C3
+      x-permission: receivable.issue (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 'Outside the drawer — no closing effect; received_by = caller. 422 repayment_exceeds_balance { balance_amount }. Identifying fields: receivable, amount.'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepaymentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+        '200':
+          description: Idempotent replay (same Idempotency-Key, same identifying fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /receivables/{id}/cancel:
+    post:
+      tags:
+      - receivables
+      operationId: receivableCancel
+      summary: Cancel an unused receivable (P5.RCV.06)
+      x-permission: receivable.issue (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      description: 409 receivable_in_use (repaid or pending) / cash_out_linked { cash_out_id } (cancel the Part 7 cash out instead).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receivable'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /payroll/outstanding:
+    get:
+      tags:
+      - receivables
+      operationId: payrollOutstanding
+      summary: Outstanding balances and reversal remainders (P5.RCV.07) — gap E10
+      x-permission: payroll.view+ (private — company scope only; a branch-scope grant reaches nothing → 403 company_scope_required — P5-RULE-01)
+      parameters:
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: employee_status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+        description: Repeatable
+        style: form
+        explode: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OutstandingItem'
+                required:
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /me/receivables:
+    get:
+      tags:
+      - receivables
+      operationId: myReceivables
+      summary: My advances / loans (P5.RCV.08)
+      x-permission: self
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Receivable'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /me/payslips:
+    get:
+      tags:
+      - payslips
+      operationId: myPayslipList
+      summary: My payslips (P5.PSL.01)
+      x-permission: self
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayslipListItem'
+                required:
+                - items
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /me/payslips/{entry_id}:
+    get:
+      tags:
+      - payslips
+      operationId: myPayslipGet
+      summary: My payslip (P5.PSL.02) — AD-PAY-03
+      x-permission: self (PUBLISHED / PAID runs only; others → 404)
+      parameters:
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payslip'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /me/payslips/{entry_id}/file:
+    get:
+      tags:
+      - payslips
+      operationId: myPayslipFile
+      summary: My payslip as PDF / Excel (P5.PSL.03) — D-PAYR-07
+      x-permission: self
+      parameters:
+      - name: entry_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Payroll entry id (one employee in the run)
+      - name: format
+        in: query
+        schema:
+          type: string
+          enum:
+          - pdf
+          - xlsx
+          default: pdf
+      - name: lang
+        in: query
+        schema:
+          type: string
+          enum:
+          - mm
+          - en
+        description: Default = own ui_language
+      responses:
+        '200':
+          description: Payslip PDF / XLSX, rendered on demand (ADR-013)
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="payslip-<employee_code>-<YYYY-MM>.pdf|.xlsx"
+          content:
+            application/pdf:
+              schema:
+                type: string
+                contentMediaType: application/pdf
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                contentMediaType: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /me/attendance/status:
+    get:
+      tags:
+      - attendance-self
+      operationId: myAttendanceStatus
+      summary: 'Clock-in chip state (P5.ATT.01) — AD-TODAY-01 #2'
+      x-permission: self
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /me/attendance/clock-in:
+    post:
+      tags:
+      - attendance-self
+      operationId: clockIn
+      summary: Clock in — QR + GPS (P5.ATT.02) — D-ATT-01/02, owner C10
+      x-permission: self (the session user is the employee — D-ATT-06)
+      description: 422 manual_only_mode · qr_invalid · qr_revoked · not_assigned_to_branch · branch_location_missing (always — a self clock-in needs the branch coordinates, whatever
+        attendance.gps_required says) · gps_inaccurate { accuracy_meters, max_meters } · too_far { distance_meters, radius_meters, branch_id } (both only when attendance.gps_required
+        is on; off = distance and accuracy are recorded, neither the radius nor the accuracy limit is enforced); 400 validation when the device sends no position (→ manual entry by a
+        manager); 409 already_clocked_in { record_id }. An open record at another branch is closed first (auto switch — warning previous_record_closed). Warnings late { minutes } · no_shift_today.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClockInRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '200':
+          description: Repeat within 120 s at the same branch (natural replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: true on a replay (API-IDEM-02)
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /me/attendance/clock-out:
+    post:
+      tags:
+      - attendance-self
+      operationId: clockOut
+      summary: Clock out — button + GPS, no QR (P5.ATT.03) — owner C10
+      x-permission: self
+      description: 409 not_clocked_in · 422 gps_inaccurate / too_far (both only when attendance.gps_required is on; a branch without coordinates does not block — distance stored as null);
+        warning early_leave { minutes }; a repeat within 120 s of the close → 200 current record.
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClockOutRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /me/attendance:
+    get:
+      tags:
+      - attendance-self
+      operationId: myAttendance
+      summary: My attendance and exceptions (P5.ATT.04)
+      x-permission: self
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default first day of this month
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Default today
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttendanceRecord'
+                  exceptions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttendanceException'
+                required:
+                - items
+                - exceptions
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /attendance/records:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceRecordList
+      summary: Attendance records (P5.ATR.01)
+      x-permission: attendance.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date; default today
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: method
+        in: query
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 QR_GPS (own phone) · 2 MANUAL (manager / admin — D-ATT-06)
+          x-enum-varnames:
+          - QR_GPS
+          - MANUAL
+      - name: open
+        in: query
+        schema:
+          type: boolean
+        description: true = still clocked in
+      - name: include_voided
+        in: query
+        schema:
+          type: boolean
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttendanceRecordListItem'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+      - attendance
+      operationId: attendanceManualCreate
+      summary: Manual attendance (P5.ATR.03) — D-ATT-06, AD-ATT-02
+      x-permission: attendance.create (branch data — body.branch_id)
+      description: 422 self_action (owner C11) / not_assigned_to_branch / clock_time_invalid · 409 attendance_overlap / already_clocked_in · 423 payroll_finalized. Covered ABSENT exceptions
+        → VOID (warning absent_voided).
+      parameters:
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualAttendanceCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /attendance/records/{id}:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceRecordGet
+      summary: Attendance record detail (P5.ATR.02)
+      x-permission: attendance.view+ (branch data)
+      description: Coordinates only for attendance.update holders covering the branch (P5-RULE-13 privacy).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - attendance
+      operationId: attendanceRecordCorrect
+      summary: Correct times (P5.ATR.05) — D-ATT-05, AD-ATT-04
+      x-permission: attendance.update (branch data)
+      description: Times only (wrong employee / branch = void + manual entry). 422 self_action / record_voided / clock_time_invalid · 423 payroll_finalized · 409 conflict / attendance_overlap.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttendanceCorrection'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /attendance/records/{id}/clock-out:
+    post:
+      tags:
+      - attendance
+      operationId: attendanceManualClockOut
+      summary: Manual clock-out of an open record (P5.ATR.04) — D-ATT-04/06
+      x-permission: attendance.create (branch data)
+      description: clock_out_source 2 MANUAL; 409 not_clocked_in (already closed — use the correction); 422 self_action / clock_time_invalid; 423 payroll_finalized.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualClockOut'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /attendance/records/{id}/void:
+    post:
+      tags:
+      - attendance
+      operationId: attendanceRecordVoid
+      summary: Void a wrong record (P5.ATR.06) — DB Part 5 v1.1, owner G (a)
+      x-permission: attendance.update (branch data)
+      description: voided_at / voided_by_user_id / void_reason; its exceptions → VOID, ABSENT re-detected. 422 self_action · 423 payroll_finalized.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoidRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceRecord'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /attendance/evidence:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceEvidence
+      summary: Evidence panel — that day's visits (P5.ATR.07) — D-ATT-06
+      x-permission: attendance.view+ (branch data — the employee's branches in scope)
+      parameters:
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: date
+        in: query
+        schema:
+          type: string
+          format: date
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceEvidence'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /attendance/summary:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceSummary
+      summary: Monthly per-employee counts (P5.ATR.08) — AD-ATT-02/03
+      x-permission: attendance.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: month
+        in: query
+        schema:
+          type: string
+          pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT)
+        description: Default current month
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  month:
+                    type: string
+                    pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+                    description: YYYY-MM (MMT)
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttendanceSummaryItem'
+                required:
+                - month
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /attendance/today:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceToday
+      summary: '"Who is in" today (P5.ATR.09)'
+      x-permission: attendance.view+ (branch data)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date:
+                    type: string
+                    format: date
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TodayAttendanceItem'
+                required:
+                - date
+                - items
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /attendance/exceptions:
+    get:
+      tags:
+      - attendance
+      operationId: attendanceExceptionList
+      summary: Exceptions board (P5.EXC.01) — AD-ATT-03
+      x-permission: attendance.view+ (branch data — scope-filtered)
+      parameters:
+      - name: branch_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: employee_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date
+        description: Business date; default today
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: type
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 1
+            - 2
+            - 3
+            - 4
+            description: 1 LATE · 2 EARLY_LEAVE · 3 ABSENT · 4 INCOMPLETE (D-ATT-03)
+            x-enum-varnames:
+            - LATE
+            - EARLY_LEAVE
+            - ABSENT
+            - INCOMPLETE
+        description: Repeatable
+        style: form
+        explode: true
+      - name: status
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+            enum:
+            - 0
+            - 1
+            - 2
+            - 3
+            - 4
+            description: 0 VOID · 1 OPEN · 2 EXCUSED · 3 CONFIRMED · 4 LEAVE (F-P5-05) — OPEN + CONFIRMED are deducted
+            x-enum-varnames:
+            - VOID
+            - OPEN
+            - EXCUSED
+            - CONFIRMED
+            - LEAVE
+        description: Repeatable; default 1 OPEN
+        style: form
+        explode: true
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttendanceException'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                  total:
+                    type:
+                    - integer
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /attendance/exceptions/{id}/resolve:
+    post:
+      tags:
+      - attendance
+      operationId: attendanceExceptionResolve
+      summary: Resolve an exception (P5.EXC.02) — F-P5-05, owner C11
+      x-permission: attendance.resolve (branch data — the exception's branch) (+ leave.create for create_leave)
+      description: 400 reason_required (VOID / EXCUSED) · 422 self_action / leave_not_covering · 423 payroll_finalized · Part 2 leave errors for create_leave. status 1 = undo.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExceptionResolveRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceException'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '423':
+          $ref: '#/components/responses/Locked'
+  /branches/{id}/attendance-qr:
+    get:
+      tags:
+      - attendance-qr
+      operationId: attendanceQrGet
+      summary: Branch attendance QR — active token + history (P5.QR.01) — AD-QR-02
+      x-permission: attendance_qr.view+ (branch data)
+      description: The printable poster PDF = Part 8 POST /v1/exports kind attendance_qr_poster (attendance_qr.view+ for the branch, no data.export — P5-RULE-17).
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceQr'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags:
+      - attendance-qr
+      operationId: attendanceQrIssue
+      summary: Issue / regenerate the token (P5.QR.02)
+      x-permission: attendance_qr.create (branch data)
+      description: The active token is revoked in the same transaction (history kept) — old posters answer qr_revoked.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch id
+      - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceQr'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /branches/{id}/attendance-qr/revoke:
+    post:
+      tags:
+      - attendance-qr
+      operationId: attendanceQrRevoke
+      summary: Revoke without replacement (P5.QR.03)
+      x-permission: attendance_qr.delete (branch data)
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Branch id
+      - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type:
+                  - string
+                  - 'null'
+                  maxLength: 1000
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceQr'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: point_session
+      description: Server-side session — D-AUTH-06. Mutating requests also need X-Requested-With (API-AUTH-02).
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque cursor from next_cursor
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - point-app
+      description: CSRF guard for cookie-authenticated mutations (API-AUTH-02)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: client_request_id — one UUID per logical submit, kept across retries (API-IDEM-01, DB Part 5 v1.1 G (b)); missing → 400 idempotency_key_required
+  responses:
+    ValidationError:
+      description: 400 validation · reason_required · idempotency_key_required (errors[] per field)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: 401 unauthenticated · session_revoked
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 403 forbidden (context.required) · out_of_scope · company_scope_required (private level — P5-RULE-01) · earnings_hidden · csrf
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 404 not_found (unknown id, out-of-scope single read, another employee's or an unpublished payslip)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 409 invalid_transition · period_overlap · closings_open · run_stale · later_run_exists · earlier_run_open · plan_in_use · assignment_overlap · assignment_scope_conflict
+        · assignment_in_use · system_row · already_exists · auto_line · receivable_in_use · cash_out_linked · already_clocked_in · not_clocked_in · attendance_overlap · idempotency_in_progress
+        · conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: 422 business rule — codes in docs/api/05-commission-payroll-attendance.md §16 (period_invalid, period_not_ended, net_negative, tiers_invalid, self_action, self_issue,
+        qr_invalid, qr_revoked, too_far, gps_inaccurate, manual_only_mode, repayment_exceeds_balance, …)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: 423 payroll_finalized (PayrollLock — contract 3; a date inside a FINALIZED / PUBLISHED / PAID run) · locked (review writes on a FINALIZED+ run, context.correction_path
+        = "reopen")
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Language key under error.* (API-ERR-01)
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+          description: Server-generated UUIDv7 (API-ERR-01)
+        context:
+          type: object
+          additionalProperties: true
+          description: 'Machine data (API-ERR-01 v1.4): payroll_finalized → { employee_id, run_id, period: { start, end }, status } · closings_open → { items: [{ branch_id, dates[] }]
+            } · run_stale → { changed[] (input groups: sales, refunds, attendance, leaves, shifts, salaries, assignments, receivables, settings, runs), calculated_at } · period_overlap
+            / later_run_exists / earlier_run_open → { run_id } · net_negative → { employee_id, net_amount } · tiers_invalid → { reason } · plan_in_use → { active_assignment_count } ·
+            too_far → { distance_meters, radius_meters, branch_id } · gps_inaccurate → { accuracy_meters, max_meters } · already_clocked_in → { record_id } · repayment_exceeds_balance
+            → { balance_amount } · cash_out_linked → { cash_out_id } · invalid_transition → { status } · locked → { locked_by, locked_at, correction_path: "reopen" } · forbidden → {
+            required }'
+      required:
+      - type
+      - title
+      - status
+      - code
+    EmployeeRef:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        employee_code:
+          type:
+          - string
+          - 'null'
+      required:
+      - id
+      - display_name
+    UserRef:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+      required:
+      - user_id
+      - display_name
+    Warning:
+      type: object
+      properties:
+        code:
+          type: string
+          description: override_dropped · override_stale · period_gap · open_exceptions · closings_open · period_not_ended · no_salary · capped · employees_left · pending_leaves · reopened_not_recalculated
+            · late · no_shift_today · previous_record_closed · early_leave · absent_voided
+        params:
+          type: object
+          additionalProperties: true
+      required:
+      - code
+    ReasonBody:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - reason
+    CommissionPlan:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        description_mm:
+          type:
+          - string
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              tier_order:
+                type: integer
+                minimum: 1
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                description: null = no upper limit (last tier)
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+            required:
+            - tier_order
+            - from_amount
+            - to_amount
+            - rate_percent
+          minItems: 1
+        in_use:
+          type: boolean
+          description: Referenced by an assignment — tiers frozen
+        active_assignment_count:
+          type: integer
+        assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanAssignment'
+          description: Detail only (P5.COM.03)
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - status
+      - tiers
+      - in_use
+      - active_assignment_count
+      - created_at
+      - updated_at
+    CommissionPlanCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        description_mm:
+          type:
+          - string
+          - 'null'
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                description: null = last tier
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+            required:
+            - from_amount
+            - rate_percent
+          minItems: 1
+          maxItems: 10
+      required:
+      - name_mm
+      - tiers
+    CommissionPlanUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        description_mm:
+          type:
+          - string
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                description: null = last tier
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+            required:
+            - from_amount
+            - rate_percent
+          minItems: 1
+          maxItems: 10
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    CommissionPlanNewVersion:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+                description: null = last tier
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+            required:
+            - from_amount
+            - rate_percent
+          minItems: 1
+          maxItems: 10
+    PlanAssignment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        commission_plan:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - name_mm
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: null = all branches added together (C-2); set = that branch only (F-P5-01)
+        effective_from:
+          type: string
+          format: date
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        assigned_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        note:
+          type:
+          - string
+          - 'null'
+        used:
+          type: boolean
+          description: Referenced by a commission result of a FINALIZED / PUBLISHED / PAID run (a working run does not count)
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - employee
+      - commission_plan
+      - branch_id
+      - effective_from
+      - effective_to
+      - assigned_by
+      - used
+      - created_at
+      - updated_at
+    PlanAssignmentCreate:
+      type: object
+      properties:
+        employee_id:
+          type: string
+          format: uuid
+        commission_plan_id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        effective_from:
+          type: string
+          format: date
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      required:
+      - employee_id
+      - commission_plan_id
+      - effective_from
+    PlanAssignmentUpdate:
+      type: object
+      properties:
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        commission_plan_id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    CommissionPreviewItem:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        assignment_id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        window_from:
+          type: string
+          format: date
+        window_to:
+          type: string
+          format: date
+        commissionable_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        effective_rate_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Percent, 4 decimals as stored (numeric(7,4) — P5-RULE-20)
+        tier_breakdown:
+          type: array
+          items:
+            type: object
+            properties:
+              tier_order:
+                type: integer
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+              base_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              commission_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - tier_order
+            - from_amount
+            - rate_percent
+            - base_amount
+            - commission_amount
+        reversal_amount:
+          type: integer
+          minimum: 0
+          description: Commission of refunds in this month of sales already finalized (deducted in this month's run)
+      required:
+      - employee
+      - assignment_id
+      - window_from
+      - window_to
+      - commissionable_amount
+      - commission_amount
+      - effective_rate_percent
+      - tier_breakdown
+      - reversal_amount
+    MyEarnings:
+      type: object
+      properties:
+        month:
+          type: string
+          pattern: ^[0-9]{4}-(0[1-9]|1[0-2])$
+          description: YYYY-MM (MMT)
+        today_sales_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        month_sales_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commissionable_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_estimate_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        current_tier:
+          oneOf:
+          - type: object
+            properties:
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+            required:
+            - from_amount
+            - rate_percent
+          - type: 'null'
+        next_tier:
+          oneOf:
+          - type: object
+            properties:
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+              remaining_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - from_amount
+            - rate_percent
+            - remaining_amount
+          - type: 'null'
+        no_plan:
+          type: boolean
+        final:
+          oneOf:
+          - type: object
+            properties:
+              commission_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              entry_id:
+                type: string
+                format: uuid
+            required:
+            - commission_amount
+            - entry_id
+          - type: 'null'
+        note:
+          type: string
+          enum:
+          - final_at_month_end
+      required:
+      - month
+      - today_sales_amount
+      - month_sales_amount
+      - commissionable_amount
+      - no_plan
+      - note
+      description: Own figures only (AD-PERM-05); estimate = P5-RULE-02 tiers on the period-to-date base (payroll period containing today — the month for MONTHLY)
+    Salary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        basic_salary_amount:
+          type: integer
+          minimum: 0
+          description: Monthly MMK (F-P5-12)
+        effective_from:
+          type: string
+          format: date
+        effective_to:
+          type:
+          - string
+          - 'null'
+          format: date
+        set_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        note:
+          type:
+          - string
+          - 'null'
+        current:
+          type: boolean
+        locked:
+          type: boolean
+          description: Inside a finalized payroll period
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - employee_id
+      - basic_salary_amount
+      - effective_from
+      - effective_to
+      - set_by
+      - current
+      - locked
+      - created_at
+      - updated_at
+    SalaryCreate:
+      type: object
+      properties:
+        basic_salary_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        effective_from:
+          type: string
+          format: date
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      required:
+      - basic_salary_amount
+      - effective_from
+    SalaryOverviewItem:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        employee_status:
+          type: integer
+        salary:
+          oneOf:
+          - $ref: '#/components/schemas/Salary'
+          - type: 'null'
+        next_change:
+          oneOf:
+          - type: object
+            properties:
+              effective_from:
+                type: string
+                format: date
+              basic_salary_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - effective_from
+            - basic_salary_amount
+          - type: 'null'
+        primary_branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+      required:
+      - employee
+      - employee_status
+      - salary
+      - next_change
+    AllocationSharesRequest:
+      type: object
+      properties:
+        shares:
+          oneOf:
+          - type: array
+            items:
+              type: object
+              properties:
+                branch_id:
+                  type: string
+                  format: uuid
+                percent:
+                  type: number
+                  exclusiveMinimum: 0
+                  maximum: 100
+              required:
+              - branch_id
+              - percent
+            minItems: 1
+          - type: 'null'
+          description: Σ percent = 100; null removes the entry
+      required:
+      - shares
+    EmployeePay:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        current_salary:
+          oneOf:
+          - $ref: '#/components/schemas/Salary'
+          - type: 'null'
+        next_salary_change:
+          oneOf:
+          - $ref: '#/components/schemas/Salary'
+          - type: 'null'
+        commission_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanAssignment'
+          description: Only with commission.view+ (company scope)
+        receivables:
+          type: array
+          items:
+            $ref: '#/components/schemas/Receivable'
+        allocation_shares:
+          oneOf:
+          - type: array
+            items:
+              type: object
+              properties:
+                branch_id:
+                  type: string
+                  format: uuid
+                percent:
+                  type: number
+              required:
+              - branch_id
+              - percent
+          - type: 'null'
+        primary_branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        effective_show_own_earnings:
+          type: boolean
+      required:
+      - employee
+      - current_salary
+      - receivables
+      - allocation_shares
+      - effective_show_own_earnings
+    PayrollCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name_mm:
+          type: string
+        name_en:
+          type:
+          - string
+          - 'null'
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EARNING · 2 DEDUCTION
+          x-enum-varnames:
+          - EARNING
+          - DEDUCTION
+        system_code:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - null
+          description: null = custom · 1 BASIC · 2 COMMISSION · 3 COMMISSION_REVERSAL · 4 LATE · 5 ABSENT · 6 UNPAID_LEAVE · 7 ADVANCE_REPAYMENT · 8 LOAN_REPAYMENT (F-P5-03)
+        sort_order:
+          type: integer
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - name_mm
+      - kind
+      - system_code
+      - sort_order
+      - status
+      - updated_at
+    PayrollCategoryCreate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EARNING · 2 DEDUCTION
+          x-enum-varnames:
+          - EARNING
+          - DEDUCTION
+        sort_order:
+          type: integer
+      required:
+      - name_mm
+      - kind
+    PayrollCategoryUpdate:
+      type: object
+      properties:
+        name_mm:
+          type: string
+          minLength: 1
+          maxLength: 150
+        name_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 150
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 INACTIVE · 1 ACTIVE
+          x-enum-varnames:
+          - INACTIVE
+          - ACTIVE
+        sort_order:
+          type: integer
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    RunTotals:
+      type: object
+      properties:
+        employees:
+          type: integer
+        basic_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        gross_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        net_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+      required:
+      - employees
+      - gross_amount
+      - deduction_amount
+      - net_amount
+    PayrollRunListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        period_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 MONTHLY · 2 WEEKLY · 3 BIWEEKLY · 4 CUSTOM (D-PAYR-01)
+          x-enum-varnames:
+          - MONTHLY
+          - WEEKLY
+          - BIWEEKLY
+          - CUSTOM
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+          x-enum-varnames:
+          - CANCELLED
+          - DRAFT
+          - CALCULATED
+          - FINALIZED
+          - PUBLISHED
+          - PAID
+        totals:
+          $ref: '#/components/schemas/RunTotals'
+        paid_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        reopen_count:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - period_type
+      - period_start
+      - period_end
+      - status
+      - totals
+      - reopen_count
+      - updated_at
+    PayrollRun:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        period_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 MONTHLY · 2 WEEKLY · 3 BIWEEKLY · 4 CUSTOM (D-PAYR-01)
+          x-enum-varnames:
+          - MONTHLY
+          - WEEKLY
+          - BIWEEKLY
+          - CUSTOM
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+          x-enum-varnames:
+          - CANCELLED
+          - DRAFT
+          - CALCULATED
+          - FINALIZED
+          - PUBLISHED
+          - PAID
+        rules_snapshot:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: 'payroll.* settings, leave types is_paid, allocation basis, period type — F-P5-04 — and inputs_fingerprint { <group>: sha256 } of the calculation (P5-RULE-09 c)'
+        totals:
+          $ref: '#/components/schemas/RunTotals'
+        calculated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        calculated_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        finalized_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finalized_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        published_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        published_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        paid_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        paid_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        paid_note:
+          type:
+          - string
+          - 'null'
+        reopen_count:
+          type: integer
+        last_reopened_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_reopened_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        last_reopen_reason:
+          type:
+          - string
+          - 'null'
+        cancelled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        actions:
+          type: object
+          properties:
+            calculate:
+              type: boolean
+            finalize:
+              type: boolean
+            publish:
+              type: boolean
+            mark_paid:
+              type: boolean
+            reopen:
+              type: boolean
+            cancel:
+              type: boolean
+          required:
+          - calculate
+          - finalize
+          - publish
+          - mark_paid
+          - reopen
+          - cancel
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - period_type
+      - period_start
+      - period_end
+      - status
+      - totals
+      - reopen_count
+      - created_by
+      - warnings
+      - actions
+      - created_at
+      - updated_at
+    PayrollRunCreate:
+      type: object
+      properties:
+        period_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 MONTHLY · 2 WEEKLY · 3 BIWEEKLY · 4 CUSTOM (D-PAYR-01)
+          x-enum-varnames:
+          - MONTHLY
+          - WEEKLY
+          - BIWEEKLY
+          - CUSTOM
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+      required:
+      - period_start
+      - period_end
+    FinalizeRequest:
+      type: object
+      properties:
+        expected_calculated_at:
+          type: string
+          format: date-time
+          description: The calculated_at of the review the admin saw — 409 run_stale if it moved
+      required:
+      - expected_calculated_at
+    MarkPaidRequest:
+      type: object
+      properties:
+        paid_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Default now; published_at ≤ paid_at ≤ now
+        paid_note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+    PayrollEntryListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        basic_salary_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        other_earnings_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        gross_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        net_amount:
+          type: integer
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+      required:
+      - id
+      - employee
+      - basic_salary_amount
+      - commission_amount
+      - other_earnings_amount
+      - gross_amount
+      - deduction_amount
+      - net_amount
+      - warnings
+    PayrollLine:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name_mm:
+              type: string
+            name_en:
+              type:
+              - string
+              - 'null'
+            system_code:
+              type:
+              - integer
+              - 'null'
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              - 5
+              - 6
+              - 7
+              - 8
+              - null
+              description: null = custom · 1 BASIC · 2 COMMISSION · 3 COMMISSION_REVERSAL · 4 LATE · 5 ABSENT · 6 UNPAID_LEAVE · 7 ADVANCE_REPAYMENT · 8 LOAN_REPAYMENT (F-P5-03)
+          required:
+          - id
+          - name_mm
+          - system_code
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EARNING · 2 DEDUCTION
+          x-enum-varnames:
+          - EARNING
+          - DEDUCTION
+        source:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 AUTO · 2 MANUAL
+          x-enum-varnames:
+          - AUTO
+          - MANUAL
+        description_mm:
+          type: string
+        description_en:
+          type:
+          - string
+          - 'null'
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        auto_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        override_reason:
+          type:
+          - string
+          - 'null'
+        override_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        commission_result_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: 'COMMISSION line: its result · AUTO COMMISSION_REVERSAL line: the result holding this run''s REVERSAL lines (null for a carry-only line)'
+        employee_receivable_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sort_order:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - category
+      - kind
+      - source
+      - description_mm
+      - amount
+      - sort_order
+      - updated_at
+    PayrollAttendanceItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        item_date:
+          type: string
+          format: date
+        item_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 1 LATE · 2 EARLY_LEAVE · 3 ABSENT · 4 UNPAID_LEAVE · 5 LATE_TO_ABSENT
+          x-enum-varnames:
+          - LATE
+          - EARLY_LEAVE
+          - ABSENT
+          - UNPAID_LEAVE
+          - LATE_TO_ABSENT
+        attendance_exception_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        leave_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        minutes:
+          type:
+          - integer
+          - 'null'
+        day_portion:
+          type:
+          - number
+          - 'null'
+          enum:
+          - 0.5
+          - 1
+          - null
+        auto_deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        override_reason:
+          type:
+          - string
+          - 'null'
+        override_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - item_date
+      - item_type
+      - auto_deduction_amount
+      - deduction_amount
+      - updated_at
+    CommissionLine:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 EARN · 2 REVERSAL (refund after finalize — OPEN-26)
+          x-enum-varnames:
+          - EARN
+          - REVERSAL
+        sale_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        refund_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        original_line_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        base_amount:
+          type: integer
+          description: Whole MMK, signed (REVERSAL lines are negative)
+        rate_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Percent, 4 decimals as stored (numeric(7,4) — P5-RULE-20)
+        commission_amount:
+          type: integer
+          description: Whole MMK, signed (REVERSAL lines are negative)
+        label:
+          type: string
+          description: e.g. "28/Oct Hair dye refund — 6,000" (AD-PAY-03)
+      required:
+      - id
+      - kind
+      - branch_id
+      - base_amount
+      - rate_percent
+      - commission_amount
+      - label
+    CommissionResult:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        assignment_id:
+          type: string
+          format: uuid
+        branch_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        commissionable_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        effective_rate_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Percent, 4 decimals as stored (numeric(7,4) — P5-RULE-20)
+        tier_breakdown:
+          type: array
+          items:
+            type: object
+            properties:
+              tier_order:
+                type: integer
+              from_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              to_amount:
+                type:
+                - integer
+                - 'null'
+                minimum: 0
+              rate_percent:
+                type: number
+                minimum: 0
+                maximum: 100
+                multipleOf: 0.01
+                description: Percent, ≤ 2 decimals (numeric(5,2))
+              base_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              commission_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - tier_order
+            - from_amount
+            - rate_percent
+            - base_amount
+            - commission_amount
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommissionLine'
+      required:
+      - id
+      - assignment_id
+      - commissionable_amount
+      - commission_amount
+      - effective_rate_percent
+      - tier_breakdown
+      - lines
+    PayrollEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        run_status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+          x-enum-varnames:
+          - CANCELLED
+          - DRAFT
+          - CALCULATED
+          - FINALIZED
+          - PUBLISHED
+          - PAID
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        basic_salary_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        gross_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        net_amount:
+          type: integer
+        late_count:
+          type: integer
+        late_minutes:
+          type: integer
+        absent_days:
+          type: number
+        unpaid_leave_days:
+          type: number
+        scheduled_days:
+          type: number
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollLine'
+        attendance_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollAttendanceItem'
+        commission:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommissionResult'
+        receivables:
+          type: array
+          items:
+            type: object
+            properties:
+              receivable_id:
+                type: string
+                format: uuid
+              kind:
+                type: integer
+                enum:
+                - 1
+                - 2
+                description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (separate balances — D-PAYR-04)
+                x-enum-varnames:
+                - SALARY_ADVANCE
+                - STAFF_LOAN
+              line_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              balance_before_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              deducted_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              balance_after_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - receivable_id
+            - kind
+            - balance_before_amount
+            - deducted_amount
+            - balance_after_amount
+        allocation:
+          type: object
+          properties:
+            snapshot:
+              type: boolean
+              description: false = preview (CALCULATED), true = finalized snapshot
+            basis:
+              type: integer
+              enum:
+              - 1
+              - 2
+              - 3
+              - 4
+              description: 1 ATTENDANCE_HOURS · 2 SCHEDULED_HOURS · 3 MANUAL_PERCENT · 4 PRIMARY_BRANCH (D-PAYR-08)
+              x-enum-varnames:
+              - ATTENDANCE_HOURS
+              - SCHEDULED_HOURS
+              - MANUAL_PERCENT
+              - PRIMARY_BRANCH
+            rows:
+              type: array
+              items:
+                type: object
+                properties:
+                  branch_id:
+                    type: string
+                    format: uuid
+                  ratio:
+                    type: number
+                    minimum: 0
+                    maximum: 1
+                  allocated_gross_amount:
+                    type: integer
+                    minimum: 0
+                    description: Whole MMK (D-PLT-04, API-DATA-02)
+                required:
+                - branch_id
+                - ratio
+                - allocated_gross_amount
+          required:
+          - snapshot
+          - rows
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        explanations:
+          type: array
+          items:
+            type: string
+          description: '"How is this calculated?" lines (AD-HELP-02)'
+        note:
+          type:
+          - string
+          - 'null'
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - run_id
+      - run_status
+      - employee
+      - basic_salary_amount
+      - gross_amount
+      - deduction_amount
+      - net_amount
+      - lines
+      - attendance_items
+      - commission
+      - receivables
+      - allocation
+      - warnings
+      - updated_at
+    PayrollLineCreate:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        description_mm:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        expected_updated_at:
+          type: string
+          format: date-time
+          description: The entry's updated_at (double-submit guard — 409 conflict)
+      required:
+      - category_id
+      - description_mm
+      - amount
+      - expected_updated_at
+    PayrollLineUpdate:
+      type: object
+      properties:
+        amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        override_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: 'AUTO lines: required when amount ≠ auto_amount'
+        description_mm:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description_en:
+          type:
+          - string
+          - 'null'
+          maxLength: 300
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    AttendanceItemOverride:
+      type: object
+      properties:
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        override_reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when ≠ auto_deduction_amount
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - deduction_amount
+      - expected_updated_at
+    PayslipListItem:
+      type: object
+      properties:
+        entry_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+        net_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+          x-enum-varnames:
+          - CANCELLED
+          - DRAFT
+          - CALCULATED
+          - FINALIZED
+          - PUBLISHED
+          - PAID
+        paid_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - entry_id
+      - run_id
+      - period_start
+      - period_end
+      - net_amount
+      - status
+    Payslip:
+      type: object
+      properties:
+        entry_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          description: 0 CANCELLED · 1 DRAFT · 2 CALCULATED (review) · 3 FINALIZED · 4 PUBLISHED · 5 PAID (D-PAYR-06, F-P5-09)
+          x-enum-varnames:
+          - CANCELLED
+          - DRAFT
+          - CALCULATED
+          - FINALIZED
+          - PUBLISHED
+          - PAID
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+        basic:
+          type: object
+          properties:
+            amount:
+              type: integer
+              minimum: 0
+              description: Whole MMK (D-PLT-04, API-DATA-02)
+            proration_note:
+              type:
+              - string
+              - 'null'
+          required:
+          - amount
+        earnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollLine'
+        deductions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollLine'
+        commission:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommissionResult'
+        attendance_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayrollAttendanceItem'
+        receivables:
+          type: array
+          items:
+            type: object
+            properties:
+              kind:
+                type: integer
+                enum:
+                - 1
+                - 2
+                description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (separate balances — D-PAYR-04)
+                x-enum-varnames:
+                - SALARY_ADVANCE
+                - STAFF_LOAN
+              deducted_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+              balance_after_amount:
+                type: integer
+                minimum: 0
+                description: Whole MMK (D-PLT-04, API-DATA-02)
+            required:
+            - kind
+            - deducted_amount
+            - balance_after_amount
+        gross_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        net_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        paid_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - entry_id
+      - run_id
+      - status
+      - employee
+      - period_start
+      - period_end
+      - basic
+      - earnings
+      - deductions
+      - commission
+      - attendance_items
+      - receivables
+      - gross_amount
+      - deduction_amount
+      - net_amount
+      description: P5-RULE-12 — PUBLISHED / PAID runs only
+    Receivable:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (separate balances — D-PAYR-04)
+          x-enum-varnames:
+          - SALARY_ADVANCE
+          - STAFF_LOAN
+        principal_amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        installment_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: null = whole balance at the next payroll (owner C2)
+        repayment_start_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        issued_at:
+          type: string
+          format: date-time
+        issued_by:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+          required:
+          - user_id
+          - display_name
+        cash_out_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Drawer-issued (Part 7)
+        reason:
+          type:
+          - string
+          - 'null'
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          description: 0 CANCELLED · 1 ACTIVE · 2 SETTLED
+          x-enum-varnames:
+          - CANCELLED
+          - ACTIVE
+          - SETTLED
+        settled_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        repaid_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        pending_deduction_amount:
+          type: integer
+          minimum: 0
+          description: Lines in FINALIZED / PUBLISHED runs not yet marked paid
+        balance_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        repayments:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              amount:
+                type: integer
+                minimum: 1
+                description: Whole MMK, > 0
+              source:
+                type: string
+                enum:
+                - payroll
+                - cash
+              run_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+              period_start:
+                type:
+                - string
+                - 'null'
+                format: date
+              received_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              received_by:
+                oneOf:
+                - type: object
+                  properties:
+                    user_id:
+                      type: string
+                      format: uuid
+                    display_name:
+                      type: string
+                  required:
+                  - user_id
+                  - display_name
+                - type: 'null'
+              note:
+                type:
+                - string
+                - 'null'
+              created_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - amount
+            - source
+            - created_at
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - employee
+      - kind
+      - principal_amount
+      - installment_amount
+      - issued_at
+      - issued_by
+      - status
+      - repaid_amount
+      - pending_deduction_amount
+      - balance_amount
+      - repayments
+      - updated_at
+    ReceivableCreate:
+      type: object
+      properties:
+        employee_id:
+          type: string
+          format: uuid
+        kind:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 SALARY_ADVANCE · 2 STAFF_LOAN (separate balances — D-PAYR-04)
+          x-enum-varnames:
+          - SALARY_ADVANCE
+          - STAFF_LOAN
+        principal_amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        installment_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        repayment_start_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+        issued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Default now
+      required:
+      - employee_id
+      - kind
+      - principal_amount
+      - reason
+    ReceivableUpdate:
+      type: object
+      properties:
+        installment_amount:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+        repayment_start_date:
+          type:
+          - string
+          - 'null'
+          format: date
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - expected_updated_at
+    RepaymentCreate:
+      type: object
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole MMK, > 0
+        received_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Default now (≤ now)
+        note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+      required:
+      - amount
+    OutstandingItem:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        employee_status:
+          type: integer
+        advance_balance_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        loan_balance_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        pending_deduction_amount:
+          type: integer
+          minimum: 0
+          description: Whole MMK (D-PLT-04, API-DATA-02)
+        commission_reversal_outstanding_amount:
+          type: integer
+          minimum: 0
+          description: Σ |REVERSAL| − Σ AUTO COMMISSION_REVERSAL lines in FINALIZED+ runs, ≥ 0 (manual lines never count — P5-RULE-02)
+        last_run_period_end:
+          type:
+          - string
+          - 'null'
+          format: date
+      required:
+      - employee
+      - employee_status
+      - advance_balance_amount
+      - loan_balance_amount
+      - pending_deduction_amount
+      - commission_reversal_outstanding_amount
+    AttendanceStatus:
+      type: object
+      properties:
+        mode:
+          type: object
+          properties:
+            qr_required:
+              type: boolean
+            gps_required:
+              type: boolean
+            manual_only:
+              type: boolean
+            max_gps_accuracy_meters:
+              type: integer
+          required:
+          - qr_required
+          - gps_required
+          - manual_only
+          - max_gps_accuracy_meters
+        open_record:
+          oneOf:
+          - $ref: '#/components/schemas/AttendanceRecord'
+          - type: 'null'
+        today_blocks:
+          type: array
+          items:
+            type: object
+            properties:
+              branch_id:
+                type: string
+                format: uuid
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+              shift_ids:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+            required:
+            - branch_id
+            - starts_at
+            - ends_at
+            - shift_ids
+        branches:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              name_mm:
+                type: string
+              name_en:
+                type:
+                - string
+                - 'null'
+              radius_meters:
+                type: integer
+              has_location:
+                type: boolean
+            required:
+            - id
+            - name_mm
+            - radius_meters
+            - has_location
+      required:
+      - mode
+      - open_record
+      - today_blocks
+      - branches
+    ClockInRequest:
+      type: object
+      properties:
+        qr_token:
+          type: string
+          minLength: 43
+          maxLength: 64
+          description: The t value of the poster URL /clock?t=<token> (P5-RULE-17) — redacted in logs
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+        accuracy_meters:
+          type: number
+          minimum: 0
+      required:
+      - qr_token
+      - latitude
+      - longitude
+      - accuracy_meters
+    ClockOutRequest:
+      type: object
+      properties:
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+        accuracy_meters:
+          type: number
+          minimum: 0
+      required:
+      - latitude
+      - longitude
+      - accuracy_meters
+    ExceptionBrief:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        exception_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 LATE · 2 EARLY_LEAVE · 3 ABSENT · 4 INCOMPLETE (D-ATT-03)
+          x-enum-varnames:
+          - LATE
+          - EARLY_LEAVE
+          - ABSENT
+          - INCOMPLETE
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 0 VOID · 1 OPEN · 2 EXCUSED · 3 CONFIRMED · 4 LEAVE (F-P5-05) — OPEN + CONFIRMED are deducted
+          x-enum-varnames:
+          - VOID
+          - OPEN
+          - EXCUSED
+          - CONFIRMED
+          - LEAVE
+        minutes:
+          type:
+          - integer
+          - 'null'
+      required:
+      - id
+      - exception_type
+      - status
+    AttendanceRecord:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        clock_in_at:
+          type: string
+          format: date-time
+        clock_out_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        method:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 QR_GPS (own phone) · 2 MANUAL (manager / admin — D-ATT-06)
+          x-enum-varnames:
+          - QR_GPS
+          - MANUAL
+        clock_out_source:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+          description: null = still clocked in · 1 SELF · 2 MANUAL · 3 AUTO_SHIFT_END (D-ATT-04)
+        shift:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - starts_at
+            - ends_at
+          - type: 'null'
+        late_minutes:
+          type: integer
+        early_leave_minutes:
+          type: integer
+        worked_minutes:
+          type:
+          - integer
+          - 'null'
+        clock_in_distance_meters:
+          type:
+          - integer
+          - 'null'
+        clock_out_distance_meters:
+          type:
+          - integer
+          - 'null'
+        clock_in_latitude:
+          type:
+          - number
+          - 'null'
+          description: Only for the employee and attendance.update holders (P5-RULE-13)
+        clock_in_longitude:
+          type:
+          - number
+          - 'null'
+        clock_out_latitude:
+          type:
+          - number
+          - 'null'
+        clock_out_longitude:
+          type:
+          - number
+          - 'null'
+        device_label:
+          type:
+          - string
+          - 'null'
+        manual_reason:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 9
+          - null
+          description: 'MANUAL records only: 1 PHONE_UNAVAILABLE · 9 OTHER'
+        manual_note:
+          type:
+          - string
+          - 'null'
+        entered_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        corrected_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        corrected_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        correction_reason:
+          type:
+          - string
+          - 'null'
+        voided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        voided_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        void_reason:
+          type:
+          - string
+          - 'null'
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExceptionBrief'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - employee
+      - branch_id
+      - business_date
+      - clock_in_at
+      - clock_out_at
+      - method
+      - clock_out_source
+      - late_minutes
+      - early_leave_minutes
+      - exceptions
+      - created_at
+      - updated_at
+    AttendanceRecordListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        clock_in_at:
+          type: string
+          format: date-time
+        clock_out_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        method:
+          type: integer
+          enum:
+          - 1
+          - 2
+          description: 1 QR_GPS (own phone) · 2 MANUAL (manager / admin — D-ATT-06)
+          x-enum-varnames:
+          - QR_GPS
+          - MANUAL
+        clock_out_source:
+          type:
+          - integer
+          - 'null'
+          enum:
+          - 1
+          - 2
+          - 3
+          - null
+          description: null = still clocked in · 1 SELF · 2 MANUAL · 3 AUTO_SHIFT_END (D-ATT-04)
+        late_minutes:
+          type: integer
+        early_leave_minutes:
+          type: integer
+        worked_minutes:
+          type:
+          - integer
+          - 'null'
+        clock_in_distance_meters:
+          type:
+          - integer
+          - 'null'
+        corrected:
+          type: boolean
+        voided:
+          type: boolean
+      required:
+      - id
+      - employee
+      - branch_id
+      - business_date
+      - clock_in_at
+      - method
+      - late_minutes
+      - corrected
+      - voided
+    ManualAttendanceCreate:
+      type: object
+      properties:
+        employee_id:
+          type: string
+          format: uuid
+        branch_id:
+          type: string
+          format: uuid
+        clock_in_at:
+          type: string
+          format: date-time
+        clock_out_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        manual_reason:
+          type: integer
+          enum:
+          - 1
+          - 9
+          description: 1 PHONE_UNAVAILABLE · 9 OTHER (note required) — D-ATT-06
+          x-enum-varnames:
+          - PHONE_UNAVAILABLE
+          - OTHER
+        manual_note:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required when manual_reason = 9 OTHER
+      required:
+      - employee_id
+      - branch_id
+      - clock_in_at
+      - manual_reason
+    ManualClockOut:
+      type: object
+      properties:
+        clock_out_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - clock_out_at
+      - reason
+    AttendanceCorrection:
+      type: object
+      properties:
+        clock_in_at:
+          type: string
+          format: date-time
+        clock_out_at:
+          type: string
+          format: date-time
+        correction_reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+        expected_updated_at:
+          type: string
+          format: date-time
+      required:
+      - correction_reason
+      - expected_updated_at
+    VoidRequest:
+      type: object
+      properties:
+        void_reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Free-text reason (AD-RSN-02 source F) — 400 reason_required when blank
+      required:
+      - void_reason
+    AttendanceException:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        branch_id:
+          type: string
+          format: uuid
+        business_date:
+          type: string
+          format: date
+        exception_type:
+          type: integer
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 1 LATE · 2 EARLY_LEAVE · 3 ABSENT · 4 INCOMPLETE (D-ATT-03)
+          x-enum-varnames:
+          - LATE
+          - EARLY_LEAVE
+          - ABSENT
+          - INCOMPLETE
+        minutes:
+          type:
+          - integer
+          - 'null'
+        shift:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - starts_at
+            - ends_at
+          - type: 'null'
+        attendance_record_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        detected_at:
+          type: string
+          format: date-time
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 0 VOID · 1 OPEN · 2 EXCUSED · 3 CONFIRMED · 4 LEAVE (F-P5-05) — OPEN + CONFIRMED are deducted
+          x-enum-varnames:
+          - VOID
+          - OPEN
+          - EXCUSED
+          - CONFIRMED
+          - LEAVE
+        leave_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        resolution_reason:
+          type:
+          - string
+          - 'null'
+        resolved_by:
+          oneOf:
+          - type: object
+            properties:
+              user_id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - user_id
+            - display_name
+          - type: 'null'
+        resolved_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        payroll_effect:
+          type: string
+          enum:
+          - deducted
+          - not_deducted
+          - not_deductible
+          description: not_deductible = INCOMPLETE
+        locked:
+          type: boolean
+          description: Inside a finalized payroll period
+        changed_after_resolution:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - employee
+      - branch_id
+      - business_date
+      - exception_type
+      - detected_at
+      - status
+      - payroll_effect
+      - locked
+      - updated_at
+    ExceptionResolveRequest:
+      type: object
+      properties:
+        status:
+          type: integer
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          description: 0 VOID · 1 OPEN · 2 EXCUSED · 3 CONFIRMED · 4 LEAVE (F-P5-05) — OPEN + CONFIRMED are deducted
+          x-enum-varnames:
+          - VOID
+          - OPEN
+          - EXCUSED
+          - CONFIRMED
+          - LEAVE
+        reason:
+          type:
+          - string
+          - 'null'
+          maxLength: 1000
+          description: Required for 0 VOID and 2 EXCUSED
+        leave_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: '4 LEAVE: an existing PENDING / APPROVED leave covering the date'
+        create_leave:
+          oneOf:
+          - type: object
+            properties:
+              leave_type_id:
+                type: string
+                format: uuid
+              day_portion:
+                type: integer
+                enum:
+                - 1
+                - 2
+                - 3
+                description: 1 FULL · 2 MORNING · 3 AFTERNOON (Part 2 leaves)
+                x-enum-varnames:
+                - FULL
+                - MORNING
+                - AFTERNOON
+            required:
+            - leave_type_id
+            - day_portion
+          - type: 'null'
+      required:
+      - status
+    AttendanceEvidence:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        date:
+          type: string
+          format: date
+        visits:
+          type: array
+          items:
+            type: object
+            properties:
+              visit_id:
+                type: string
+                format: uuid
+              branch_id:
+                type: string
+                format: uuid
+              status:
+                type: integer
+              started_at:
+                type: string
+                format: date-time
+              completed_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              finished_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              role:
+                type: string
+                enum:
+                - performer
+                - recorder
+            required:
+            - visit_id
+            - branch_id
+            - status
+            - started_at
+            - role
+        shifts:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              branch_id:
+                type: string
+                format: uuid
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - branch_id
+            - starts_at
+            - ends_at
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/AttendanceRecordListItem'
+      required:
+      - employee
+      - date
+      - visits
+      - shifts
+      - records
+    AttendanceSummaryItem:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        scheduled_days:
+          type: number
+        present_days:
+          type: number
+        worked_minutes:
+          type: integer
+        late_count:
+          type: integer
+        late_minutes:
+          type: integer
+        early_leave_count:
+          type: integer
+        absent_days:
+          type: number
+        incomplete_count:
+          type: integer
+        manual_count:
+          type: integer
+          description: Manual entries this month (D-ATT-06)
+        exceptions_by_status:
+          type: object
+          properties:
+            open:
+              type: integer
+            excused:
+              type: integer
+            confirmed:
+              type: integer
+            leave:
+              type: integer
+            void:
+              type: integer
+          required:
+          - open
+          - excused
+          - confirmed
+          - leave
+          - void
+      required:
+      - employee
+      - scheduled_days
+      - present_days
+      - worked_minutes
+      - late_count
+      - late_minutes
+      - early_leave_count
+      - absent_days
+      - incomplete_count
+      - manual_count
+      - exceptions_by_status
+    TodayAttendanceItem:
+      type: object
+      properties:
+        employee:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            display_name:
+              type: string
+            employee_code:
+              type:
+              - string
+              - 'null'
+          required:
+          - id
+          - display_name
+        state:
+          type: string
+          enum:
+          - clocked_in
+          - clocked_out
+          - not_yet
+          - late
+          - absent
+          - on_leave
+          - unscheduled_in
+        blocks:
+          type: array
+          items:
+            type: object
+            properties:
+              starts_at:
+                type: string
+                format: date-time
+              ends_at:
+                type: string
+                format: date-time
+            required:
+            - starts_at
+            - ends_at
+        record:
+          oneOf:
+          - $ref: '#/components/schemas/AttendanceRecordListItem'
+          - type: 'null'
+        open_exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExceptionBrief'
+      required:
+      - employee
+      - state
+      - blocks
+      - record
+      - open_exceptions
+    AttendanceQr:
+      type: object
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        active:
+          oneOf:
+          - type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              token:
+                type: string
+              qr_payload:
+                type: string
+                description: https://<app host>/clock?t=<token>
+              created_at:
+                type: string
+                format: date-time
+              created_by:
+                type: object
+                properties:
+                  user_id:
+                    type: string
+                    format: uuid
+                  display_name:
+                    type: string
+                required:
+                - user_id
+                - display_name
+            required:
+            - id
+            - token
+            - qr_payload
+            - created_at
+            - created_by
+          - type: 'null'
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              created_at:
+                type: string
+                format: date-time
+              created_by:
+                type: object
+                properties:
+                  user_id:
+                    type: string
+                    format: uuid
+                  display_name:
+                    type: string
+                required:
+                - user_id
+                - display_name
+              revoked_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+              revoked_by:
+                oneOf:
+                - type: object
+                  properties:
+                    user_id:
+                      type: string
+                      format: uuid
+                    display_name:
+                      type: string
+                  required:
+                  - user_id
+                  - display_name
+                - type: 'null'
+            required:
+            - id
+            - created_at
+            - created_by
+      required:
+      - branch_id
+      - active
+      - history

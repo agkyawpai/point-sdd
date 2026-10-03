@@ -1,0 +1,124 @@
+// Point Barbershop — Part 3: Customers / Booking · v3 🔒 D-DB-07 (30/Sep/2026)
+// Part 1 (D-DB-02) + 1b (D-DB-05) + 2 (D-DB-06) ပေါ်မှာ ဆောက် — dbdiagram မှာ part1 + part2 နဲ့ တွဲ paste
+// 🔒 D-CUS-01..09, D-BKG-01..22 (v5.1: D-BKG-09, D-BKG-12, D-BKG-20 ⏭), D-SVC-04..08, D-SCH-03, D-LV-04,
+//    D-ORG-03, D-DB-01/03/04, D-PLT-15 · OPEN-29 (က) = customer က option ကိုယ်တိုင်ရွေး
+// Status / type = smallint + CHECK (D-DB-03) · EXCLUDE / CHECK / composite FK = part3-customers-booking-v3-constraints.sql
+// F-BK-nn = review finding (§6.4, §6.4c) — D-DB-07 နဲ့ approve ပြီး
+// Waitlist ⏭ (D-BKG-20, §6.4b) — ဒီ part မှာ table မထည့်
+
+// ───────────────────────── Customers ─────────────────────────
+
+Table customers {
+  id uuid [pk, note: 'UUIDv7']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03 — company-level customer (D-CUS-01)']
+  name varchar(255) [not null, note: 'ပြောတဲ့အတိုင်း တစ်ခု (D-DB-04)']
+  phone varchar(50) [not null, note: 'ရိုက်ထည့်တဲ့အတိုင်း (ပြဖို့)']
+  phone_normalized varchar(20) [not null, note: 'E.164 (+959…) — 🔒 D-CUS-02 identity · (company_id, phone_normalized) unique (archive ပြီးသားပါ — F-BK-21)']
+  notes text [note: 'Optional၊ staff အားလုံးမြင် (D-CUS-01) · free text (D-DB-04)']
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE (D-CUS-07, D-DB-03)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz [note: 'Soft delete (D-CUS-07)']
+
+  Indexes {
+    (company_id, phone_normalized) [unique, note: 'D-CUS-02 + D-ORG-03']
+    (company_id, name) [note: 'Search (D-CUS-06)']
+  }
+
+  Note: '''
+  Booking / walk-in မှာ ဖုန်းနဲ့ auto match / create (D-CUS-03) — archive ပြီးသား ဖုန်းဆို row အသစ် မဖန်တီး၊ ပြန်ဖွင့် (F-BK-21)
+  Account / login မရှိ (D-CUS-04) · customer ဆီ ဘာမှမပို့ — email field မထား (D-CUS-05)
+  Preferred barber / timeline / statistics = history ကနေ တွက် — column မထား (D-CUS-07, D-CUS-08)
+  F-BK-08: R365 ရဲ့ preferences ✖ (lock မရှိ)
+  '''
+}
+
+// ───────────────────────── Booking ─────────────────────────
+
+Table booking_cancel_reasons {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04 (admin master list)']
+  name_en varchar(150)
+  requires_note boolean [not null, default: false, note: '"Other" — စာ မဖြစ်မနေ (D-BKG-14) · app စစ်']
+  system_code smallint [note: 'NULL = admin ထည့်တာ · 1 NO_SHOW (D-BKG-17 auto-cancel က သုံး — ပိတ် / archive ✖)']
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '''
+  F-BK-17 — 🔒 D-BKG-14 preset + D-DB-04 ("cancel reason" = admin master list, MM + EN)
+  Seed: Customer ပြောင်းချင် · Barber မအား · Customer မလာ (system_code 1) · Other (requires_note)
+  (company_id, system_code) unique · (company_id, name_mm) unique — archive မလုပ်ရသေးတာတွေအတွင်း (SQL)
+  '''
+}
+
+Table bookings {
+  id uuid [pk]
+  branch_id uuid [not null, ref: > branches.id, note: 'Home service ဆိုလည်း barber ထွက်တဲ့ branch (D-SVC-06)']
+  customer_id uuid [not null, ref: > customers.id, note: 'Auto match / create (D-CUS-03) · F-BK-06']
+  customer_name varchar(255) [not null, note: 'ဒီ booking မှာ ရိုက်ထည့်တဲ့ နာမည် — ဥပမာ အမေဖုန်းနဲ့ သား (D-BKG-09 v5.1) · customers.name ကို auto မပြောင်း (F-BK-19)']
+  booked_employee_id uuid [not null, ref: > employees.id, note: '🔒 D-BKG-05 customer ရွေး · D-BKG-08 · F-BK-01/05']
+  location_type smallint [not null, default: 1, note: '1 BRANCH (ဆိုင်) · 2 HOME (အိမ်) — D-BKG-22']
+  home_address text [note: 'HOME ဆို မဖြစ်မနေ (D-BKG-22) · free text']
+  home_address_note text [note: 'HOME — မှတ်သားစရာ (optional, D-BKG-22)']
+  transport_fee_amount bigint [note: 'HOME ဆို ကားခ snapshot (MMK — D-SVC-06; 0 = ဆိုင်ခံ) · BRANCH ဆို NULL · sale line = Part 4']
+  channel smallint [not null, note: '1 ONLINE (website) · 2 STAFF — F-BK-11 ✅ (D-BKG-09 v5.1)']
+  created_by_user_id uuid [ref: > users.id, note: 'STAFF ဆို မဖြစ်မနေ · ONLINE ဆို NULL']
+  starts_at timestamptz [not null, note: 'Customer ချိန်းချိန် (HOME = အိမ်ရောက်ချိန်)']
+  ends_at timestamptz [not null, note: 'Service အကုန် ပြီးချိန် = starts_at + Σ items.duration_minutes']
+  block_starts_at timestamptz [not null, note: 'Barber ပိတ်ချိန် အစ = starts_at − သွားချိန် (HOME — D-SCH-03) · F-BK-16']
+  block_ends_at timestamptz [not null, note: 'Barber ပိတ်ချိန် အဆုံး = ends_at + buffer (D-SVC-07) + ပြန်ချိန် (HOME) · F-BK-16']
+  business_date date [not null, note: 'starts_at ရဲ့ MMT ရက် (D-PLT-15)']
+  status smallint [not null, default: 1, note: '0 CANCELLED · 1 BOOKED · 2 STARTED · 3 COMPLETED (D-BKG-18)']
+  cancelled_at timestamptz
+  cancel_reason_id uuid [ref: > booking_cancel_reasons.id, note: 'D-BKG-14 · no-show auto = system_code 1 (D-BKG-17)']
+  cancel_note text [note: 'Other ဆို မဖြစ်မနေ (app)']
+  cancelled_by_actor smallint [note: '1 CUSTOMER (manage link) · 2 STAFF · 3 SYSTEM (no-show) — F-BK-09']
+  cancelled_by_user_id uuid [ref: > users.id, note: 'STAFF ဆို မဖြစ်မနေ']
+  manage_token_hash varchar(255) [not null, unique, note: 'Raw token မသိမ်း (D-BKG-11) · staff ထည့်တဲ့ booking လည်း link ထုတ် — F-BK-10']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, business_date)
+    (booked_employee_id, block_starts_at)
+    (customer_id, starts_at)
+  }
+
+  Note: '''
+  🔒 D-BKG-08 — barber တစ်ယောက် ပိတ်ချိန် (block) ထပ် ✖ — branch မတူလည်း (EXCLUDE — SQL) · first success wins
+  🔒 D-BKG-09 (v5.1) — active (BOOKED / STARTED) ၁ ခု = ONLINE booking မှာပဲ app စစ် (customer row FOR UPDATE) · DB index မသုံး
+  🔒 D-BKG-12 (v5.1) — reschedule: အချိန်ပဲ ရွှေ့ = items ဈေး / ကြာချိန် / buffer မပြောင်း၊ block ပြန်တွက် ·
+     service / option ပြောင်း = အဲ့ item ပဲ ဈေးအသစ် · barber / ဆိုင် ↔ အိမ် ပြောင်း = item အကုန် + ကားခ ဈေးအသစ်
+  🔒 D-BKG-16 — CANCELLED ကနေ ပြန်မဖွင့် · CANCELLED ⇔ cancel field တွေ (CHECK — SQL)
+  Availability (D-BKG-04) = shift − booking block − leave (pending ပါ — D-LV-04) − walk-in visit (Part 4) — app, code တစ်နေရာတည်း (§6.4b A-2)
+  Cancel / reschedule / no-show = code လမ်းကြောင်း တစ်ခုတည်း (§6.4b A-3) · noti + audit (D-BKG-15, Part 8)
+  Employee: ဒီ branch မှာ ရှိ (employee_branches) + eligible (D-EMP-05; HOME = home_allowed) — app စစ်
+  STARTED / COMPLETED = visit (Part 4) က ပြောင်း — visits.booking_id FK Part 4 မှာ
+  '''
+}
+
+Table booking_items {
+  id uuid [pk]
+  booking_id uuid [not null, ref: > bookings.id]
+  sort_order smallint [not null, note: 'ဆက်တိုက် အစဉ် (D-BKG-03)']
+  service_id uuid [not null, ref: > services.id, note: 'F-BK-15 ✅ (Part 2 🔒)']
+  service_variant_id uuid [ref: > service_variants.id, note: 'OPTIONS service = မဖြစ်မနေ (OPEN-29 (က) — app စစ်) · SIMPLE = NULL · ဒီ service ရဲ့ variant ပဲ (composite FK — SQL)']
+  unit_price_amount bigint [not null, note: 'ချိန်းရက်ရဲ့ ဈေး snapshot (D-SVC-04, D-SVC-08; barber / HOME ဈေး ပါ) — F-BK-02']
+  duration_minutes integer [not null, note: 'Snapshot (D-SVC-05 ကွက် ကြာချိန် ဒါမှမဟုတ် branch ပုံမှန်)']
+  buffer_minutes smallint [not null, default: 0, note: 'Snapshot (D-SVC-07) — item တိုင်း ကြာချိန် + buffer']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (booking_id, sort_order) [unique]
+  }
+
+  Note: '''
+  Service အများကြီး + barber တစ်ယောက် + ဆက်တိုက် (D-BKG-03)
+  Service နာမည် snapshot မထား — services ကို မဖျက်ဘူး (D-DAT-05); receipt နာမည် snapshot = sale (Part 4) — F-BK-18
+  '''
+}

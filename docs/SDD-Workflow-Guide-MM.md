@@ -8,16 +8,18 @@
 ## 0. Folder ပုံစံ
 
 ```
-D:\point_flow\                  ← workspace (repo မဟုတ်)
-├── point-sdd\                  ← ဒီ repo (spec + test case + tool) — github.com/agkyawpai/point-sdd
-├── <app-repo>\                 ← app source code repo (အဆင်သင့်ဖြစ်ရင် ဒီမှာ clone)
-└── docs\                       ← DB design (DBML/SQL), decision log, ux-rules.md
+point\                          ← workspace folder (repo မဟုတ် — ဘယ် drive မဆို)
+├── point-sdd\                  ← ဒီ repo (spec + design source + test case + tool) — github.com/agkyawpai/point-sdd
+└── point-barber\               ← app source code repo — github.com/naingaunglinn/point-barber
 ```
 
 | Repo | ဘာထည့်လဲ | ဘာ မထည့်ရဘူးလဲ |
 |---|---|---|
-| **point-sdd** | Brief, OpenSpec change / spec, test case JSON, tool, skill | App source code ✖ |
-| **app repo** | Source code, migration, unit test | Spec ✖ (spec က point-sdd မှာပဲ) |
+| **point-sdd** | Brief, OpenSpec change / spec, **design source အကုန်** (`docs/decisions` ဆုံးဖြတ်ချက် · `docs/db` DBML / SQL · `docs/ux` · `docs/api` · `docs/adr` · `docs/plan`), test case JSON, tool, skill | App source code ✖ |
+| **point-barber** | Source code, migration, unit / integration / e2e test, `docs/engineering/coding-guideline.md`, `design-reference/` ပုံ | Spec ✖ (spec က point-sdd မှာပဲ) |
+
+> Repo ၂ ခု ခွဲတာရဲ့ အကြောင်းရင်း = `docs/adr/ADR-016`။ **DB / API / UX / ADR ပြောင်းချင်ရင် point-sdd မှာ အရင်ပြင်** (version bump + decision register note) → ပြီးမှ point-barber မှာ code ပြင်။
+> Claude Code အတွက် စည်းမျဉ်း: ဒီ repo = [`CLAUDE.md`](../CLAUDE.md) + `openspec/config.yaml`; app repo = `point-barber/CLAUDE.md` + `docs/engineering/coding-guideline.md` (CG-…)။
 
 **အဓိက စည်းမျဉ်း — Spec မရှိရင် code မရေးရ။** Code / branch / PR တိုင်း point-sdd ထဲက OpenSpec change တစ်ခုကို ညွှန်းနိုင်ရမယ်။
 
@@ -53,14 +55,15 @@ D:\point_flow\                  ← workspace (repo မဟုတ်)
 |---|---|
 | Git | `git --version` |
 | Python 3.9+ | `python --version` |
-| Node.js 20+ | `node --version` |
+| Node.js 20.19+ | `node --version` |
 | Claude Code (VS Code extension သို့ CLI) | — |
 
 ### 2.2 Repo clone + tool setup
 
 ```powershell
-cd D:\point_flow
+mkdir point; cd point
 git clone https://github.com/agkyawpai/point-sdd.git
+git clone https://github.com/naingaunglinn/point-barber.git
 cd point-sdd
 
 # Test case tool (Python)
@@ -71,22 +74,32 @@ python -m venv .venv
 npm install
 npx playwright install chromium
 
-# OpenSpec
-npm install -g @fission-ai/openspec
-openspec init          # Claude Code ကို ရွေး
+# OpenSpec — version pin (စက်တိုင်း တူအောင်)
+npm install -g @fission-ai/openspec@1.14.0
+openspec init --tools claude .                  # /opsx:* command ထုတ် (openspec/config.yaml မပြောင်း)
+openspec store register . --id point-sdd        # စက်တစ်လုံး တစ်ခါ — point-sdd = spec "store"
+
+cd ..\point-barber
+openspec init --tools claude .                  # app repo မှာလည်း /opsx:* command
+openspec list                                   # point-sdd ထဲက change တွေ ပေါ်ရမယ်
 ```
 
-> `openspec init` က `openspec/` folder နဲ့ `/opsx:*` command တွေကို ထုတ်ပေးတယ်။ Version အလိုက် command နာမည် ကွဲနိုင်လို့ init ပြီးရင် Claude Code မှာ `/` ရိုက်ပြီး စစ်ပါ။
+> `openspec init` က `/opsx:*` command တွေကို ထုတ်ပေးတယ် (`openspec/config.yaml` ရှိပြီးသားကို မထိ)။ Init ပြီးရင် Claude Code မှာ `/` ရိုက်ပြီး စစ်ပါ။
+> `point-barber/openspec/config.yaml` ထဲမှာ `store: point-sdd` တစ်ကြောင်းပဲ ရှိတယ် — app repo က spec ကို point-sdd ကနေ တိုက်ရိုက် ဖတ်တယ် (ADR-016)။ အသေးစိတ် = [`SETUP.md`](../SETUP.md)။
 
-### 2.3 App repo ကို Claude မြင်အောင်
+### 2.3 ဘယ် repo ထဲမှာ ဘာလုပ်မလဲ
 
-App repo clone ပြီးရင်:
+| အလုပ် | Claude Code ဖွင့်ရမယ့် repo |
+|---|---|
+| Brief · `/opsx:explore` · `/opsx:propose` · `openspec validate` · `/point-generate-tests` · `/point-browser-tester` · `/opsx:archive` | **point-sdd** |
+| `/opsx:apply <change-id>` (code ရေး) | **point-barber** — app ရဲ့ `CLAUDE.md` + coding guideline + hook တွေ အလိုလို ဝင်; change ကို store ကနေ ဖတ်; `tasks.md` ရဲ့ `[x]` က point-sdd ထဲ ရောက် |
 
-1. `.claude\settings.local.json.example` ကို `.claude\settings.local.json` အဖြစ် copy
-2. `<app-repo-folder>` နေရာမှာ တကယ့် folder နာမည် ထည့်
-3. `projects.json.example` → `projects.json` လည်း အတူတူ
+Skill တွေက app repo ကို ဖတ်ဖို့ (ကိုယ့်စက်အတွက်ပဲ — git ထဲ မဝင်):
 
-(ဒီ file ၂ ခုက ကိုယ့်စက်အတွက်ပဲ — git ထဲ မဝင်ဘူး)
+1. `.claude\settings.local.json.example` ကို `.claude\settings.local.json` အဖြစ် copy (`../point-barber` ပါပြီးသား)
+2. `projects.json.example` → `projects.json`
+
+> **Fallback:** store က OpenSpec 1.14.0 မှာ beta ပါ။ point-barber ထဲမှာ `openspec list` က change တွေ မပြရင် — point-sdd ထဲကနေ `/opsx:apply` run (အပေါ်က `settings.local.json` လို) ပြီး session အစမှာ Claude ကို `../point-barber/CLAUDE.md` ဖတ်ခိုင်းပါ။
 
 ---
 
@@ -96,8 +109,8 @@ Brainstorm ပြီးရင် **feature / form တစ်ခုကို brief
 
 ### 3.1 Brief အရွယ်
 
-- **Brief ၁ ခု = အလုပ် ၁–၃ ရက်**၊ တစ်ထိုင်တည်း review လို့ရတဲ့ အရွယ်။
-- Part တစ်ခုလုံး (ဥပမာ Part 4 Sales) ✖ — ခွဲပါ: `add-visit-start-complete`, `add-sale-finish-receipt`, `add-payments-cash-kbzpay`, `add-discount-requests` …
+- **Brief ၁ ခု = form / topic တစ်ခု = အလုပ် ၁–၃ ရက်**၊ တစ်ထိုင်တည်း review လို့ရတဲ့ အရွယ်၊ test case ~၂၀–၃၀ (🔒 D-PLT-20)။ Change စာရင်း + အစဉ် + ဘယ်သူ = `docs/plan/roadmap.md`။
+- Part တစ်ခုလုံး (ဥပမာ Part 4 Sales) ✖ — ခွဲပါ: `add-discount-codes`, `add-discount-requests`, `add-refunds`, `add-sale-adjustments` … (roadmap ထဲက နာမည်တွေ)
 - နာမည် = **verb + feature**: `add-…`, `change-…`, `remove-…`, `fix-…`
 - ဘယ် brief ပြီးမှ ဒါလုပ်လို့ရလဲ (dependency) ရေးပါ။
 
@@ -166,14 +179,14 @@ Form တစ်ခုချင်း field တိုင်း ဒီလို ရ
 - **Buttons** — ဘာ button တွေ၊ နှိပ်ရင် ဘာဖြစ်လဲ၊ ဘယ် status မှာ ပိတ်ထားလဲ
 - **Permission** — ဘယ် role မြင်ရ / ပြင်ရ
 - **List screen ဆို** — column၊ sort default၊ filter၊ search ဘာနဲ့ရှာ
-- **Save ပြီးရင်** — ဘယ်မှာ ကျန်လဲ၊ ဘာ message ပြလဲ (`docs/ux-rules.md` အတိုင်း)
+- **Save ပြီးရင်** — ဘယ်မှာ ကျန်လဲ၊ ဘာ message ပြလဲ (`docs/ux/admin-panel.md` AD-… / `docs/ux/frontend-website.md` FE-… အတိုင်း — rule ID ကိုးကား)
 
 > Field table ကောင်းရင် **Boundary / Abnormal test case** တွေ အလိုလို ထွက်လာတယ် (1–100 ဆို 0, 1, 100, 101 စစ်မယ်)။
 
 ### 3.4 မပေးခင် checklist
 
 - [ ] Rule တိုင်း ဟုတ် / မဟုတ် စစ်လို့ရတဲ့ တစ်ကြောင်း
-- [ ] Rule တိုင်းမှာ scenario အနည်းဆုံး ၁ ခု (တကယ့် နာမည် / ငွေ / အချိန်)
+- [ ] Rule တိုင်းမှာ scenario အနည်းဆုံး ၁ ခု (တကယ့် နာမည် / ငွေ / အချိန် — `docs/plan/spec-fixtures.md` ထဲက လူ / ဆိုင်ခွဲ / ဈေး ကိုပဲ သုံး)
 - [ ] Form field တိုင်း table ထဲ ပါ
 - [ ] Decision ID ပါ၊ ဆုံးဖြတ်ချက်အသစ်ဆို "proposed" လို့ မှတ်
 - [ ] Out of scope ဖြည့်ပြီး (တစ်ကြောင်းဖြစ်ဖြစ်)
@@ -192,7 +205,7 @@ Commit: `git add docs/briefs/<change-id>.md` → `git commit -m "brief: <change-
 /opsx:explore docs/briefs/<change-id>.md
 ```
 
-Claude က brief + decision log + DBML ကို ဖတ်ပြီး **မရှင်းတာ၊ ကွဲလွဲတာ** ကို မေးခွန်းထုတ်မယ်။
+Claude က brief + `docs/decisions/decision-register.md` + `docs/db` + `docs/api` + `docs/ux` ကို ဖတ်ပြီး **မရှင်းတာ၊ ကွဲလွဲတာ** ကို မေးခွန်းထုတ်မယ်။ 🔒 ဆုံးဖြတ်ချက် အချင်းချင်း ဆန့်ကျင်တာ တွေ့ရင် Claude က ကိုယ်တိုင် မရွေးဘဲ ရပ်ပြီး မေးရမယ် (D-PLT-13)။
 → Spec ရေးသူက brief ထဲ "Answers to Claude's questions" မှာ ဖြေ (chat ထဲမဟုတ် — မှတ်တမ်းကျန်အောင်)။
 
 ### 4.2 Propose — change ထုတ်
@@ -232,10 +245,10 @@ openspec/changes/<change-id>/
 - Code task တိုင်း **ဘယ် repo** မှာလဲ ရေး
 - ဥပမာ:
   ```markdown
-  ## 1. Backend (<app-repo>)
+  ## 1. Backend (point-barber)
   - [ ] 1.1 discount_requests migration + model
   - [ ] 1.2 POST /sales/{id}/discount-requests (reason required, one PENDING per sale)
-  ## 2. Frontend (<app-repo>)
+  ## 2. Frontend (point-barber)
   - [ ] 2.1 "Ask for discount" dialog
   ## 3. Tests
   - [ ] 3.1 Unit tests for R1–R5
@@ -254,6 +267,13 @@ The system SHALL allow at most one PENDING discount request per OPEN sale.
 - **THEN** the "Ask for discount" button is disabled
 - **AND** the API rejects a new request with "A request is already pending"
 ```
+
+**ဒီ project ရဲ့ spec စည်းမျဉ်း (🔒 D-PLT-20 — `openspec/config.yaml` မှာ အပြည့်):**
+
+- Capability folder = `openspec/config.yaml` ထဲက business area စာရင်းထဲကပဲ — **၂၅ ခု 🔒** (`auth`, `access`, `organization`, `services-pricing`, `scheduling`, `leave`, `customers`, `booking`, `visits`, `sales-checkout`, `payments`, `discounts`, `refunds`, `inventory`, `finance-closing`, `commission-payroll`, `attendance`, `settings`, `website`, `notifications`, `reports-dashboards`, `audit`, `data-management`, `platform-runtime`, `ui-foundation`)။ (နောက်ဆုံး ၂ ခု — `platform-runtime`, `ui-foundation` — ကို owner က 02/Oct/2026 sheet 3 (review §0.11 S3) မှာ အတည်ပြုပြီး။)
+- Requirement တိုင်း = **တကယ့်တန်ဖိုးပါတဲ့ SHALL စာကြောင်း + source ID**။ "D-PAY-04 ကြည့်" လို့ချည်း ရေးရင် requirement မဟုတ်။
+- Scenario = တကယ့် နာမည် / MMK ပမာဏ / အချိန် / error `code` + HTTP status; မျှော်လင့်တဲ့ တန်ဖိုးကို တွက်ပုံနဲ့ ရေး (`total = 11,000 (8,000 + 3,000)`)။
+- Proposal ထိပ်မှာ `## မြန်မာ အတိုချုပ်`; `## Open questions` → "Needs the owner's answer" အောက်မှာ တစ်ခုခု ကျန်နေရင် အဲ့ change တစ်ခုလုံး apply မလုပ်ရ။
 
 Format စည်းမျဉ်း (validator တင်းကျပ်တယ်):
 
@@ -287,8 +307,8 @@ Commit: `proposal: <change-id>`
 
 ## 5. အဆင့် ③ — Code ရေး (Developer)
 
-1. App repo မှာ branch ဖွင့်: `git switch -c feature/<change-id>`
-2. Claude Code မှာ:
+1. **point-barber** မှာ branch ဖွင့်: `git switch -c feature/<change-id>`
+2. Claude Code ကို **point-barber ထဲမှာ ဖွင့်ပြီး**:
    ```
    /opsx:apply <change-id>
    ```
@@ -297,7 +317,8 @@ Commit: `proposal: <change-id>`
 4. Spec မှာ မပါတာ လုပ်ချင်လာရင် → **ရပ်** → spec / brief ကို အရင်ပြင် → ပြီးမှ ဆက်
 5. Unit test ကို scenario တွေကနေ ရေး (scenario ၁ ခု ≈ test ၁ ခု)
 6. Commit ကို အဆင့်လိုက်ခွဲ (task group တစ်ခု = commit တစ်ခု လောက်)
-7. PR description မှာ `Spec: point-sdd/openspec/changes/<change-id>` ထည့်
+7. PR title = `<type>(<change-id>): <အကျဉ်း>` (ဥပမာ `feat(add-walkin-visit-checkout): take split payment`) — coding guideline CG-GIT-02; PR description မှာ `Spec: point-sdd/openspec/changes/<change-id>` + decision ID + rule ID (`AD-…` / `CG-…`) ထည့်
+8. Code ရေးပုံ စည်းမျဉ်း = `point-barber/docs/engineering/coding-guideline.md` (CG-…) — CI က စက်နဲ့ စစ်လို့ရတာ အကုန် စစ်တယ်
 
 > Claude လမ်းလွဲရင် chat ထဲ ပြောတာထက် **tasks.md သို့ scenario** ကို ပြင်တာ ပိုထိရောက်တယ်။ ပြီးရင် `/clear` လုပ်ပြီး ပြန် apply။
 
@@ -416,11 +437,14 @@ Cleanup: Sale ကို cancel ပြီး status Cancelled ဖြစ်တာ 
 ```
 
 - Claude က case တစ်ခုချင်း scope ခွဲ (browser ရ / မရ)၊ Playwright နဲ့ browser ဖွင့်ပြီး run
-- **Login အချက်အလက်** — chat ထဲ **ဘယ်တော့မှ မထည့်ရ**၊ environment variable နဲ့ပဲ:
+- **Login** — system မှာ **password မရှိ** (Google / email code)။ Tester က email code နဲ့ ဝင်တယ်: code ကို test environment ရဲ့ **Mailpit** ကနေ harness က ဖတ်ပေးတယ်။ Chat ထဲ code / password **ဘယ်တော့မှ မထည့်ရ**၊ environment variable နဲ့ပဲ:
   ```powershell
-  $env:POINT_TEST_ADMIN_USER = "..."
-  $env:POINT_TEST_ADMIN_PASSWORD = "..."
+  $env:POINT_TEST_BASE_URL     = "https://app.point.test"
+  $env:POINT_TEST_MAILPIT_URL  = "http://localhost:8025"
+  $env:POINT_TEST_ADMIN_EMAIL  = "kyawzin@point.test"     # docs/plan/spec-fixtures.md ထဲက လူ
+  $env:POINT_TEST_BARBER_EMAIL = "aung@point.test"
   ```
+  Google login ကို လက်နဲ့ပဲ စစ် (automation ✖)။
 - Data ပြောင်းတဲ့ case (data-mutating / RBAC-mutating) က **ခွင့်ပြုချက်မပေးရင် မ run** — test environment မှာပဲ ခွင့်ပြုပါ
 - Evidence: `work/Test Cases/<Topic> Evidence/runs/<run-id>/` (screenshot, results.json, summary.md)
 - ပြီးရင် PASS → OK၊ FAIL → NG အဖြစ် Excel ထဲ ရေးပေးမယ်။ BLOCKED / OUT_OF_SCOPE က မထိဘူး — manual စစ်ရမယ်
@@ -508,11 +532,11 @@ Push မလုပ်ခင် `git pull` အရင်။ Change တစ်ခု�
 [ ] 4. Validate            openspec validate <id> --strict
 [ ] 5. Review proposal     (နှစ်ယောက်)                             → commit
 [ ] 6. Branch              app repo: git switch -c feature/<id>
-[ ] 7. Apply               /opsx:apply <id>                       → unit test pass
+[ ] 7. Apply               point-barber ထဲမှာ /opsx:apply <id>     → CI green + PR review (merge မလုပ်သေး)
 [ ] 8. Test cases          /point-generate-tests <id>             → JSON review → Excel
 [ ] 9. Test                Manual / /point-browser-tester <xlsx>
 [ ] 10. NG fix loop        NG Report → fix → retest → Confirmed date
-[ ] 11. Merge              app repo PR (Spec link ပါ)
+[ ] 11. Merge              app repo PR squash merge (Spec link ပါ) — NG အကုန် ပိတ်ပြီးမှ
 [ ] 12. Archive            /opsx:archive <id>                     → commit
 ```
 
@@ -527,7 +551,7 @@ Push မလုပ်ခင် `git pull` အရင်။ Change တစ်ခု�
 Code ရပ် → brief / spec ပြင် → proposal ပြန် review → ဆက် apply။ Code ထဲမှာပဲ ပြင်ပြီး spec မပြင်ရင် spec နဲ့ code ကွဲသွားမယ်။
 
 **Q: Test case ဘယ်နှစ်ခု သင့်တော်လဲ?**
-Change သေး ၃–၁၀၊ ပုံမှန် feature ၁၀–၂၅၊ rule ရှုပ်ရင် ၂၀–၄၀။ များတာ မကောင်းဘူး — behavior မတူတာပဲ ခွဲ။
+Change သေး ၃–၁၀၊ ပုံမှန် ၂၀–၃၀ (🔒 D-PLT-20)။ ၃၀ ကျော်နေရင် change က ကြီးလွန်းတာ — ခွဲဖို့ စဉ်းစားပါ။ များတာ မကောင်းဘူး — behavior မတူတာပဲ ခွဲ။
 
 **Q: Excel ပြင်ချင်ရင်?**
 Case content → JSON ပြင်ပြီး ပြန်ထုတ်။ Tester column (Result စတာ) → Excel မှာ တိုက်ရိုက်။

@@ -1,0 +1,257 @@
+// Point Barbershop — Part 7: Finance / Daily closing / P&L · v1.2 🔒 D-DB-11 (30/Sep/2026 · v1.1 = 02/Oct/2026 · v1.2 = 02/Oct/2026)
+// v1.1 → v1.2 (02/Oct/2026 — owner "OPEN-40 OK" · OPEN-40 (a) = B · 🔒 D-DB-11 v1.2 · review §0.9): payroll reopen ↔ salary expense (source 3 PAYROLL) = soft delete (hard delete ✖ — D-DAT-05)
+//   (1) FK expenses.payroll_entry_branch_allocation_id → payroll_entry_branch_allocations.id = ON DELETE SET NULL (ဒီဖိုင်အောက်က `Ref:` — generated DDL ထဲ ပါ)
+//   (2) CHECK expenses_source_refs_chk (constraints v1.2): source 3 ⇒ allocation NULL ကို deleted_at IS NOT NULL ဖြစ်မှပဲ ခွင့်ပြု (live PAYROLL expense = allocation မဖြစ်မနေ — မပြောင်း)
+//   Reopen (Expenses.removePayroll) = run ရဲ့ source-3 expense တွေ soft delete (deleted_at · deleted_by_user_id = actor · deletion_reason = "Payroll reopened — <reason>") အရင် → ပြီးမှ Part 5 က allocation ဖျက်
+//   (FK က expense ရဲ့ allocation id ကို NULL လုပ် — row ကျန်) → finalize ပြန်လုပ်ရင် allocation အသစ် + expense row အသစ် (expenses_one_per_allocation … WHERE deleted_at IS NULL မပြောင်း)
+//   Soft delete မလုပ်ရသေးတဲ့ expense ရဲ့ allocation ကို ဖျက်ရင် DB က ပယ် (SET NULL ⇒ CHECK) · column အသစ် မရှိ · table / တခြား constraint မပြောင်း
+// v1 → v1.1 (02/Oct/2026 — G (owner one-sheet 02/Oct 00:06) · G (d)): cash_outs + cash_returns .cancelled_at / cancelled_by_user_id / cancel_reason (owner E5 — all-or-none CHECK)
+//   + expenses / manual_incomes .client_request_id (uuid UNIQUE NULL — ၂ ခါ နှိပ်မိ ကာ) · constraints v1.1 · cancelled row = closing / outstanding / လကုန် job ထဲ မပါ
+//   Note ညှိ: cash manual income = PENDING + APPROVED ⇒ expected cash (owner E7) · P&L = APPROVED ပဲ · KBZPay verify = ပိတ်ပြီးလည်း ရ (owner E3)
+// Part 1 + 4 (payments / refunds) + 5 (payroll allocations / receivables) + 6 (purchases) ပေါ်မှာ ဆောက် — dbdiagram မှာ part1–6 နဲ့ တွဲ paste
+// 🔒 D-FIN-01..09 (v5.1: D-FIN-06 OPEN-05 A · D-FIN-09 OPEN-25), REC-17, D-PAY-02 (closing verify), D-VIS-13 (late entry ⇐ closing), D-SVC-06 (ကားခ Cash Out),
+//    D-PAYR-04 (advance / loan = receivable), D-DAT-05, D-AUD-02, D-NTF-03, D-ORG-03, D-DB-01 / 03 / 04, D-PLT-15
+// Status / type = smallint + CHECK (D-DB-03) · CHECK / partial unique / FK = part7-finance-closing-v1-constraints.sql
+// F-P7-nn = review finding (§6.4g) — D-DB-11 နဲ့ approve ပြီး
+// Future FK ပြေ: employee_receivables.cash_out_id → cash_outs (Part 5) · purchases → expenses.purchase_id (Part 6 v1.1 — F-P7-05)
+// P&L (D-FIN-05) = view: revenue (sales FINISHED — Part 4) + manual_incomes − expenses (APPROVED, deleted ✖ — reversal အနုတ်) · branch = branch_id · company-wide = branch_id NULL
+// Attachments (D-FIN-03) = Part 8 attachments (entity_type / entity_id) · ငွေ table ပြောင်းတိုင်း DB trigger → audit_events (Part 8 — D-AUD-02)
+
+// ───────────────────────── Categories ─────────────────────────
+
+Table expense_categories {
+  id uuid [pk, note: 'UUIDv7']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04']
+  name_en varchar(150)
+  system_code smallint [note: 'NULL = admin ဖန်တီး (D-FIN-02) · 1 SALARY (payroll auto — D-FIN-04) · 2 PRODUCT_PURCHASE (Part 6 auto) · 3 HOME_SERVICE_TRANSPORT (D-SVC-06) — archive ✖']
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '🔒 D-FIN-02 — admin manage · "Staff Advance" category ✖ (REC-15 — advance / loan = receivable, Part 5) · (company_id, name_mm) unique (SQL) · F-P7-01'
+}
+
+Table income_categories {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04 — ဥပမာ ပစ္စည်း ရောင်း (ဟောင်း) / အခြား']
+  name_en varchar(150)
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '🔒 D-FIN-01 manual income category · service / product / ကားခ revenue = sales (Part 4) auto — category မလို'
+}
+
+// ───────────────────────── Expense / Income ─────────────────────────
+
+Table expenses {
+  id uuid [pk]
+  client_request_id uuid [unique, note: 'v1.1 G (d) — P7.EXP.03 manual expense Idempotency-Key (၂ ခါ နှိပ်မိ ကာ — D-VIS-10) · auto source (2–6) = NULL']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  branch_id uuid [ref: > branches.id, note: 'NULL = company-wide (D-FIN-02 / D-FIN-05 company P&L) · ဖြည့် = branch P&L']
+  category_id uuid [not null, ref: > expense_categories.id]
+  source smallint [not null, note: '1 MANUAL · 2 CASH_OUT (drawer — D-FIN-07) · 3 PAYROLL (finalize auto — D-FIN-04) · 4 PURCHASE (POSTED auto — Part 6) · 5 MUST_RETURN_AUTO (လကုန် — D-FIN-09) · 6 CASH_RETURN_REVERSAL (ပြန်ထည့် — OPEN-25, အနုတ်)']
+  amount bigint [not null, note: 'MMK · > 0 · REVERSAL ⇒ < 0 (CHECK) · P&L = Σ (APPROVED, deleted ✖)']
+  expense_date date [not null, note: 'MMT — P&L လ (PAYROLL = period_end · MUST_RETURN_AUTO = မူလလ ကုန်ရက် · REVERSAL = ပြန်ထည့်ရက်)']
+  description_mm text [note: 'Free text (D-DB-04)']
+  paid_via smallint [note: 'MANUAL ⇒ မဖြစ်မနေ: 1 BANK · 2 OWNER_PERSONAL · 3 OTHER (drawer cash = CASH_OUT source ကနေပဲ)']
+  status smallint [not null, default: 1, note: '1 PENDING (admin မဟုတ်သူ ထည့် — D-FIN-03) · 2 APPROVED (P&L ထဲ) · 3 REJECTED']
+  requested_by_user_id uuid [not null, ref: > users.id]
+  approved_by_user_id uuid [ref: > users.id, note: 'Permission `expense.approve` · admin ထည့်ရင် ကိုယ်တိုင် (auto APPROVED)']
+  approved_at timestamptz
+  rejection_reason text
+  deleted_at timestamptz [note: 'Soft delete (D-FIN-03 — "Void" ✖) · P&L ထဲ မပါ · reason + by · v1.2: payroll reopen ⇒ source 3 row soft delete (deletion_reason = "Payroll reopened — <reason>" — OPEN-40 a)']
+  deleted_by_user_id uuid [ref: > users.id]
+  deletion_reason text
+  cash_out_id uuid [ref: - cash_outs.id, note: 'source CASH_OUT / MUST_RETURN_AUTO ⇒ မဖြစ်မနေ (cash out ၁ ခု expense ၁ ခု)']
+  payroll_entry_branch_allocation_id uuid [note: 'source PAYROLL ⇒ (employee × branch drill-down — D-FIN-04 / D-PAYR-08) · Gross · v1.2: FK ON DELETE SET NULL — NULL = payroll reopen ကြောင့် soft delete ဖြစ်ပြီးသား row ပဲ (CHECK: source 3 ⇒ allocation ရှိ ဒါမှမဟုတ် deleted_at ရှိ)']
+  purchase_id uuid [ref: > purchases.id, note: 'source PURCHASE ⇒ (purchase × branch ၁ ခု — F-P7-05)']
+  original_expense_id uuid [ref: > expenses.id, note: 'REVERSAL ⇒ မူလ MUST_RETURN_AUTO expense (label: မူလ ရက် / ပမာဏ — OPEN-25)']
+  cash_return_id uuid [ref: - cash_returns.id, note: 'REVERSAL ⇒ ပြန်ထည့်တဲ့ cash return']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (company_id, expense_date)
+    (branch_id, expense_date)
+    (category_id, expense_date)
+  }
+
+  Note: '''
+  🔒 D-FIN-03 — PENDING မှာ ပြင်ရ · APPROVED ပြီး ပြင် ✖ (delete + အသစ်) · attachment = Part 8
+  🔒 D-FIN-04 — salary expense = payroll_entry_branch_allocations.allocated_gross_amount (Gross · advance / loan ✖)
+  🔒 D-FIN-09 / OPEN-25 — MUST_RETURN_AUTO (+) မူလလ · REVERSAL (−) ပြန်ထည့်လ — category တူ · P&L row ၂ ကြောင်း + label + note (F-P7-04)
+  Source AUTO (2–6) ⇒ status APPROVED (app) · MANUAL admin ⇒ APPROVED · MANUAL non-admin ⇒ PENDING → noti approver (D-NTF-03)
+  v1.2 (OPEN-40 a — owner "OPEN-40 OK") — payroll reopen: source 3 row တွေ soft delete ("Payroll reopened — <reason>") → allocation ဖျက် (FK SET NULL — row ကျန်, Finance list မှာ မြင်ရ) → finalize ပြန် = row အသစ် · hard delete ✖ (D-DAT-05)
+  '''
+}
+
+// v1.2 (OPEN-40 a): FK action = ON DELETE SET NULL — DBML inline `ref:` မှာ action ရေးလို့ မရလို့ long form နဲ့ ရေး (FK column = ညာဘက် endpoint `expenses.payroll_entry_branch_allocation_id` · constraint နာမည် = PostgreSQL default expenses_payroll_entry_branch_allocation_id_fkey — မပြောင်း)
+Ref: payroll_entry_branch_allocations.id - expenses.payroll_entry_branch_allocation_id [delete: set null]
+
+Table manual_incomes {
+  id uuid [pk]
+  client_request_id uuid [unique, note: 'v1.1 G (d) — P7.INC.03 Idempotency-Key (၂ ခါ နှိပ်မိ ကာ — D-VIS-10)']
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  branch_id uuid [ref: > branches.id, note: 'NULL = company-wide (D-FIN-01)']
+  category_id uuid [not null, ref: > income_categories.id]
+  amount bigint [not null, note: '> 0 MMK']
+  income_date date [not null, note: 'MMT']
+  payment_method_id uuid [not null, ref: > payment_methods.id, note: 'Cash ⇒ drawer cash in → closing expected (REC-17 "± cash in") — PENDING ကတည်းက (owner E7) · branch မဖြစ်မနေ (CHECK)']
+  description_mm text
+  status smallint [not null, default: 1, note: '1 PENDING · 2 APPROVED · 3 REJECTED — expense ပုံစံတူ (F-P7-02)']
+  requested_by_user_id uuid [not null, ref: > users.id]
+  approved_by_user_id uuid [ref: > users.id]
+  approved_at timestamptz
+  rejection_reason text
+  deleted_at timestamptz
+  deleted_by_user_id uuid [ref: > users.id]
+  deletion_reason text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (company_id, income_date)
+  }
+
+  Note: '🔒 D-FIN-01 manual income (branch / company) · P&L revenue = sales (Part 4) + ဒီ table (APPROVED ပဲ) · cash income = PENDING / APPROVED ⇒ expected cash (owner E7 — ဗီရိုထဲ ရောက်ပြီ; REJECTED / deleted ✖)'
+}
+
+// ───────────────────────── Cash Out / Return (🔒 D-FIN-07 / 08 / 09) ─────────────────────────
+
+Table cash_out_reasons {
+  id uuid [pk]
+  company_id uuid [not null, ref: > companies.id, note: 'D-ORG-03']
+  name_mm varchar(150) [not null, note: 'D-DB-04 — ဥပမာ ဝန်ထမ်း ထမင်း / မီးဖိုး / supplier / ဘဏ်သွင်း / ပိုင်ရှင် ယာယီ ထုတ်']
+  name_en varchar(150)
+  accounting_type smallint [not null, note: '1 EXPENSE (→ expenses) · 2 EMPLOYEE_BALANCE (advance / loan → employee_receivables) · 3 CASH_MOVEMENT (ဘဏ်သွင်း — expense ✖) · 4 MUST_RETURN (ယာယီ — D-FIN-09) — 🔒 D-FIN-08']
+  expense_category_id uuid [ref: > expense_categories.id, note: 'EXPENSE / MUST_RETURN ⇒ မဖြစ်မနေ (CHECK — D-FIN-08) · MUST_RETURN = လကုန် auto expense category']
+  receivable_kind smallint [note: 'EMPLOYEE_BALANCE ⇒ 1 SALARY_ADVANCE · 2 STAFF_LOAN (Part 5 employee_receivables.kind) — CHECK']
+  sort_order integer [not null, default: 0]
+  status smallint [not null, default: 1, note: '0 INACTIVE · 1 ACTIVE (admin "active" — D-FIN-08)']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  archived_at timestamptz
+
+  Note: '''
+  🔒 D-FIN-08 Cash Out Reason Master — reason က accounting ဆုံးဖြတ် · (company_id, name_mm) unique (SQL)
+  Seed: ဝန်ထမ်း ထမင်း (1) · မီးဖိုး (1) · supplier (1) · Home service ကားခ (1 — D-SVC-06) · လစာ ကြိုထုတ် (2, advance) · ဝန်ထမ်း ချေးငွေ (2, loan) · ဘဏ်သွင်း (3) · ပိုင်ရှင် ယာယီ ထုတ် (4)
+  '''
+}
+
+Table cash_outs {
+  id uuid [pk]
+  client_request_id uuid [not null, unique, note: 'D-VIS-10 double submit']
+  branch_id uuid [not null, ref: > branches.id, note: 'ဘယ် drawer ကနေ']
+  reason_id uuid [not null, ref: > cash_out_reasons.id]
+  accounting_type smallint [not null, note: 'reason.accounting_type snapshot (reason နောက်မှ ပြင်လည်း history မပြောင်း) — CHECK ⇔ field']
+  amount bigint [not null, note: '> 0 MMK']
+  note text [note: 'D-FIN-07 note']
+  taken_by_user_id uuid [ref: > users.id, note: 'MUST_RETURN ⇒ ယူသူ (user ရှိရင်) · မရှိရင် taken_by_name']
+  taken_by_name varchar(200) [note: 'MUST_RETURN ⇒ user မဟုတ်တဲ့ ယူသူ (CHECK: user ✖ name ✖ ၂ ခုလုံး မရှိ ✖)']
+  expected_return_date date [note: 'MUST_RETURN — optional (🟡 D-FIN-07 → F-P7-03 optional)']
+  employee_id uuid [ref: > employees.id, note: 'EMPLOYEE_BALANCE ⇒ ငွေယူတဲ့ ဝန်ထမ်း (CHECK) → employee_receivables (Part 5)']
+  occurred_at timestamptz [not null, note: 'တကယ် ထုတ်ချိန် (စာအုပ်မှတ်ပြီး closing မှာ သွင်း = user ရိုက် — D-FIN-07)']
+  business_date date [not null, note: 'MMT — ဒီရက် closing ရဲ့ expected cash ထဲ (REC-17)']
+  recorded_by_user_id uuid [not null, ref: > users.id]
+  converted_expense_at timestamptz [note: 'MUST_RETURN — လကုန် closing အထိ မပြန် ⇒ expense auto (D-FIN-09) · expense row = expenses.cash_out_id']
+  settled_at timestamptz [note: 'MUST_RETURN — Σ cash_returns (cancelled ✖) = amount ⇒ ပိတ် (app)']
+  cancelled_at timestamptz [note: 'v1.1 G (d) — owner E5: စာရင်းမပိတ်ခင် မှားရင် cancel (row မဖျက် — D-DAT-05) · cancelled ⇒ expected cash / outstanding / လကုန် job ထဲ မပါ']
+  cancelled_by_user_id uuid [ref: > users.id, note: 'Permission `cashout.delete` (Admin / Manager)']
+  cancel_reason text [note: 'cancelled_at ⇔ by ⇔ reason (CHECK — all-or-none, reason ဗလာ ✖)']
+  created_at timestamptz [not null, default: `now()`, note: '= recorded_at']
+
+  Indexes {
+    (branch_id, business_date)
+    (accounting_type, settled_at)
+  }
+
+  Note: '''
+  🔒 D-FIN-07 — drawer ထုတ်တိုင်း form · closing expected cash − Σ cash_outs (business_date)
+  Type ⇒ ဘာဖြစ်လဲ (app, same tx): EXPENSE → expenses (source 2) · EMPLOYEE_BALANCE → employee_receivables (kind = reason.receivable_kind) · CASH_MOVEMENT → ဘာမှ (cash ↓ ပဲ) · MUST_RETURN → outstanding (report "ပြန်ထည့်ရန်")
+  Closing CLOSED ပြီး ဒီ branch-date မှာ cash out အသစ် ✖ (reopen မှ — app)
+  v1.1 (owner E5) — cancel = cancelled_at / by / reason · EXPENSE ⇒ linked expense soft delete · EMPLOYEE_BALANCE ⇒ receivable cancel (Part 5) · active return ရှိ / converted ⇒ cancel ✖ (app — P7-RULE-10)
+  '''
+}
+
+Table cash_returns {
+  id uuid [pk]
+  client_request_id uuid [not null, unique]
+  cash_out_id uuid [not null, ref: > cash_outs.id, note: 'MUST_RETURN cash out ပဲ (app) · partial ရ — Σ ≤ amount (app)']
+  branch_id uuid [not null, ref: > branches.id, note: 'ပြန်ထည့်တဲ့ drawer (ပုံမှန် = cash_out.branch)']
+  amount bigint [not null, note: '> 0']
+  returned_at timestamptz [not null]
+  business_date date [not null, note: 'MMT — ဒီရက် closing expected cash + (REC-17)']
+  received_by_user_id uuid [not null, ref: > users.id]
+  note text
+  cancelled_at timestamptz [note: 'v1.1 G (d) — owner E5: ပြန်ထည့်တာ မှားရင် cancel (row မဖျက်) · cancelled ⇒ expected cash ✖ · reversal expense soft delete · cash_out.settled_at ပြန်ဖြုတ် (app — P7-RULE-11)']
+  cancelled_by_user_id uuid [ref: > users.id, note: 'Permission `cashout.delete` (return ရဲ့ branch)']
+  cancel_reason text [note: 'cancelled_at ⇔ by ⇔ reason (CHECK — all-or-none)']
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (cash_out_id)
+    (branch_id, business_date)
+  }
+
+  Note: '''
+  🔒 D-FIN-09 / OPEN-25 — မူလ cash out converted ပြီး (expense ဖြစ်ပြီး) ⇒ expenses REVERSAL row (−amount, category တူ, original_expense_id, label = မူလ ရက် / ပမာဏ)
+  Convert မဖြစ်သေး (လအတွင်း ပြန်) ⇒ expense မထုတ် — outstanding ↓ ပဲ
+  '''
+}
+
+// ───────────────────────── Daily closing (🔒 D-FIN-06 v5.1) ─────────────────────────
+
+Table daily_closings {
+  id uuid [pk]
+  branch_id uuid [not null, ref: > branches.id]
+  business_date date [not null, note: 'MMT · (branch, date) unique']
+  status smallint [not null, default: 1, note: '1 OPEN (ပိတ်ရန်) · 2 CLOSED (immutable) — reopen ⇒ OPEN + reopen field (D-FIN-06)']
+  opening_cash_amount bigint [not null, default: 0, note: 'မနက် ဗီရိုထဲ ကြိုထားငွေ — default = branch setting (OPEN-05 A) · ပိတ်သူ ပြင်ရ']
+  previous_closing_counted_amount bigint [note: 'မနေ့ closing ရဲ့ counted (ရှိရင်) — ≠ opening ⇒ reason (CHECK)']
+  opening_difference_reason text
+  cash_sales_amount bigint [not null, default: 0, note: 'Σ payments (is_cash method, voided ✖, sale FINISHED, business_date) — snapshot']
+  cash_refunds_amount bigint [not null, default: 0, note: 'Σ refunds (cash method, business_date)']
+  cash_outs_amount bigint [not null, default: 0, note: 'Σ cash_outs (branch, business_date, cancelled ✖ — v1.1)']
+  cash_returns_amount bigint [not null, default: 0, note: 'Σ cash_returns (ပြန်ထည့်တဲ့ branch, business_date, cancelled ✖ — v1.1)']
+  cash_manual_incomes_amount bigint [not null, default: 0, note: 'Σ manual_incomes (cash, PENDING + APPROVED — owner E7, deleted ✖, branch, date)']
+  expected_cash_amount bigint [not null, default: 0, note: '= opening + sales − refunds − outs + returns + manual (CHECK — REC-17)']
+  counted_cash_amount bigint [note: 'ပိတ်သူ ရေတဲ့ ဗီရိုငွေ — CLOSED ⇒ မဖြစ်မနေ · cash_difference_amount = counted − expected (generated column — SQL) · ≠ 0 ⇒ reason (CHECK) · |diff| > setting ⇒ admin noti (D-NTF-03)']
+  cash_difference_reason text
+  noncash_expected_amount bigint [not null, default: 0, note: 'Σ payments (non-cash method — KBZPay) business_date']
+  noncash_verified_amount bigint [not null, default: 0, note: 'Σ verified (D-PAY-02 v5.1)']
+  unverified_payment_count integer [not null, default: 0, note: '✔ မရသေးတာ — CLOSED + > 0 ⇒ reason (CHECK — D-PAY-02 v5.1)']
+  unverified_reason text
+  notes text
+  closed_at timestamptz
+  closed_by_user_id uuid [ref: > users.id, note: 'Permission `closing.close` (OPEN-05 A)']
+  reopen_count smallint [not null, default: 0]
+  last_reopened_at timestamptz
+  last_reopened_by_user_id uuid [ref: > users.id, note: 'Admin — D-FIN-06 reopen + audit']
+  last_reopen_reason text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (branch_id, business_date) [unique]
+    (business_date, status)
+  }
+
+  Note: '''
+  🔒 D-FIN-06 (v5.1) — branch + ရက် · expected / counted / difference / reason · CLOSED immutable · admin reopen (reason) · company consolidated = view
+  Snapshot column တွေ = CLOSE ချိန် app တွက် (payments / refunds / cash_outs / cash_returns / manual_incomes ကနေ) — ပြီးမှ source ပြောင်းလည်း closing မပြောင်း (F-P7-06)
+  CLOSED ⇒ ဒီ branch-date late entry (D-VIS-13) / cash out / cash return / cash manual income ✖ — reopen မှ (app) · KBZPay verify = ပိတ်ပြီးလည်း ရ (owner E3 — snapshot မပြောင်း)
+  Opening = setting default · previous_closing_counted ≠ opening ⇒ reason (ပိုင်ရှင် ထုတ်သွား = Cash Out မှတ်)
+  '''
+}
+
+// ── Setting (Part 8) ──
+// closing.opening_float_amount (branch, default 0 — OPEN-05 A) · closing.cash_difference_tolerance_amount (company, default 0) · closing.close_roles = permission
+// finance.month_end_must_return_job (REC-31 ပုံစံ — လကုန် closing ပြီး MUST_RETURN outstanding → expenses source 5)
+// Permission: expense.create (staff) · expense.approve · income.create · income.approve · cashout.create · cashout.return · closing.close · closing.reopen (admin) · finance.pnl.view
